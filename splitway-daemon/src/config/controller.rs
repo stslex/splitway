@@ -16,7 +16,15 @@ fn resolve_dns<'a>(vpn_name: &'a str) -> Option<String> {
     let output = Command::new("nmcli")
         .args(["device", "show", vpn_name])
         .output()
-        .ok()?;
+        .ok();
+
+    let output = match output {
+        Some(output) => Some(output),
+        None => {
+            println!("enable vpn to resolve Dns param");
+            return None;
+        }
+    }?;
 
     String::from_utf8_lossy(&output.stdout)
         .lines()
