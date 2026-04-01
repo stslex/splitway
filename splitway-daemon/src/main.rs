@@ -1,0 +1,119 @@
+use std::process::{exit, Command};
+
+use splitway_shared::config::{get_config, ConfigParseError};
+
+use crate::config::{ConfigController, ResolvedConfig};
+
+mod config;
+
+fn main() {
+    env_logger::init();
+
+    let args: Vec<String> = std::env::args().collect();
+    let command = args.get(1).map(|s| s.as_str());
+
+    match command {
+        Some("run") => launch_daemon(),
+        Some("revert") => revert_dns_domain(),
+        Some("status") => show_status(),
+        _ => println!("usage: splitway-daemon <apply|revert|status>"),
+    }
+}
+
+fn show_status() {
+    let vpn_name = get_config().map_or("default".to_string(), |config| config.vpn_name.clone());
+
+    Command::new("/usr/bin/resolvectl")
+        .arg("status")
+        .arg(vpn_name)
+        .status()
+        .unwrap_or_else(|e| panic!("error show_status: {e}"));
+}
+
+fn launch_daemon() {
+    let config = get_resolved_config();
+
+    log::info!("Resolved config: {:?}", config);
+
+    call_resolvectl(&config);
+    add_dns_domain(&config);
+}
+
+fn get_resolved_config() -> ResolvedConfig {
+    match get_config() {
+        Ok(config) => config,
+        Err(e) => {
+            match e {
+                ConfigParseError::ConfigNotFound => {
+                    log::error!("Config file not found, creating empty config");
+                    if let Err(e) = splitway_shared::config::create_empty_config() {
+                        log::error!("Error create empty config: {e}");
+                    }
+                }
+                _ => log::error!("Error get config: {e}"),
+            }
+            exit(1);
+        }
+    }
+    .resolve()
+    .unwrap()
+}
+
+fn add_dns_domain(config: &ResolvedConfig) {
+    let result = Command::new("/usr/bin/resolvectl")
+        .arg("domain")
+        .arg(config.vpn_name.clone())
+        .args(&config.vpn_hosts)
+        .output();
+    match result {
+        Ok(output) => {
+            println!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+            println!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        Err(e) => println!("error add_dns_domain:: {e}"),
+    }
+}
+
+fn call_resolvectl(config: &ResolvedConfig) {
+    let result = Command::new("/usr/bin/resolvectl")
+        .arg("dns")
+        .arg(config.vpn_name.clone())
+        .arg(config.vpn_ip.clone())
+        .output();
+    match result {
+        Ok(output) => {
+            println!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+            println!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        Err(e) => println!("error call_resolvectl: {e}"),
+    }
+}
+
+fn revert_dns_domain() {
+    let name = match get_config() {
+        Ok(config) => config.vpn_name,
+        Err(e) => {
+            match e {
+                ConfigParseError::ConfigNotFound => {
+                    log::error!("Config file not found, creating empty config");
+                    if let Err(e) = splitway_shared::config::create_empty_config() {
+                        log::error!("Error create empty config: {e}");
+                    }
+                }
+                _ => log::error!("Error get config: {e}"),
+            }
+            exit(1);
+        }
+    };
+    let result = Command::new("/usr/bin/resolvectl")
+        .arg("revert")
+        .arg(name)
+        .output();
+    match result {
+        Ok(output) => {
+            println!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+            println!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        Err(e) => println!("error revert_dns_domain: {e}"),
+    }
+}
