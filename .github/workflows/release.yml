@@ -1,7 +1,8 @@
-name: Build Dev
+name: Release
 
 on:
-  pull_request:
+  push:
+    branches: ["master"]
   workflow_dispatch:
 
 concurrency:
@@ -44,13 +45,6 @@ jobs:
           VERSION=$(grep '^version' splitway-daemon/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-          PR="${{ github.event.pull_request.number }}"
-          if [ -n "$PR" ]; then
-            echo "label=v${VERSION}_dev_pr-${PR}" >> $GITHUB_OUTPUT
-          else
-            echo "label=v${VERSION}_dev" >> $GITHUB_OUTPUT
-          fi
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -69,7 +63,45 @@ jobs:
         if: ${{ matrix.use_cross != true }}
         run: cargo build --release -p splitway-daemon --target ${{ matrix.target }}
 
+      - name: Rename binary
+        shell: bash
+        run: |
+          src="target/${{ matrix.target }}/release/splitway-daemon${{ matrix.bin_ext }}"
+          dst="splitway-daemon-${{ matrix.suffix }}${{ matrix.bin_ext }}"
+          cp "$src" "$dst"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: splitway-daemon-${{ steps.meta.outputs.label }}-${{ matrix.suffix }}
-          path: target/${{ matrix.target }}/release/splitway-daemon${{ matrix.bin_ext }}
+          name: splitway-daemon-${{ matrix.suffix }}
+          path: splitway-daemon-${{ matrix.suffix }}${{ matrix.bin_ext }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version
+        id: meta
+        shell: bash
+        run: |
+          VERSION=$(grep '^version' splitway-daemon/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          files: artifacts/*
+          fail_on_unmatched_files: true
