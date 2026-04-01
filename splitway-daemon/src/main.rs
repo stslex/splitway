@@ -15,9 +15,19 @@ fn main() {
     match command {
         Some("run") => launch_daemon(),
         Some("revert") => revert_dns_domain(),
-        Some("status") => { /* resolvectl status vpn0 */ }
+        Some("status") => show_status(),
         _ => println!("usage: splitway-daemon <apply|revert|status>"),
     }
+}
+
+fn show_status() {
+    let vpn_name = get_config().map_or("default".to_string(), |config| config.vpn_name.clone());
+
+    Command::new("/usr/bin/resolvectl")
+        .arg("status")
+        .arg(vpn_name)
+        .status()
+        .unwrap_or_else(|e| panic!("error show_status: {e}"));
 }
 
 fn launch_daemon() {
