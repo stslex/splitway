@@ -1,4 +1,4 @@
-name: Release
+name: Build release daemon
 
 on:
   push:
@@ -105,3 +105,34 @@ jobs:
           name: ${{ steps.meta.outputs.tag }}
           files: artifacts/*
           fail_on_unmatched_files: true
+
+  bump-version:
+    needs: release
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bump patch version in Cargo.toml files
+        shell: bash
+        run: |
+          VERSION=$(grep '^version' splitway-daemon/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
+          NEW_PATCH=$((PATCH + 1))
+          NEW_VERSION="$MAJOR.$MINOR.$NEW_PATCH"
+          sed -i "s/^version = \"$VERSION\"/version = \"$NEW_VERSION\"/" splitway-daemon/Cargo.toml
+          echo "Bumped $VERSION -> $NEW_VERSION"
+
+      - name: Commit and push version bump
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add splitway-daemon/Cargo.toml
+          git commit -m "chore: bump version after release"
+          git push
