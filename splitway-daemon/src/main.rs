@@ -8,6 +8,19 @@ mod config;
 
 fn main() {
     env_logger::init();
+
+    let args: Vec<String> = std::env::args().collect();
+    let command = args.get(1).map(|s| s.as_str());
+
+    match command {
+        Some("run") => launch_daemon(),
+        Some("revert") => revert_dns_domain(),
+        Some("status") => { /* resolvectl status vpn0 */ }
+        _ => println!("usage: splitway-daemon <apply|revert|status>"),
+    }
+}
+
+fn launch_daemon() {
     let config = get_resolved_config();
 
     log::info!("Resolved config: {:?}", config);
@@ -66,7 +79,22 @@ fn call_resolvectl(config: &ResolvedConfig) {
     }
 }
 
-fn revert_dns_domain(name: String) {
+fn revert_dns_domain() {
+    let name = match get_config() {
+        Ok(config) => config.vpn_name,
+        Err(e) => {
+            match e {
+                ConfigParseError::ConfigNotFound => {
+                    log::error!("Config file not found, creating empty config");
+                    if let Err(e) = splitway_shared::config::create_empty_config() {
+                        log::error!("Error create empty config: {e}");
+                    }
+                }
+                _ => log::error!("Error get config: {e}"),
+            }
+            exit(1);
+        }
+    };
     let result = Command::new("/usr/bin/resolvectl")
         .arg("revert")
         .arg(name)
