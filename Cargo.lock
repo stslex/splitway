@@ -251,14 +251,14 @@ dependencies = [
 
 [[package]]
 name = "splitway-cli"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "splitway-shared",
 ]
 
 [[package]]
 name = "splitway-daemon"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "env_logger",
  "log",
