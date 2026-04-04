@@ -14,6 +14,7 @@ pub fn get_config() -> Result<LocalConfig, ConfigParseError> {
         ConfigParseError::SerializeError
     })
 }
+
 pub fn create_empty_config<'a>() -> Result<(), ConfigParseError> {
     std::fs::create_dir_all(config_folder_path()).map_err(|e| {
         log::error!("Error create config dir: {e}");

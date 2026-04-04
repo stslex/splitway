@@ -35,7 +35,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Extract version
         id: meta
@@ -69,7 +69,7 @@ jobs:
         if: ${{ matrix.use_cross != true }}
         run: cargo build --release -p splitway-daemon --target ${{ matrix.target }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: splitway-daemon-${{ steps.meta.outputs.label }}-${{ matrix.suffix }}
           path: target/${{ matrix.target }}/release/splitway-daemon${{ matrix.bin_ext }}
