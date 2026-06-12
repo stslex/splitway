@@ -53,25 +53,50 @@ impl DnsBackend for LinuxBackend {
         }
 
         // Set domains: resolvectl domain <interface> <domains...>
-        let result = Command::new("resolvectl")
+        let domain_error = match Command::new("resolvectl")
             .arg("domain")
             .arg(&vpn_info.interface_name)
             .args(domains)
-            .output()?;
+            .output()
+        {
+            Ok(result) => {
+                log::debug!(
+                    "resolvectl domain stdout: {}",
+                    String::from_utf8_lossy(&result.stdout)
+                );
+                log::debug!(
+                    "resolvectl domain stderr: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                if result.status.success() {
+                    None
+                } else {
+                    Some(PlatformError::CommandFailed(
+                        String::from_utf8_lossy(&result.stderr).to_string(),
+                    ))
+                }
+            }
+            Err(e) => Some(PlatformError::Io(e)),
+        };
 
-        log::debug!(
-            "resolvectl domain stdout: {}",
-            String::from_utf8_lossy(&result.stdout)
-        );
-        log::debug!(
-            "resolvectl domain stderr: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-
-        if !result.status.success() {
-            return Err(PlatformError::CommandFailed(
-                String::from_utf8_lossy(&result.stderr).to_string(),
-            ));
+        // The DNS step already succeeded, so a domain failure leaves the
+        // system half-configured; revert before returning the original error.
+        if let Some(error) = domain_error {
+            log::error!(
+                "domain step failed for {}: {error}; rolling back DNS settings",
+                vpn_info.interface_name
+            );
+            match self.revert_rules(&vpn_info.interface_name) {
+                Ok(()) => log::info!(
+                    "rollback succeeded: {} restored to its pre-apply state",
+                    vpn_info.interface_name
+                ),
+                Err(revert_error) => log::error!(
+                    "rollback failed for {}: {revert_error}; system may be half-configured",
+                    vpn_info.interface_name
+                ),
+            }
+            return Err(error);
         }
 
         Ok(())
