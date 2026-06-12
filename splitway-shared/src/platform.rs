@@ -8,6 +8,8 @@ pub enum PlatformError {
     VpnNotFound(String),
     #[error("failed to parse output: {0}")]
     ParseError(String),
+    #[error("D-Bus error: {0}")]
+    DbusError(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -18,10 +20,25 @@ pub struct VpnInfo {
     pub dns_servers: Vec<String>,
 }
 
-pub trait DnsBackend: Send + Sync {
-    /// Detect VPN on the given interface and return its DNS info.
-    fn detect_vpn(&self, interface: &str) -> Result<VpnInfo, PlatformError>;
+#[derive(Debug, Clone)]
+pub enum VpnEvent {
+    Up(VpnInfo),
+    Down { interface_name: String },
+}
 
+pub trait VpnDetector: Send + Sync {
+    /// One-shot detection of the VPN on the given interface.
+    fn detect(&self, interface: &str) -> Result<VpnInfo, PlatformError>;
+
+    /// Subscribe to up/down events for the given interface.
+    /// The detector owns the background task feeding the channel.
+    fn watch(
+        &self,
+        interface: &str,
+    ) -> Result<tokio::sync::mpsc::Receiver<VpnEvent>, PlatformError>;
+}
+
+pub trait DnsBackend: Send + Sync {
     /// Apply DNS rules: set DNS servers and route domains through the VPN interface.
     fn apply_rules(&self, vpn_info: &VpnInfo, domains: &[String]) -> Result<(), PlatformError>;
 

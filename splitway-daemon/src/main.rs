@@ -6,6 +6,7 @@ use splitway_shared::config::{get_config, ConfigParseError};
 
 mod backend;
 mod command;
+mod detector;
 
 fn main() {
     env_logger::init();
@@ -18,7 +19,7 @@ fn main() {
 
 fn show_status() {
     let vpn_name = get_config().map_or("default".to_string(), |config| config.vpn_name.clone());
-    let backend = backend::create_backend();
+    let backend = backend::create_dns_backend();
 
     if let Err(e) = backend.status(&vpn_name) {
         panic!("error show_status: {e}");
@@ -34,9 +35,10 @@ fn launch_daemon() {
         }
     };
 
-    let backend = backend::create_backend();
+    let backend = backend::create_dns_backend();
+    let detector = detector::create_vpn_detector();
 
-    let vpn_info = match backend.detect_vpn(&local_config.vpn_name) {
+    let vpn_info = match detector.detect(&local_config.vpn_name) {
         Ok(info) => info,
         Err(e) => {
             log::error!("Failed to detect VPN: {e}");
@@ -61,7 +63,7 @@ fn revert_dns_domain() {
         }
     };
 
-    let backend = backend::create_backend();
+    let backend = backend::create_dns_backend();
 
     if let Err(e) = backend.revert_rules(&name) {
         println!("error revert_dns_domain: {e}");

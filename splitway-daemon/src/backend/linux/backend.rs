@@ -2,28 +2,9 @@ use std::process::Command;
 
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnInfo};
 
-use crate::backend::linux::parser::parse_dns_from_nmcli;
 use crate::backend::linux::LinuxBackend;
 
 impl DnsBackend for LinuxBackend {
-    fn detect_vpn(&self, interface: &str) -> Result<VpnInfo, PlatformError> {
-        let output = Command::new("nmcli")
-            .args(["device", "show", interface])
-            .output()?;
-
-        if !output.status.success() {
-            return Err(PlatformError::VpnNotFound(interface.to_string()));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let dns_servers = parse_dns_from_nmcli(&stdout)?;
-
-        Ok(VpnInfo {
-            interface_name: interface.to_string(),
-            dns_servers,
-        })
-    }
-
     fn apply_rules(&self, vpn_info: &VpnInfo, domains: &[String]) -> Result<(), PlatformError> {
         // Set DNS servers: resolvectl dns <interface> <servers...>
         if vpn_info.dns_servers.is_empty() {
