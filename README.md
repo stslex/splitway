@@ -62,13 +62,7 @@ Binaries are placed in `target/release/`.
 
 ## Roadmap
 
-- Interface monitoring — auto-apply on VPN connect/disconnect
-- IPC (Unix socket) + standalone CLI for runtime rule management
-- Multiple VPN backends (WireGuard, OpenVPN)
-- Automatic discovery of related domains (redirects, dependencies)
-- GUI (GTK4 + libadwaita)
-- Additional route targets — proxy (SOCKS5/VLESS)
-- macOS and Windows support
+See [ROADMAP.md](ROADMAP.md) — phased plan with done-criteria, from testable foundation (Phase 0) to real daemon, IPC, and multi-backend support.
 
 ## Stack
 
