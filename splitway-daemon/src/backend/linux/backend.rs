@@ -2,7 +2,7 @@ use std::process::Command;
 
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnInfo};
 
-pub struct LinuxBackend;
+use crate::backend::linux::LinuxBackend;
 
 impl DnsBackend for LinuxBackend {
     fn detect_vpn(&self, interface: &str) -> Result<VpnInfo, PlatformError> {
@@ -32,9 +32,10 @@ impl DnsBackend for LinuxBackend {
 
     fn apply_rules(&self, vpn_info: &VpnInfo, domains: &[String]) -> Result<(), PlatformError> {
         // Set DNS server: resolvectl dns <interface> <ip>
-        let dns_server = vpn_info.dns_servers.first().ok_or_else(|| {
-            PlatformError::CommandFailed("no DNS servers in VpnInfo".to_string())
-        })?;
+        let dns_server = vpn_info
+            .dns_servers
+            .first()
+            .ok_or_else(|| PlatformError::CommandFailed("no DNS servers in VpnInfo".to_string()))?;
 
         let result = Command::new("/usr/bin/resolvectl")
             .arg("dns")

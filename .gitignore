@@ -1,2 +1,4 @@
 # Added by cargo
 /target
+.claude
+.idea

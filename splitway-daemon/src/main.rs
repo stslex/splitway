@@ -1,20 +1,18 @@
+use std::env;
 use std::process::exit;
 
+use crate::command::{Command, CommandParser};
 use splitway_shared::config::{get_config, ConfigParseError};
 
 mod backend;
+mod command;
 
 fn main() {
     env_logger::init();
-
-    let args: Vec<String> = std::env::args().collect();
-    let command = args.get(1).map(|s| s.as_str());
-
-    match command {
-        Some("run") => launch_daemon(),
-        Some("revert") => revert_dns_domain(),
-        Some("status") => show_status(),
-        _ => println!("usage: splitway-daemon <apply|revert|status>"),
+    match env::args().parse_command() {
+        Command::Run => launch_daemon(),
+        Command::Revert => revert_dns_domain(),
+        Command::Status => show_status(),
     }
 }
 
