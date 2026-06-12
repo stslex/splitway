@@ -8,4 +8,5 @@ pub enum Command {
     Run,
     Revert,
     Status,
+    Watch,
 }

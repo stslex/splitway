@@ -198,9 +198,7 @@ async fn handle_state(
             // detect() runs nmcli synchronously; keep it off the async thread.
             let detected = tokio::task::spawn_blocking(move || LinuxDetector.detect(&iface))
                 .await
-                .map_err(|e| {
-                    PlatformError::CommandFailed(format!("detect task panicked: {e}"))
-                })?;
+                .map_err(|e| PlatformError::CommandFailed(format!("detect task panicked: {e}")))?;
             match detected {
                 Ok(info) => {
                     dedup.record(t);
