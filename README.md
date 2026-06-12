@@ -1,6 +1,6 @@
 # Splitway
 
-Domain-based traffic splitting tool for Linux desktops. Routes traffic through VPN or direct connection based on configurable domain rules.
+Domain-based traffic splitting tool for Linux desktops (macOS support planned — see [ROADMAP.md](ROADMAP.md)). Routes traffic through VPN or direct connection based on configurable domain rules.
 
 ## Problem
 
@@ -8,7 +8,7 @@ Corporate VPNs like GlobalProtect capture all traffic by default. Splitting requ
 
 ## What it does
 
-Splitway automates DNS-based traffic splitting. A daemon applies routing rules to `systemd-resolved` when a VPN interface comes up, and reverts them when it goes down. Domains matching the rules are resolved through the VPN's DNS server; everything else goes direct.
+Splitway automates DNS-based traffic splitting: domains matching the rules are resolved through the VPN's DNS server; everything else goes direct. Today this is a one-shot command (`run`/`revert`); automatic apply/revert on VPN interface up/down is the headline feature of Phase 2 in the roadmap.
 
 ## Current state (MVP)
 
@@ -16,7 +16,7 @@ Splitway automates DNS-based traffic splitting. A daemon applies routing rules t
 - Auto-detects VPN DNS server via NetworkManager
 - Applies/reverts split-DNS rules through `resolvectl`
 - CLI commands: `run`, `revert`, `status`
-- Linux only, GlobalProtect as first supported VPN
+- Linux only, GlobalProtect as first supported VPN, one-shot (no interface monitoring yet)
 
 ## Workspace layout
 
@@ -34,7 +34,6 @@ Create `~/.config/splitway/config.json` (auto-created as empty on first run):
 ```json
 {
   "vpn_name": "vpn0",
-  "vpn_ip": "10.0.0.1",
   "vpn_hosts": ["corp.example.com", "internal.example.com"]
 }
 ```
@@ -62,7 +61,11 @@ Binaries are placed in `target/release/`.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) — phased plan with done-criteria, from testable foundation (Phase 0) to real daemon, IPC, and multi-backend support.
+See [ROADMAP.md](ROADMAP.md) — phased plan with done-criteria: testable foundation → abstraction split → real daemon + IPC → OpenVPN/macOS backends → primitive GUI. Near-term priorities: NixOS packaging, macOS, OpenVPN, minimal GUI.
+
+## Development
+
+Workflow rules live in [CLAUDE.md](CLAUDE.md): one phase = one branch = one PR into `dev`, English only. Per-phase implementation prompts are in `docs/prompts/`.
 
 ## Stack
 

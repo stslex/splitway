@@ -37,8 +37,7 @@ Replace all `println!` in backend code with appropriate `log::debug!` / `log::in
 
 - Remove unused `ConfigParseError::Unresolve` variant
 - Fix `CommandParser::parse_command(self)` in `splitway-daemon/src/command/parser.rs`: it ignores `self` and re-reads `std::env::args()`. Make it consume `self`. Do not redesign CLI argument handling beyond this
-- Remove `vpn_ip` from the config example in `README.md` (`LocalConfig` has no such field)
-- Add a serde round-trip unit test for `LocalConfig` in `splitway-shared`
+- Add a serde round-trip unit test for `LocalConfig` in `splitway-shared` (the stale `vpn_ip` README example is already fixed)
 
 ### 6. CI
 

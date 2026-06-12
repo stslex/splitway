@@ -2,6 +2,8 @@
 
 Reflects code state as of 2026-06-12.
 
+Process: one phase = one branch = one PR into `dev` (workflow rules in `CLAUDE.md`); per-phase implementation prompts live in `docs/prompts/`.
+
 Target features, wanted as early as possible: **NixOS support, macOS support, OpenVPN support, primitive GUI** (enable/disable + config selection). Hard constraint: no shortcuts at the expense of code quality.
 
 Ordering principle: macOS + OpenVPN multiply *platform × VPN* implementations. Adding them on the current `DnsBackend` trait (which mixes VPN detection with rule application) would bake the mixed design into three implementations and force a triple rewrite later. So: split the abstractions **before** multiplying backends. Likewise, a GUI that shells out with sudo per click is a quality shortcut — the GUI waits for IPC and never holds privileges itself.
