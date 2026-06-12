@@ -31,7 +31,7 @@ impl DnsBackend for LinuxBackend {
             .first()
             .ok_or_else(|| PlatformError::CommandFailed("no DNS servers in VpnInfo".to_string()))?;
 
-        let result = Command::new("/usr/bin/resolvectl")
+        let result = Command::new("resolvectl")
             .arg("dns")
             .arg(&vpn_info.interface_name)
             .arg(dns_server)
@@ -47,7 +47,7 @@ impl DnsBackend for LinuxBackend {
         }
 
         // Set domains: resolvectl domain <interface> <domains...>
-        let result = Command::new("/usr/bin/resolvectl")
+        let result = Command::new("resolvectl")
             .arg("domain")
             .arg(&vpn_info.interface_name)
             .args(domains)
@@ -66,7 +66,7 @@ impl DnsBackend for LinuxBackend {
     }
 
     fn revert_rules(&self, interface: &str) -> Result<(), PlatformError> {
-        let result = Command::new("/usr/bin/resolvectl")
+        let result = Command::new("resolvectl")
             .arg("revert")
             .arg(interface)
             .output()?;
@@ -84,7 +84,7 @@ impl DnsBackend for LinuxBackend {
     }
 
     fn status(&self, interface: &str) -> Result<(), PlatformError> {
-        let status = Command::new("/usr/bin/resolvectl")
+        let status = Command::new("resolvectl")
             .arg("status")
             .arg(interface)
             .status()?;
