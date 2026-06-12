@@ -1,0 +1,43 @@
+---
+name: platform-dns
+description: Reference for the platform DNS/VPN interfaces Splitway builds on — systemd-resolved (resolvectl), NetworkManager D-Bus API and nmcli output, macOS resolver. Use when implementing or reviewing VpnDetector / DnsBackend code, NM event watching, or platform backends.
+---
+
+# Platform DNS/VPN reference
+
+Curated facts for Splitway's platform layer. When something here disagrees with the live system, trust the system: verify D-Bus details with `busctl introspect`, resolvectl behavior with `resolvectl --help` / `man resolvectl`.
+
+## systemd-resolved / resolvectl (Linux DnsBackend)
+
+- `resolvectl dns <iface> <server...>` — set per-link DNS servers
+- `resolvectl domain <iface> <domain...>` — set per-link domains. A bare `example.com` is both a *search* domain and a *routing* domain; `~example.com` is routing-only (queries for `*.example.com` go to this link's DNS, but the domain is not appended to bare hostnames); `~.` routes *all* queries to this link
+- `resolvectl revert <iface>` — drop per-link overrides, back to whatever the link's manager (NM/DHCP) configured
+- `resolvectl status <iface>` — current per-link DNS state
+- Needs privileges (root or polkit) for mutating calls
+- **Known improvement, deferred (behavior change, not Phase 1):** Splitway currently passes config domains bare; routing-only `~domain` is the more correct split-DNS semantic — it avoids polluting the search list
+
+## NetworkManager D-Bus (Linux VpnDetector)
+
+Bus: system bus, name `org.freedesktop.NetworkManager`.
+
+- Manager object `/org/freedesktop/NetworkManager`, interface `org.freedesktop.NetworkManager`:
+  - `GetDeviceByIpIface(s) -> o` — device object path by interface name (errors if absent)
+  - Signals `DeviceAdded(o)` / `DeviceRemoved(o)` — needed to catch tun devices created on VPN connect
+- Device objects implement `org.freedesktop.NetworkManager.Device`:
+  - Signal `StateChanged(u new_state, u old_state, u reason)`
+  - Property `Interface` (s) — match against the configured interface name
+- `NMDeviceState` (the values that matter): `10` unmanaged, `20` unavailable, `30` disconnected, `40–90` activation stages, `100` **activated**, `110` deactivating, `120` failed
+- Practical mapping: `100` → VPN up; `30`/`120` (and device removal) → VPN down; ignore intermediate stages; deduplicate repeats — NM can re-emit states
+- GlobalProtect/OpenVPN typically appear as `tun*` devices; WireGuard as `wireguard` type. The device may not exist until the VPN client starts — watch must survive that
+- zbus: generate typed proxies from introspection (`zbus-xmlgen` or `busctl introspect --xml-interface`) instead of hand-writing signatures
+
+## nmcli (current detect path)
+
+`nmcli device show <iface>` prints `KEY: value` lines; DNS lives in `IP4.DNS[n]` / `IP6.DNS[n]` entries. Parsing is implemented and unit-tested in `splitway-daemon/src/.../parser.rs` — extend tests there if the format handling changes.
+
+## macOS (Phase 3 — verify on hardware before relying on this)
+
+- Split DNS: write `/etc/resolver/<domain>` files; keys per `man 5 resolver`: `nameserver <ip>` (repeatable), optional `search_order`, `port`. Remove the file to revert. Needs root
+- Inspect resolver state: `scutil --dns`; VPN interfaces show up as `utun*`
+- After changing resolver files flush caches: `dscacheutil -flushcache` and `killall -HUP mDNSResponder`
+- No systemd/NM here: VPN detection and event source need a separate mechanism (`scutil` dynamic store watching — research task in Phase 3)
