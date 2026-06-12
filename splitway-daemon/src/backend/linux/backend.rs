@@ -25,16 +25,17 @@ impl DnsBackend for LinuxBackend {
     }
 
     fn apply_rules(&self, vpn_info: &VpnInfo, domains: &[String]) -> Result<(), PlatformError> {
-        // Set DNS server: resolvectl dns <interface> <ip>
-        let dns_server = vpn_info
-            .dns_servers
-            .first()
-            .ok_or_else(|| PlatformError::CommandFailed("no DNS servers in VpnInfo".to_string()))?;
+        // Set DNS servers: resolvectl dns <interface> <servers...>
+        if vpn_info.dns_servers.is_empty() {
+            return Err(PlatformError::CommandFailed(
+                "no DNS servers in VpnInfo".to_string(),
+            ));
+        }
 
         let result = Command::new("resolvectl")
             .arg("dns")
             .arg(&vpn_info.interface_name)
-            .arg(dns_server)
+            .args(&vpn_info.dns_servers)
             .output()?;
 
         log::debug!(
