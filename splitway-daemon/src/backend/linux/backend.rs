@@ -2,6 +2,7 @@ use std::process::Command;
 
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnInfo};
 
+use crate::backend::linux::parser::parse_dns_from_nmcli;
 use crate::backend::linux::LinuxBackend;
 
 impl DnsBackend for LinuxBackend {
@@ -15,36 +16,36 @@ impl DnsBackend for LinuxBackend {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let dns_ip = stdout
-            .lines()
-            .find(|line| line.contains("DNS"))
-            .and_then(|line| line.split_whitespace().last())
-            .map(|ip| ip.to_string())
-            .ok_or_else(|| {
-                PlatformError::ParseError("DNS entry not found in nmcli output".to_string())
-            })?;
+        let dns_servers = parse_dns_from_nmcli(&stdout)?;
 
         Ok(VpnInfo {
             interface_name: interface.to_string(),
-            dns_servers: vec![dns_ip],
+            dns_servers,
         })
     }
 
     fn apply_rules(&self, vpn_info: &VpnInfo, domains: &[String]) -> Result<(), PlatformError> {
-        // Set DNS server: resolvectl dns <interface> <ip>
-        let dns_server = vpn_info
-            .dns_servers
-            .first()
-            .ok_or_else(|| PlatformError::CommandFailed("no DNS servers in VpnInfo".to_string()))?;
+        // Set DNS servers: resolvectl dns <interface> <servers...>
+        if vpn_info.dns_servers.is_empty() {
+            return Err(PlatformError::CommandFailed(
+                "no DNS servers in VpnInfo".to_string(),
+            ));
+        }
 
-        let result = Command::new("/usr/bin/resolvectl")
+        let result = Command::new("resolvectl")
             .arg("dns")
             .arg(&vpn_info.interface_name)
-            .arg(dns_server)
+            .args(&vpn_info.dns_servers)
             .output()?;
 
-        println!("stdout: {}", String::from_utf8_lossy(&result.stdout));
-        println!("stderr: {}", String::from_utf8_lossy(&result.stderr));
+        log::debug!(
+            "resolvectl dns stdout: {}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        log::debug!(
+            "resolvectl dns stderr: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
 
         if !result.status.success() {
             return Err(PlatformError::CommandFailed(
@@ -53,32 +54,69 @@ impl DnsBackend for LinuxBackend {
         }
 
         // Set domains: resolvectl domain <interface> <domains...>
-        let result = Command::new("/usr/bin/resolvectl")
+        let domain_error = match Command::new("resolvectl")
             .arg("domain")
             .arg(&vpn_info.interface_name)
             .args(domains)
-            .output()?;
+            .output()
+        {
+            Ok(result) => {
+                log::debug!(
+                    "resolvectl domain stdout: {}",
+                    String::from_utf8_lossy(&result.stdout)
+                );
+                log::debug!(
+                    "resolvectl domain stderr: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                if result.status.success() {
+                    None
+                } else {
+                    Some(PlatformError::CommandFailed(
+                        String::from_utf8_lossy(&result.stderr).to_string(),
+                    ))
+                }
+            }
+            Err(e) => Some(PlatformError::Io(e)),
+        };
 
-        println!("stdout: {}", String::from_utf8_lossy(&result.stdout));
-        println!("stderr: {}", String::from_utf8_lossy(&result.stderr));
-
-        if !result.status.success() {
-            return Err(PlatformError::CommandFailed(
-                String::from_utf8_lossy(&result.stderr).to_string(),
-            ));
+        // The DNS step already succeeded, so a domain failure leaves the
+        // system half-configured; revert before returning the original error.
+        if let Some(error) = domain_error {
+            log::error!(
+                "domain step failed for {}: {error}; rolling back DNS settings",
+                vpn_info.interface_name
+            );
+            match self.revert_rules(&vpn_info.interface_name) {
+                Ok(()) => log::info!(
+                    "rollback succeeded: {} restored to its pre-apply state",
+                    vpn_info.interface_name
+                ),
+                Err(revert_error) => log::error!(
+                    "rollback failed for {}: {revert_error}; system may be half-configured",
+                    vpn_info.interface_name
+                ),
+            }
+            return Err(error);
         }
 
         Ok(())
     }
 
     fn revert_rules(&self, interface: &str) -> Result<(), PlatformError> {
-        let result = Command::new("/usr/bin/resolvectl")
+        let result = Command::new("resolvectl")
             .arg("revert")
             .arg(interface)
             .output()?;
 
-        println!("stdout: {}", String::from_utf8_lossy(&result.stdout));
-        println!("stderr: {}", String::from_utf8_lossy(&result.stderr));
+        log::debug!(
+            "resolvectl revert stdout: {}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        log::debug!(
+            "resolvectl revert stderr: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
 
         if !result.status.success() {
             return Err(PlatformError::CommandFailed(
@@ -90,7 +128,7 @@ impl DnsBackend for LinuxBackend {
     }
 
     fn status(&self, interface: &str) -> Result<(), PlatformError> {
-        let status = Command::new("/usr/bin/resolvectl")
+        let status = Command::new("resolvectl")
             .arg("status")
             .arg(interface)
             .status()?;

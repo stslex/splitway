@@ -15,7 +15,7 @@ pub fn get_config() -> Result<LocalConfig, ConfigParseError> {
     })
 }
 
-pub fn create_empty_config<'a>() -> Result<(), ConfigParseError> {
+pub fn create_empty_config() -> Result<(), ConfigParseError> {
     std::fs::create_dir_all(config_folder_path()).map_err(|e| {
         log::error!("Error create config dir: {e}");
         ConfigParseError::ConfigNotFound
@@ -53,7 +53,6 @@ pub struct LocalConfig {
 pub enum ConfigParseError {
     ConfigNotFound,
     SerializeError,
-    Unresolve,
 }
 
 impl Display for ConfigParseError {
@@ -61,7 +60,25 @@ impl Display for ConfigParseError {
         match self {
             ConfigParseError::ConfigNotFound => write!(f, "Config file not found"),
             ConfigParseError::SerializeError => write!(f, "Error serialize/deserialize config"),
-            ConfigParseError::Unresolve => write!(f, "Error unresolve config"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LocalConfig;
+
+    #[test]
+    fn local_config_serde_round_trip() {
+        let config = LocalConfig {
+            vpn_name: "wg0".to_string(),
+            vpn_hosts: vec!["example.com".to_string(), "internal.corp".to_string()],
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: LocalConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.vpn_name, config.vpn_name);
+        assert_eq!(parsed.vpn_hosts, config.vpn_hosts);
     }
 }
