@@ -37,8 +37,14 @@ impl DnsBackend for LinuxBackend {
             .arg(dns_server)
             .output()?;
 
-        println!("stdout: {}", String::from_utf8_lossy(&result.stdout));
-        println!("stderr: {}", String::from_utf8_lossy(&result.stderr));
+        log::debug!(
+            "resolvectl dns stdout: {}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        log::debug!(
+            "resolvectl dns stderr: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
 
         if !result.status.success() {
             return Err(PlatformError::CommandFailed(
@@ -53,8 +59,14 @@ impl DnsBackend for LinuxBackend {
             .args(domains)
             .output()?;
 
-        println!("stdout: {}", String::from_utf8_lossy(&result.stdout));
-        println!("stderr: {}", String::from_utf8_lossy(&result.stderr));
+        log::debug!(
+            "resolvectl domain stdout: {}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        log::debug!(
+            "resolvectl domain stderr: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
 
         if !result.status.success() {
             return Err(PlatformError::CommandFailed(
@@ -71,8 +83,14 @@ impl DnsBackend for LinuxBackend {
             .arg(interface)
             .output()?;
 
-        println!("stdout: {}", String::from_utf8_lossy(&result.stdout));
-        println!("stderr: {}", String::from_utf8_lossy(&result.stderr));
+        log::debug!(
+            "resolvectl revert stdout: {}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        log::debug!(
+            "resolvectl revert stderr: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
 
         if !result.status.success() {
             return Err(PlatformError::CommandFailed(
