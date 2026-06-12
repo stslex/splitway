@@ -2,6 +2,7 @@ use std::process::Command;
 
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnInfo};
 
+use crate::backend::linux::parser::parse_dns_from_nmcli;
 use crate::backend::linux::LinuxBackend;
 
 impl DnsBackend for LinuxBackend {
@@ -15,18 +16,11 @@ impl DnsBackend for LinuxBackend {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let dns_ip = stdout
-            .lines()
-            .find(|line| line.contains("DNS"))
-            .and_then(|line| line.split_whitespace().last())
-            .map(|ip| ip.to_string())
-            .ok_or_else(|| {
-                PlatformError::ParseError("DNS entry not found in nmcli output".to_string())
-            })?;
+        let dns_servers = parse_dns_from_nmcli(&stdout)?;
 
         Ok(VpnInfo {
             interface_name: interface.to_string(),
-            dns_servers: vec![dns_ip],
+            dns_servers,
         })
     }
 
