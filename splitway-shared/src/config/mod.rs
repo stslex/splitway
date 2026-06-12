@@ -15,7 +15,7 @@ pub fn get_config() -> Result<LocalConfig, ConfigParseError> {
     })
 }
 
-pub fn create_empty_config<'a>() -> Result<(), ConfigParseError> {
+pub fn create_empty_config() -> Result<(), ConfigParseError> {
     std::fs::create_dir_all(config_folder_path()).map_err(|e| {
         log::error!("Error create config dir: {e}");
         ConfigParseError::ConfigNotFound
