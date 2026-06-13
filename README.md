@@ -17,7 +17,7 @@ Splitway automates DNS-based traffic splitting: domains matching the rules are r
 - Applies/reverts split-DNS rules through `resolvectl`
 - Runtime control over a Unix socket: `splitway status/enable/disable/add/remove/list/reload`
 - Reverts DNS rules on `SIGTERM`/`SIGINT` so a stop never leaves the system half-configured
-- Linux only, GlobalProtect as first supported VPN
+- Linux only; GlobalProtect and OpenVPN — both NetworkManager-managed — supported
 
 ## Workspace layout
 
@@ -34,10 +34,23 @@ Create `~/.config/splitway/config.json` (auto-created as empty on first run):
 
 ```json
 {
-  "vpn_name": "vpn0",
+  "vpn_name": "tun0",
   "vpn_hosts": ["corp.example.com", "internal.example.com"]
 }
 ```
+
+`vpn_name` is the **network interface (device) name**, not the NetworkManager
+connection name. Find it with `nmcli device status` (or `ip link`) while the VPN
+is up:
+
+- **OpenVPN via NetworkManager** creates a `tun*` device — usually `tun0`. Set
+  `vpn_name` to that device (e.g. `tun0`), *not* the NM connection's name. NM
+  models the VPN as a separate active connection bound to your base interface,
+  but the pushed DNS and the up/down events live on the `tun*` device, which is
+  what Splitway watches.
+- **GlobalProtect** (openconnect) behaves the same way — a `tun*` device.
+- **WireGuard** typically appears as the connection's own device name (e.g.
+  `wg0`).
 
 ## Usage
 

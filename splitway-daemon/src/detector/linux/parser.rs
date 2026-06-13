@@ -85,6 +85,39 @@ IP6.GATEWAY:                            --
         assert_eq!(dns, vec!["10.2.0.1".to_string(), "fd00::1".to_string()]);
     }
 
+    /// Real `nmcli device show tun0` output captured from a
+    /// NetworkManager-managed VPN tunnel (openconnect/GlobalProtect). NM models
+    /// every VPN plugin's `tun*` device the same way and normalizes pushed DNS
+    /// into the device's `IP4.DNS[n]` fields, so this is exactly the field
+    /// layout an OpenVPN-over-NM `tun*` device exposes. The device reports
+    /// `connected (externally)` (NMDeviceState 100) because the VPN client, not
+    /// NM, created it — the parser must still pick up the pushed DNS. Routes are
+    /// trimmed (the real output had ~100); the parser ignores them regardless.
+    #[test]
+    fn openvpn_over_nm_tun_device() {
+        let output = "\
+GENERAL.DEVICE:                         tun0
+GENERAL.TYPE:                           tun
+GENERAL.NM-TYPE:                        NMDeviceTun
+GENERAL.MTU:                            1422
+GENERAL.STATE:                          100 (connected (externally))
+GENERAL.IP-IFACE:                       tun0
+GENERAL.IS-SOFTWARE:                    yes
+GENERAL.NM-MANAGED:                     yes
+GENERAL.CONNECTION:                     tun0
+IP4.ADDRESS[1]:                         10.2.154.1/32
+IP4.GATEWAY:                            --
+IP4.ROUTE[1]:                           dst = 10.77.39.193/32, nh = 0.0.0.0, mt = 50
+IP4.ROUTE[2]:                           dst = 192.168.0.0/24, nh = 0.0.0.0, mt = 50
+IP4.DNS[1]:                             10.77.39.193
+IP6.ADDRESS[1]:                         fe80::cbe6:f1ad:8207:2f4b/64
+IP6.GATEWAY:                            --
+IP6.ROUTE[1]:                           dst = fe80::/64, nh = ::, mt = 256
+";
+        let dns = parse_dns_from_nmcli(output).unwrap();
+        assert_eq!(dns, vec!["10.77.39.193".to_string()]);
+    }
+
     #[test]
     fn no_dns_entries_is_parse_error() {
         let output = "\
