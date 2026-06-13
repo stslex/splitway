@@ -14,10 +14,21 @@ pub fn get_config() -> Result<LocalConfig, ConfigParseError> {
 /// testable without touching the real config location.
 pub fn load_config_from(path: &Path) -> Result<LocalConfig, ConfigParseError> {
     log::info!("Config path: {}", path.display());
-    let config_str = fs::read_to_string(path).map_err(|e| {
-        log::error!("Error read config file: {e}");
-        ConfigParseError::ConfigNotFound
-    })?;
+    let config_str = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        // Only a genuinely absent file is "not found" — the daemon turns that
+        // into an empty config. Any other read failure (permissions, I/O, the
+        // path is a directory, ...) must NOT be mistaken for absence, or the
+        // daemon would overwrite an existing-but-unreadable config with an
+        // empty one. Surface those as a distinct error instead.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(ConfigParseError::ConfigNotFound);
+        }
+        Err(e) => {
+            log::error!("Error reading config {}: {e}", path.display());
+            return Err(ConfigParseError::ReadError(e.to_string()));
+        }
+    };
     serde_json::from_str::<LocalConfig>(&config_str).map_err(|e| {
         log::error!("Error deserialize: {e}");
         ConfigParseError::SerializeError
@@ -120,6 +131,10 @@ pub struct LocalConfig {
 #[derive(Debug)]
 pub enum ConfigParseError {
     ConfigNotFound,
+    /// The config exists but could not be read (permissions, I/O, ...). Kept
+    /// distinct from `ConfigNotFound` so callers never overwrite it with an
+    /// empty config.
+    ReadError(String),
     SerializeError,
     WriteError(String),
 }
@@ -128,6 +143,7 @@ impl Display for ConfigParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConfigParseError::ConfigNotFound => write!(f, "Config file not found"),
+            ConfigParseError::ReadError(e) => write!(f, "Error reading config: {e}"),
             ConfigParseError::SerializeError => write!(f, "Error serialize/deserialize config"),
             ConfigParseError::WriteError(e) => write!(f, "Error writing config: {e}"),
         }
@@ -144,6 +160,29 @@ mod tests {
         dir.push(format!("splitway-config-test-{}-{tag}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir.join("config.json")
+    }
+
+    #[test]
+    fn absent_config_is_not_found_but_unreadable_is_read_error() {
+        // A genuinely missing file -> ConfigNotFound (daemon creates empty).
+        let mut missing = std::env::temp_dir();
+        missing.push(format!("splitway-absent-{}.json", std::process::id()));
+        let _ = fs::remove_file(&missing);
+        assert!(matches!(
+            load_config_from(&missing),
+            Err(ConfigParseError::ConfigNotFound)
+        ));
+
+        // An existing-but-unreadable path (here a directory) -> ReadError, so
+        // the daemon never mistakes it for absence and overwrites it.
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("splitway-readerr-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(matches!(
+            load_config_from(&dir),
+            Err(ConfigParseError::ReadError(_))
+        ));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
