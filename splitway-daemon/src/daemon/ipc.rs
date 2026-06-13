@@ -21,9 +21,12 @@ use crate::daemon::state::StateCommand;
 /// can change DNS. The socket is created, then `chmod`ed to `0600`,
 /// restricting control to the user running the daemon (for the system
 /// service, root). The containing directory is required to be `0700` first
-/// (the `/run/splitway` fallback is created and chmod'd; `$XDG_RUNTIME_DIR` is
-/// verified user-private and the bind refused otherwise), so the brief window
+/// (the system-service socket dir fallback is created and chmod'd;
+/// `$XDG_RUNTIME_DIR` is verified user-private and the bind refused
+/// otherwise), so the brief window
 /// between `bind()` and the `chmod` is not reachable by other users.
+/// (The system socket dir is `SYSTEM_SOCKET_DIR` from `splitway-shared`:
+/// `/run/splitway` on Linux, `/var/run/splitway` on macOS.)
 /// (`umask` is avoided deliberately: it is process-global and would
 /// race file creation in other tasks of this multi-threaded daemon.) For
 /// unprivileged multi-user control, an operator would widen this to `0660`
@@ -55,7 +58,7 @@ pub fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
                 ));
             }
         } else {
-            // The /run/splitway fallback is ours: create it and enforce 0700.
+            // The system-service socket dir fallback is ours: create + 0700.
             std::fs::create_dir_all(dir)?;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
