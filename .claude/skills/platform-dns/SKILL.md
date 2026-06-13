@@ -30,6 +30,7 @@ Bus: system bus, name `org.freedesktop.NetworkManager`.
 - Practical mapping: `100` → VPN up; `30`/`120` (and device removal) → VPN down; ignore intermediate stages; deduplicate repeats — NM can re-emit states
 - GlobalProtect/OpenVPN typically appear as `tun*` devices; WireGuard as `wireguard` type. The device may not exist until the VPN client starts — watch must survive that
 - zbus: generate typed proxies from introspection (`zbus-xmlgen` or `busctl introspect --xml-interface`) instead of hand-writing signatures
+- **OpenVPN-via-NM subtlety:** an OpenVPN connection imported into NM is modelled as a *VPN active connection*, not only a device. NM still creates a `tun*` device whose `StateChanged` fires, but the authoritative VPN up/down may live on the active-connection object (`org.freedesktop.NetworkManager.VPN.Connection`, `VpnStateChanged(u state, u reason)`, state `5` = activated, `7`/`8` = disconnected). Verify with `nmcli connection show --active` + `busctl introspect` whether device `StateChanged` alone is sufficient for the OpenVPN case before adding a second signal source. `nmcli device show tun0` for DNS works regardless
 
 ## nmcli (current detect path)
 
