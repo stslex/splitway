@@ -61,9 +61,15 @@ impl StateMachine {
     }
 
     /// What *should* be applied given the current config and VPN state.
-    /// `None` means "nothing should be applied".
+    /// `None` means "nothing should be applied" (revert to direct DNS).
+    ///
+    /// An empty domain list yields `None`: there is nothing to route, and
+    /// `resolvectl domain <iface>` with zero domains does not clear existing
+    /// ones, so applying an empty set would leave stale split-DNS active.
+    /// Removing the last domain therefore reverts instead.
     fn desired(&self) -> Option<(VpnInfo, Vec<String>)> {
-        match (&self.last_info, self.config.enabled && self.vpn_up) {
+        let active = self.config.enabled && self.vpn_up && !self.config.vpn_hosts.is_empty();
+        match (&self.last_info, active) {
             (Some(info), true) => Some((info.clone(), self.config.vpn_hosts.clone())),
             _ => None,
         }
@@ -502,6 +508,35 @@ mod tests {
         assert_eq!(resp, Response::Ok);
         // No re-apply for an absent removal.
         assert_eq!(backend.applies.lock().unwrap().len(), applies_before);
+    }
+
+    #[tokio::test]
+    async fn empty_domain_list_does_not_apply() {
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend.clone(), config(true, &[]), "empty-no-apply");
+
+        sm.on_event(vpn_up("wg0")).await;
+
+        // Nothing to route → nothing applied (an empty `resolvectl domain`
+        // would not clear anything anyway).
+        assert!(backend.applies.lock().unwrap().is_empty());
+        assert!(sm.applied.is_none());
+    }
+
+    #[tokio::test]
+    async fn removing_last_domain_reverts() {
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend.clone(), config(true, &["a.com"]), "remove-last");
+
+        sm.on_event(vpn_up("wg0")).await;
+        assert!(sm.applied.is_some());
+
+        let resp = sm.on_request(Request::RemoveDomain("a.com".to_string())).await;
+
+        assert_eq!(resp, Response::Ok);
+        // The last domain is gone → revert rather than apply an empty set.
+        assert_eq!(backend.reverts.lock().unwrap().as_slice(), &["wg0"]);
+        assert!(sm.applied.is_none());
     }
 
     #[tokio::test]
