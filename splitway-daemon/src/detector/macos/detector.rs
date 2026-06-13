@@ -34,9 +34,10 @@ impl VpnDetector for MacosDetector {
 pub(super) fn current_dns(interface: &str) -> Result<Vec<String>, PlatformError> {
     let output = Command::new("scutil").arg("--dns").output()?;
     if !output.status.success() {
-        return Err(PlatformError::CommandFailed(
-            "scutil --dns failed".to_string(),
-        ));
+        return Err(PlatformError::CommandFailed(format!(
+            "scutil --dns failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(parse_scutil_dns(&stdout, interface))

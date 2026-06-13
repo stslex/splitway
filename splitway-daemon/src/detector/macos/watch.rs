@@ -8,7 +8,8 @@
 //!
 //! API verified against `system-configuration` 0.7 + `core-foundation` 0.9 and
 //! the crate's own `watch_dns` example. `SCDynamicStore` is not `Send`, so it
-//! is built on the watcher thread rather than moved into it.
+//! is built on the watcher thread rather than moved into it; the `Rc<RefCell>`
+//! dedup likewise never leaves this thread.
 //!
 //! Shutdown is lazy, unlike the Linux watch (which selects on `tx.closed()`):
 //! the dropped receiver is only noticed inside the callback, which fires on the
@@ -16,6 +17,9 @@
 //! thread stays parked in `CFRunLoop::run_current()` until the next event, and
 //! is otherwise reaped at process exit. That is acceptable for a daemon whose
 //! lifetime is the process's; it is not a leak that accumulates.
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use core_foundation::array::CFArray;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
@@ -28,14 +32,15 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use splitway_shared::platform::{PlatformError, VpnEvent, VpnInfo};
 
 use super::detector::current_dns;
-use super::state::{transition, Deduper, Transition};
+use super::state::{Deduper, Emit};
 
 /// State carried through the SCDynamicStore callback (a bare `fn`, so it cannot
-/// capture — everything it needs lives here).
+/// capture — everything it needs lives here). The dedup is shared (`Rc`) with
+/// the post-arm initial sample so the two never double-emit.
 struct WatchContext {
     interface: String,
     tx: Sender<VpnEvent>,
-    dedup: Deduper,
+    dedup: Rc<RefCell<Deduper>>,
 }
 
 /// Spawn the macOS watch thread and return the event receiver.
@@ -52,19 +57,14 @@ pub(super) fn watch(interface: &str) -> Result<Receiver<VpnEvent>, PlatformError
 }
 
 fn run_watch(interface: String, tx: Sender<VpnEvent>) {
-    // Emit the current state once up-front: the VPN may already be up before we
-    // subscribe (mirrors the Linux watch reading the device's current state).
-    let mut dedup = Deduper::default();
-    if !emit_current(&interface, &tx, &mut dedup) {
-        return; // receiver already gone
-    }
+    let dedup = Rc::new(RefCell::new(Deduper::default()));
 
     let context = SCDynamicStoreCallBackContext {
         callout: on_change,
         info: WatchContext {
-            interface,
-            tx,
-            dedup,
+            interface: interface.clone(),
+            tx: tx.clone(),
+            dedup: dedup.clone(),
         },
     };
 
@@ -107,6 +107,17 @@ fn run_watch(interface: String, tx: Sender<VpnEvent>) {
     // `kCFRunLoopCommonModes` is an extern static; reading it is unsafe. It is
     // already a `CFRunLoopMode`, so it is passed without a cast.
     run_loop.add_source(&source, unsafe { kCFRunLoopCommonModes });
+
+    // Sample the current state only AFTER the source is armed: a transition
+    // racing between the sample and arming would otherwise be lost (it happened
+    // before we were listening, and we'd already have a stale sample). With the
+    // source live, any such change is queued and delivered once the run loop
+    // starts; the shared dedup keeps this sample and that delivery from
+    // double-emitting.
+    if !emit_current(&interface, &tx, &mut dedup.borrow_mut()) {
+        return; // receiver already gone
+    }
+
     log::debug!("starting macOS SCDynamicStore watch");
     CFRunLoop::run_current();
     log::debug!("macOS SCDynamicStore watch stopped");
@@ -115,14 +126,16 @@ fn run_watch(interface: String, tx: Sender<VpnEvent>) {
 /// SCDynamicStore change callback. Must match `SCDynamicStoreCallBackT`:
 /// `fn(SCDynamicStore, CFArray<CFString>, &mut T)`.
 fn on_change(_store: SCDynamicStore, _changed_keys: CFArray<CFString>, ctx: &mut WatchContext) {
-    if !emit_current(&ctx.interface, &ctx.tx, &mut ctx.dedup) {
+    let mut dedup = ctx.dedup.borrow_mut();
+    if !emit_current(&ctx.interface, &ctx.tx, &mut dedup) {
         // Receiver dropped: stop the run loop so the thread can exit.
         CFRunLoop::get_current().stop();
     }
 }
 
-/// Read the interface's current DNS, map it to up/down, and send an event if
-/// the state changed. Returns `false` if the receiver has been dropped.
+/// Read the interface's current DNS, decide whether it represents a new state,
+/// and send the corresponding event. Returns `false` if the receiver has been
+/// dropped.
 fn emit_current(interface: &str, tx: &Sender<VpnEvent>, dedup: &mut Deduper) -> bool {
     let servers = match current_dns(interface) {
         Ok(servers) => servers,
@@ -133,18 +146,15 @@ fn emit_current(interface: &str, tx: &Sender<VpnEvent>, dedup: &mut Deduper) -> 
             return true;
         }
     };
-    let transition = transition(!servers.is_empty());
-    if !dedup.changed(transition) {
-        return true;
-    }
-    let event = match transition {
-        Transition::Up => VpnEvent::Up(VpnInfo {
+    let event = match dedup.decide(&servers) {
+        Emit::Up => VpnEvent::Up(VpnInfo {
             interface_name: interface.to_string(),
             dns_servers: servers,
         }),
-        Transition::Down => VpnEvent::Down {
+        Emit::Down => VpnEvent::Down {
             interface_name: interface.to_string(),
         },
+        Emit::Nothing => return true,
     };
     tx.blocking_send(event).is_ok()
 }
