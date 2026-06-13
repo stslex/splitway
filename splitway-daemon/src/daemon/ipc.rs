@@ -57,10 +57,37 @@ pub fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
     }
-    // A socket left over from an unclean shutdown would make bind fail with
-    // EADDRINUSE. We are the single daemon instance, so removing it is safe.
+    // An existing socket file is either stale (from an unclean shutdown) or a
+    // live daemon. Probe it before removing: unconditionally unlinking would
+    // let a second `run` hijack the path from a running daemon, ending with
+    // two daemons mutating DNS.
     if path.exists() {
-        std::fs::remove_file(path)?;
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!(
+                        "another splitway-daemon is already listening on {}",
+                        path.display()
+                    ),
+                ));
+            }
+            // No listener: the socket is stale, safe to remove.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                log::warn!("removing stale socket at {}", path.display());
+                std::fs::remove_file(path)?;
+            }
+            // It vanished between the check and the probe — nothing to remove.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Ambiguous (e.g. permissions): do not hijack a path we cannot
+            // prove is dead.
+            Err(e) => {
+                return Err(std::io::Error::other(format!(
+                    "cannot probe existing socket {}: {e}",
+                    path.display()
+                )));
+            }
+        }
     }
     // Create the socket 0600 atomically: the guard restores the prior umask
     // on drop, success or error.
