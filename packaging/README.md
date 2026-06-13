@@ -14,7 +14,7 @@ The CLI is installed as `splitway` (the name it advertises: `splitway status`,
 ```sh
 sudo install -Dm644 packaging/systemd/splitway.service /etc/systemd/system/splitway.service
 sudo install -Dm755 target/release/splitway-daemon /usr/bin/splitway-daemon
-sudo install -Dm755 target/release/splitway-cli     /usr/bin/splitway
+sudo install -Dm755 target/release/splitway         /usr/bin/splitway
 sudo systemctl enable --now splitway
 ```
 
