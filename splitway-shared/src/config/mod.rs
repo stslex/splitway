@@ -81,15 +81,11 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     })?;
     fs::create_dir_all(dir)?;
 
-    let tmp = dir.join(temp_file_name());
-    let write_result = (|| {
-        // create_new (O_EXCL) refuses to open (and thus never truncates) any
-        // pre-existing file at the temp path; the unique name makes that
-        // essentially impossible anyway.
-        let mut file = File::create_new(&tmp)?;
-        file.write_all(contents)?;
-        file.sync_all()
-    })();
+    // Create a temp file we exclusively own (O_EXCL), so cleaning it up on
+    // failure can never delete a pre-existing file at that path.
+    let (mut file, tmp) = create_temp_file(dir)?;
+    let write_result = file.write_all(contents).and_then(|()| file.sync_all());
+    drop(file);
     if let Err(e) = write_result {
         let _ = fs::remove_file(&tmp);
         return Err(e);
@@ -104,6 +100,26 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
         let _ = dir_file.sync_all();
     }
     Ok(())
+}
+
+/// Create and open a fresh, exclusively-owned (`O_EXCL`) temp file under `dir`,
+/// retrying on the rare name collision (e.g. a leftover temp from a previous
+/// run that reused this pid) with a new name rather than failing. Returns the
+/// open file and the path it created, so the caller cleans up only a temp it
+/// created — never a pre-existing file.
+fn create_temp_file(dir: &Path) -> io::Result<(File, PathBuf)> {
+    for _ in 0..1000 {
+        let tmp = dir.join(temp_file_name());
+        match File::create_new(&tmp) {
+            Ok(file) => return Ok((file, tmp)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not create a unique temp file after many attempts",
+    ))
 }
 
 /// A hidden temp filename unique within this process, used as the atomic-write

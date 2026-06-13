@@ -124,7 +124,15 @@ fn on_change(_store: SCDynamicStore, _changed_keys: CFArray<CFString>, ctx: &mut
 /// Read the interface's current DNS, map it to up/down, and send an event if
 /// the state changed. Returns `false` if the receiver has been dropped.
 fn emit_current(interface: &str, tx: &Sender<VpnEvent>, dedup: &mut Deduper) -> bool {
-    let servers = current_dns(interface).unwrap_or_default();
+    let servers = match current_dns(interface) {
+        Ok(servers) => servers,
+        // A transient `scutil` failure is not "VPN down": keep the last known
+        // state instead of emitting a spurious Down that would revert rules.
+        Err(e) => {
+            log::warn!("reading DNS for {interface} failed: {e}; keeping last state");
+            return true;
+        }
+    };
     let transition = transition(!servers.is_empty());
     if !dedup.changed(transition) {
         return true;

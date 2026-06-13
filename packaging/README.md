@@ -50,19 +50,24 @@ before exiting, so a stop never leaves the system half-configured.
 (`dscacheutil -flushcache`, `killall -HUP mDNSResponder`). VPN up/down is
 detected via SCDynamicStore (`scutil --dns` for the DNS servers).
 
+macOS ships BSD `install`, which has no `-D` flag, so create the target dir
+first (`/Library/LaunchDaemons` already exists):
+
 ```sh
-sudo install -Dm755 target/release/splitway-daemon /usr/local/bin/splitway-daemon
-sudo install -Dm755 target/release/splitway         /usr/local/bin/splitway
-sudo install -Dm644 packaging/launchd/com.splitway.daemon.plist \
+sudo mkdir -p /usr/local/bin
+sudo install -m 755 target/release/splitway-daemon /usr/local/bin/splitway-daemon
+sudo install -m 755 target/release/splitway         /usr/local/bin/splitway
+sudo install -m 644 packaging/launchd/com.splitway.daemon.plist \
     /Library/LaunchDaemons/com.splitway.daemon.plist
 sudo launchctl load -w /Library/LaunchDaemons/com.splitway.daemon.plist
 # stop + revert:
 sudo launchctl unload -w /Library/LaunchDaemons/com.splitway.daemon.plist
 ```
 
-Configure the VPN interface in `~/.config/splitway/config.json` (`vpn_name` is
-the `utun*` interface — find it with `scutil --nwi` or `ifconfig` while the VPN
-is up); the daemon reads `$HOME/.config/splitway` of the user it runs as.
+The plist runs the daemon as root and pins `HOME=/var/root`, so configure the
+VPN interface in `/var/root/.config/splitway/config.json` (`vpn_name` is the
+`utun*` interface — find it with `scutil --nwi` or `ifconfig` while the VPN is
+up).
 
 ### Socket on macOS
 

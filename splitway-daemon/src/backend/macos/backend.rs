@@ -72,9 +72,9 @@ enum Prior {
 /// overwritten, so a mid-write failure restores overwritten files to their
 /// original bytes and removes only the files this call newly created. A failed
 /// re-apply therefore leaves the previously-live split-DNS exactly as it was —
-/// never a partial or empty set. Then prunes our now-unwanted files (best
-/// effort — the target set is already fully written, so pruning failures don't
-/// corrupt it).
+/// never a partial or empty set. Then prunes our now-unwanted files; a prune
+/// failure is returned (not swallowed) so the caller retries rather than
+/// recording success while a dropped domain's file keeps routing.
 fn apply_to_dir(dir: &Path, servers: &[String], domains: &[String]) -> Result<(), PlatformError> {
     // Reject names that are not safe single path components before touching the
     // filesystem: `dir.join("../x")` would escape /etc/resolver, and a
@@ -94,13 +94,27 @@ fn apply_to_dir(dir: &Path, servers: &[String], domains: &[String]) -> Result<()
     for domain in domains {
         let path = resolver_path(dir, domain);
         // Snapshot the prior state so a later failure can restore it exactly.
-        let prior = match fs::read(&path) {
-            // Only overwrite a resolver file we previously wrote. If one exists
-            // without our marker it is the user's: refuse rather than replace
-            // it, because revert would later delete it (it now carries our
-            // marker) and the user's original DNS config would be lost — the
-            // in-call snapshot does not survive a successful apply.
-            Ok(bytes) => {
+        // symlink_metadata does not follow links, so we classify the entry
+        // itself, not a symlink target.
+        let prior = match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => {
+                let bytes = match fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    // Present but unreadable: don't risk clobbering it.
+                    Err(e) => {
+                        rollback(&written);
+                        return Err(PlatformError::CommandFailed(format!(
+                            "failed to read resolver file {} before overwrite: {e}",
+                            path.display()
+                        )));
+                    }
+                };
+                // Only overwrite a resolver file we previously wrote. If one
+                // exists without our marker it is the user's: refuse rather than
+                // replace it, because revert would later delete it (it now
+                // carries our marker) and the user's original DNS config would
+                // be lost — the in-call snapshot does not survive a successful
+                // apply.
                 if !is_managed(&String::from_utf8_lossy(&bytes)) {
                     rollback(&written);
                     return Err(PlatformError::CommandFailed(format!(
@@ -111,11 +125,20 @@ fn apply_to_dir(dir: &Path, servers: &[String], domains: &[String]) -> Result<()
                 Prior::Existed(bytes)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Prior::Absent,
-            // Present but unreadable: don't risk clobbering it irrecoverably.
+            // Exists but is a symlink / directory / other non-regular entry:
+            // refuse. We never follow a symlink (rollback could not restore it,
+            // and the write would replace the link with a regular file).
+            Ok(_) => {
+                rollback(&written);
+                return Err(PlatformError::CommandFailed(format!(
+                    "refusing to overwrite non-regular resolver entry: {}",
+                    path.display()
+                )));
+            }
             Err(e) => {
                 rollback(&written);
                 return Err(PlatformError::CommandFailed(format!(
-                    "failed to read resolver file {} before overwrite: {e}",
+                    "failed to stat resolver file {} before overwrite: {e}",
                     path.display()
                 )));
             }
@@ -134,9 +157,12 @@ fn apply_to_dir(dir: &Path, servers: &[String], domains: &[String]) -> Result<()
     }
 
     let keep: BTreeSet<&str> = domains.iter().map(String::as_str).collect();
-    if let Err(e) = remove_managed(dir, Some(&keep)) {
-        log::warn!("could not prune stale resolver files: {e}");
-    }
+    // Surface prune failures: a leftover file for a dropped domain keeps routing
+    // it through the VPN, so the caller must treat the apply as not fully
+    // converged and retry rather than record success.
+    remove_managed(dir, Some(&keep)).map_err(|e| {
+        PlatformError::CommandFailed(format!("failed to prune stale resolver files: {e}"))
+    })?;
     Ok(())
 }
 
@@ -367,6 +393,27 @@ mod tests {
         // The user's file is left exactly as it was — not replaced by a managed
         // file that a later revert would delete.
         assert_eq!(fs::read_to_string(&user).unwrap(), "nameserver 9.9.9.9\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn apply_refuses_to_overwrite_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = temp_dir("apply-refuse-symlink");
+        // A resolver entry that is a symlink — even pointing at a file that
+        // carries our marker — must not be followed or replaced.
+        let target = dir.join("real-target");
+        fs::write(&target, resolver_contents(&servers())).unwrap();
+        let link = dir.join("corp.example.com");
+        symlink(&target, &link).unwrap();
+
+        let err = apply_to_dir(&dir, &servers(), &["corp.example.com".to_string()]).unwrap_err();
+        assert!(matches!(err, PlatformError::CommandFailed(_)));
+        // The symlink is left as-is (not followed, not replaced by a file).
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         fs::remove_dir_all(&dir).unwrap();
     }
 
