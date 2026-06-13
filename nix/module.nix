@@ -51,6 +51,10 @@ in
         ExecStart = "${lib.getExe cfg.package} run";
         Restart = "on-failure";
         RestartSec = 2;
+        # systemd creates /run/splitway (0700) before start and removes it on
+        # stop; the daemon binds its 0600 control socket inside it.
+        RuntimeDirectory = "splitway";
+        RuntimeDirectoryMode = "0700";
         # SIGTERM is trapped by the daemon to revert DNS rules before exit,
         # so a stop never leaves the system half-configured.
         KillSignal = "SIGTERM";

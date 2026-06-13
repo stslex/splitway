@@ -14,6 +14,12 @@ ExecStart=/usr/bin/splitway-daemon run
 Restart=on-failure
 RestartSec=2
 
+# systemd creates /run/splitway (0700, root) before start and removes it on
+# stop. The daemon binds its 0600 control socket inside it; the 0700 dir is
+# part of the socket's defense in depth (see packaging/README.md).
+RuntimeDirectory=splitway
+RuntimeDirectoryMode=0700
+
 # Runs as root deliberately. `resolvectl dns|domain|revert <iface>` performs
 # privileged DNS changes that polkit otherwise gates behind interactive
 # authentication — unworkable for an unattended daemon. Running as root
