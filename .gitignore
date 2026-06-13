@@ -2,3 +2,6 @@
 /target
 .claude
 .idea
+
+# Nix build result symlink
+/result
