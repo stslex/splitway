@@ -1,0 +1,30 @@
+[Unit]
+Description=Splitway split-DNS daemon
+Documentation=https://github.com/stslex/splitway
+# VPN detection needs NetworkManager (D-Bus); applying rules needs
+# systemd-resolved (resolvectl). Order after both so they are present.
+After=network-online.target NetworkManager.service systemd-resolved.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Installed to /usr/bin by deb/rpm/pacman packages. (The Nix build wires
+# its own ExecStart via the package store path; see nix/module.nix.)
+ExecStart=/usr/bin/splitway-daemon run
+Restart=on-failure
+RestartSec=2
+
+# Runs as root deliberately. `resolvectl dns|domain|revert <iface>` performs
+# privileged DNS changes that polkit otherwise gates behind interactive
+# authentication — unworkable for an unattended daemon. Running as root
+# sidesteps that. The privilege boundary for the unprivileged CLI is the
+# Unix control socket (mode 0600); see packaging/README.md for the threat
+# model. (A user service would need polkit rules granting the DNS actions.)
+
+# On stop, systemd sends SIGTERM, which the daemon traps to revert active
+# DNS rules before exiting — the system is never left half-configured.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
