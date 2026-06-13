@@ -39,7 +39,8 @@ async fn run_async(config: LocalConfig) {
     let interface = config.vpn_name.clone();
     if interface.is_empty() {
         log::warn!(
-            "vpn_name is empty in config; the daemon will idle until it is set and reloaded"
+            "vpn_name is empty in config; set it and restart the daemon to enable auto-apply \
+             (config reload re-reads domains/enabled but does not restart the interface watch)"
         );
     }
 
