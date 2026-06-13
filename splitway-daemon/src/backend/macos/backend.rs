@@ -158,11 +158,16 @@ fn apply_to_dir(dir: &Path, servers: &[String], domains: &[String]) -> Result<()
 
     let keep: BTreeSet<&str> = domains.iter().map(String::as_str).collect();
     // Surface prune failures: a leftover file for a dropped domain keeps routing
-    // it through the VPN, so the caller must treat the apply as not fully
-    // converged and retry rather than record success.
-    remove_managed(dir, Some(&keep)).map_err(|e| {
-        PlatformError::CommandFailed(format!("failed to prune stale resolver files: {e}"))
-    })?;
+    // it through the VPN. Roll back this call's writes first — on a failed
+    // reconcile the state machine does not record `applied`, so newly-created
+    // files left behind would be skipped by a later revert. Rolling back returns
+    // the directory to its pre-apply state, consistent with the retained state.
+    if let Err(e) = remove_managed(dir, Some(&keep)) {
+        rollback(&written);
+        return Err(PlatformError::CommandFailed(format!(
+            "failed to prune stale resolver files: {e}"
+        )));
+    }
     Ok(())
 }
 

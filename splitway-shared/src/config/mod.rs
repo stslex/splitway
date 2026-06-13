@@ -198,6 +198,10 @@ mod tests {
     fn temp_config(tag: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
         dir.push(format!("splitway-config-test-{}-{tag}", std::process::id()));
+        // Start from a clean directory so assertions (e.g. "no temp file left
+        // behind") reflect only this run, not leftovers from a crashed run or a
+        // reused pid.
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir.join("config.json")
     }
