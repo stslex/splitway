@@ -101,15 +101,17 @@ impl StateMachine {
                         Ok(())
                     }
                     Ok(Err(e)) => {
-                        // apply_rules rolls back a partial apply, so the
-                        // interface is left reverted, not half-configured.
+                        // Leave `applied` as it was: a failed apply may have
+                        // left the *previous* rules in place (e.g. the DNS
+                        // step fails before apply_rules' rollback runs), so we
+                        // must still remember to revert them later. Clearing it
+                        // would make disable/down/shutdown skip the revert and
+                        // leave stale DNS active.
                         log::error!("apply_rules failed on {}: {e}", info.interface_name);
-                        self.applied = None;
                         Err(e)
                     }
                     Err(e) => {
                         log::error!("apply task panicked: {e}");
-                        self.applied = None;
                         Err(PlatformError::CommandFailed(format!(
                             "apply task panicked: {e}"
                         )))
@@ -318,20 +320,28 @@ pub async fn run_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
-    /// Records what the state machine asks the backend to do.
+    /// Records what the state machine asks the backend to do. `fail_apply` is
+    /// atomic so a test can flip it after a first successful apply.
     #[derive(Default)]
     struct MockBackend {
         applies: Mutex<Vec<(String, Vec<String>)>>,
         reverts: Mutex<Vec<String>>,
-        fail_apply: bool,
+        fail_apply: AtomicBool,
         fail_revert: bool,
+    }
+
+    impl MockBackend {
+        fn set_fail_apply(&self, fail: bool) {
+            self.fail_apply.store(fail, Ordering::Relaxed);
+        }
     }
 
     impl DnsBackend for MockBackend {
         fn apply_rules(&self, info: &VpnInfo, domains: &[String]) -> Result<(), PlatformError> {
-            if self.fail_apply {
+            if self.fail_apply.load(Ordering::Relaxed) {
                 return Err(PlatformError::CommandFailed(
                     "mock apply failure".to_string(),
                 ));
@@ -528,17 +538,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_apply_leaves_state_unapplied() {
+    async fn failed_first_apply_leaves_state_unapplied() {
         let backend = Arc::new(MockBackend {
-            fail_apply: true,
+            fail_apply: AtomicBool::new(true),
             ..Default::default()
         });
         let mut sm = machine(backend.clone(), config(true, &["a.com"]), "apply-fails");
 
         sm.on_event(vpn_up("wg0")).await;
 
-        // Apply failed: nothing is recorded as applied, so a later revert
-        // won't run against a state we never reached.
+        // The very first apply failed and nothing was applied before, so there
+        // is correctly nothing to revert later.
+        assert!(sm.applied.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_reapply_preserves_previous_applied_state() {
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend.clone(), config(true, &["a.com"]), "reapply-fails");
+
+        // First apply succeeds.
+        sm.on_event(vpn_up("wg0")).await;
+        assert!(sm.applied.is_some());
+
+        // A re-apply (triggered by adding a domain) now fails...
+        backend.set_fail_apply(true);
+        let resp = sm.on_request(Request::AddDomain("b.com".to_string())).await;
+        assert!(matches!(resp, Response::Error(_)));
+
+        // ...the previous applied snapshot is retained (the old rules may
+        // still be installed), so a later revert still runs against it.
+        assert!(sm.applied.is_some());
+        backend.set_fail_apply(false);
+        sm.on_event(VpnEvent::Down {
+            interface_name: "wg0".to_string(),
+        })
+        .await;
+        assert_eq!(backend.reverts.lock().unwrap().as_slice(), &["wg0"]);
         assert!(sm.applied.is_none());
     }
 
@@ -565,7 +601,7 @@ mod tests {
     #[tokio::test]
     async fn config_mutation_reports_apply_failure_but_still_persists() {
         let backend = Arc::new(MockBackend {
-            fail_apply: true,
+            fail_apply: AtomicBool::new(true),
             ..Default::default()
         });
         let mut sm = machine(
