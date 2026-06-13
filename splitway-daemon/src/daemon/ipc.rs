@@ -20,9 +20,11 @@ use crate::daemon::state::StateCommand;
 /// not. The socket is the privilege boundary — any process that can write it
 /// can change DNS. The socket is created, then `chmod`ed to `0600`,
 /// restricting control to the user running the daemon (for the system
-/// service, root). The containing directory is enforced to `0700` first, so
-/// the brief window between `bind()` and the `chmod` is not reachable by other
-/// users. (`umask` is avoided deliberately: it is process-global and would
+/// service, root). The containing directory is required to be `0700` first
+/// (the `/run/splitway` fallback is created and chmod'd; `$XDG_RUNTIME_DIR` is
+/// verified user-private and the bind refused otherwise), so the brief window
+/// between `bind()` and the `chmod` is not reachable by other users.
+/// (`umask` is avoided deliberately: it is process-global and would
 /// race file creation in other tasks of this multi-threaded daemon.) For
 /// unprivileged multi-user control, an operator would widen this to `0660`
 /// owned by a dedicated group — not done by default, to avoid silently

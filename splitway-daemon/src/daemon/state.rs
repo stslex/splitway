@@ -115,12 +115,12 @@ impl StateMachine {
                         Ok(())
                     }
                     Ok(Err(e)) => {
-                        // Leave `applied` as it was: a failed apply may have
-                        // left the *previous* rules in place (e.g. the DNS
-                        // step fails before apply_rules' rollback runs), so we
-                        // must still remember to revert them later. Clearing it
-                        // would make disable/down/shutdown skip the revert and
-                        // leave stale DNS active.
+                        // Don't assume the system is clean on failure: apply may
+                        // have left the *previous* rules in place (the backend
+                        // can return Err without reverting, e.g. when the DNS
+                        // step itself fails). Keep `applied` so a later
+                        // disable/down/shutdown still reverts it; clearing it
+                        // would skip that and leave stale DNS active.
                         log::error!("apply_rules failed on {}: {e}", info.interface_name);
                         Err(e)
                     }
@@ -228,7 +228,13 @@ impl StateMachine {
 
     async fn set_enabled(&mut self, enabled: bool) -> Response {
         if self.config.enabled == enabled {
-            return Response::Ok;
+            // No config change, but a previous apply/revert may have failed;
+            // reconcile so a repeated enable/disable retries it instead of
+            // reporting success while the system is still out of sync.
+            return match self.reconcile().await {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error(format!("failed to apply current state: {e}")),
+            };
         }
         let mut next = self.config.clone();
         next.enabled = enabled;
@@ -337,19 +343,23 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
-    /// Records what the state machine asks the backend to do. `fail_apply` is
-    /// atomic so a test can flip it after a first successful apply.
+    /// Records what the state machine asks the backend to do. `fail_apply` /
+    /// `fail_revert` are atomic so a test can flip them after a first call.
     #[derive(Default)]
     struct MockBackend {
         applies: Mutex<Vec<(String, Vec<String>)>>,
         reverts: Mutex<Vec<String>>,
         fail_apply: AtomicBool,
-        fail_revert: bool,
+        fail_revert: AtomicBool,
     }
 
     impl MockBackend {
         fn set_fail_apply(&self, fail: bool) {
             self.fail_apply.store(fail, Ordering::Relaxed);
+        }
+
+        fn set_fail_revert(&self, fail: bool) {
+            self.fail_revert.store(fail, Ordering::Relaxed);
         }
     }
 
@@ -369,7 +379,7 @@ mod tests {
 
         fn revert_rules(&self, interface: &str) -> Result<(), PlatformError> {
             self.reverts.lock().unwrap().push(interface.to_string());
-            if self.fail_revert {
+            if self.fail_revert.load(Ordering::Relaxed) {
                 return Err(PlatformError::CommandFailed(
                     "mock revert failure".to_string(),
                 ));
@@ -650,7 +660,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_revert_failure_reports_unclean() {
         let backend = Arc::new(MockBackend {
-            fail_revert: true,
+            fail_revert: AtomicBool::new(true),
             ..Default::default()
         });
         let mut sm = machine(
@@ -665,6 +675,30 @@ mod tests {
         // Revert failed: shutdown reports unclean and keeps `applied` set.
         assert!(!clean);
         assert!(sm.applied.is_some());
+    }
+
+    #[tokio::test]
+    async fn repeated_disable_retries_a_failed_revert() {
+        let backend = Arc::new(MockBackend {
+            fail_revert: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let mut sm = machine(backend.clone(), config(true, &["a.com"]), "disable-retry");
+
+        sm.on_event(vpn_up("wg0")).await;
+        assert!(sm.applied.is_some());
+
+        // First disable persists enabled=false but the revert fails.
+        let first = sm.on_request(Request::Disable).await;
+        assert!(matches!(first, Response::Error(_)));
+        assert!(sm.applied.is_some());
+
+        // The backend recovers; a repeated `disable` (config unchanged) must
+        // still reconcile and retry the revert rather than reporting success.
+        backend.set_fail_revert(false);
+        let second = sm.on_request(Request::Disable).await;
+        assert_eq!(second, Response::Ok);
+        assert!(sm.applied.is_none());
     }
 
     #[tokio::test]
