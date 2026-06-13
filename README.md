@@ -59,6 +59,19 @@ cargo build --release
 
 Binaries are placed in `target/release/`.
 
+### Nix
+
+With flakes enabled:
+
+```sh
+nix build      # build both binaries into ./result/bin/
+nix develop    # dev shell with cargo, rustc, rustfmt, clippy, rust-analyzer
+```
+
+The flake also exposes `nixosModules.default`. On a NixOS host, import it and
+set `services.splitway.enable = true;` to install the package system-wide. The
+systemd service is a commented-out stub until the real daemon lands in Phase 2.
+
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md) — phased plan with done-criteria: testable foundation → abstraction split → real daemon + IPC → OpenVPN/macOS backends → primitive GUI. Near-term priorities: NixOS packaging, macOS, OpenVPN, minimal GUI.
