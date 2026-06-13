@@ -68,6 +68,7 @@ mod tests {
         assert_eq!(dedup.decide(&s(&["1.1.1.1"])), Emit::Up);
         assert_eq!(dedup.decide(&s(&[])), Emit::Down);
         assert_eq!(dedup.decide(&s(&[])), Emit::Nothing); // already down
+        assert_eq!(dedup.decide(&s(&["1.1.1.1"])), Emit::Up); // up again (last reset to None)
     }
 
     #[test]

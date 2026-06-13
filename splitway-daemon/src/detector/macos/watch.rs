@@ -125,9 +125,20 @@ fn run_watch(interface: String, tx: Sender<VpnEvent>) {
 
 /// SCDynamicStore change callback. Must match `SCDynamicStoreCallBackT`:
 /// `fn(SCDynamicStore, CFArray<CFString>, &mut T)`.
+///
+/// This runs via an `extern "C"` trampoline, so a panic must not unwind across
+/// it (that aborts the process). Catch any unexpected panic, log it, and keep
+/// the watch alive — a one-off failed sample is recoverable on the next event.
 fn on_change(_store: SCDynamicStore, _changed_keys: CFArray<CFString>, ctx: &mut WatchContext) {
-    let mut dedup = ctx.dedup.borrow_mut();
-    if !emit_current(&ctx.interface, &ctx.tx, &mut dedup) {
+    let alive = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut dedup = ctx.dedup.borrow_mut();
+        emit_current(&ctx.interface, &ctx.tx, &mut dedup)
+    }))
+    .unwrap_or_else(|_| {
+        log::error!("macOS DNS watch callback panicked; ignoring this notification");
+        true // stay alive rather than tear the loop down on a transient panic
+    });
+    if !alive {
         // Receiver dropped: stop the run loop so the thread can exit.
         CFRunLoop::get_current().stop();
     }
