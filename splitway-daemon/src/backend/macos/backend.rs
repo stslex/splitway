@@ -160,8 +160,11 @@ fn apply_to_dir(dir: &Path, servers: &[String], domains: &[String]) -> Result<()
     // Surface prune failures: a leftover file for a dropped domain keeps routing
     // it through the VPN. Roll back this call's writes first — on a failed
     // reconcile the state machine does not record `applied`, so newly-created
-    // files left behind would be skipped by a later revert. Rolling back returns
-    // the directory to its pre-apply state, consistent with the retained state.
+    // files left behind would be skipped by a later revert. This undoes only
+    // this call's writes; a partially-completed prune is not un-deleted, but
+    // prune only ever removes files that are being dropped or are already stale,
+    // so those deletions are safe to leave. The result stays consistent with the
+    // retained `applied` state.
     if let Err(e) = remove_managed(dir, Some(&keep)) {
         rollback(&written);
         return Err(PlatformError::CommandFailed(format!(
@@ -428,6 +431,40 @@ mod tests {
         let err = apply_to_dir(&dir, &servers(), &["../escape".to_string()]).unwrap_err();
         assert!(matches!(err, PlatformError::CommandFailed(_)));
         assert!(!dir.join("../escape").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_prune_rolls_back_this_calls_writes() {
+        use std::process::Command;
+        // Exercises the prune-failure branch the write-failure tests can't reach:
+        // a stale managed file for a dropped domain is made immutable (chflags
+        // uchg) so remove_managed fails AFTER the fresh write for a.com succeeds.
+        let dir = temp_dir("prune-rollback");
+        let stale = dir.join("b.com");
+        fs::write(&stale, resolver_contents(&servers())).unwrap();
+        assert!(Command::new("chflags")
+            .args(["uchg"])
+            .arg(&stale)
+            .status()
+            .unwrap()
+            .success());
+
+        let err = apply_to_dir(&dir, &servers(), &["a.com".to_string()]).unwrap_err();
+        assert!(matches!(err, PlatformError::CommandFailed(_)));
+        // The freshly-written a.com (Prior::Absent) is rolled back, and the
+        // un-prunable file is left untouched.
+        assert!(
+            !dir.join("a.com").exists(),
+            "the fresh write must be rolled back when prune fails"
+        );
+        assert!(stale.exists(), "an un-prunable file is left intact");
+
+        // Teardown: clear the immutable flag so the dir can be removed.
+        let _ = Command::new("chflags")
+            .args(["nouchg"])
+            .arg(&stale)
+            .status();
         fs::remove_dir_all(&dir).unwrap();
     }
 }
