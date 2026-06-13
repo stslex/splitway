@@ -86,10 +86,21 @@ pub fn config_file_path() -> PathBuf {
 }
 
 fn config_folder_path() -> PathBuf {
-    PathBuf::from(format!(
-        "{}/.config/splitway",
-        std::env::var("HOME").unwrap()
-    ))
+    // Resolve without panicking — this runs inside a long-lived daemon that
+    // may be a systemd service where HOME is not guaranteed. Prefer
+    // $XDG_CONFIG_HOME, then $HOME/.config, then a root-service fallback.
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("splitway");
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home).join(".config").join("splitway");
+        }
+    }
+    log::warn!("neither XDG_CONFIG_HOME nor HOME is set; falling back to /root/.config/splitway");
+    PathBuf::from("/root/.config/splitway")
 }
 
 fn default_enabled() -> bool {
