@@ -17,6 +17,7 @@ tokio = { version = "1", features = [
     "net",
     "io-util",
     "signal",
+    "time",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
