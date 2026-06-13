@@ -14,48 +14,28 @@ use splitway_shared::ipc::{RequestEnvelope, Response, PROTOCOL_VERSION};
 
 use crate::daemon::state::StateCommand;
 
-/// Restores the previous process umask when dropped, so a tightened umask
-/// around `bind()` cannot leak to the rest of the process (including on the
-/// error path).
-struct UmaskGuard(libc::mode_t);
-
-impl UmaskGuard {
-    /// Tighten the umask to `0o177` so a freshly created file gets mode
-    /// `0600` (owner read/write only).
-    fn owner_only() -> Self {
-        // SAFETY: `umask` is always safe to call; it just swaps a per-process
-        // value and returns the prior one.
-        UmaskGuard(unsafe { libc::umask(0o177) })
-    }
-}
-
-impl Drop for UmaskGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `owner_only`.
-        unsafe {
-            libc::umask(self.0);
-        }
-    }
-}
-
 /// Bind the control socket with owner-only (`0600`) permissions.
 ///
 /// Security model: the daemon makes privileged DNS changes; the CLI does
 /// not. The socket is the privilege boundary — any process that can write it
-/// can change DNS. The socket is created `0600` *atomically* via a tightened
-/// umask around `bind()` (no world-accessible window), restricting control to
-/// the user running the daemon (for the system service, root). The containing
-/// directory is also `0700` (`$XDG_RUNTIME_DIR` already is; the
-/// `/run/splitway` fallback is created that way, or pre-created by systemd's
-/// `RuntimeDirectory=`). For unprivileged multi-user control, an operator
-/// would widen this to `0660` owned by a dedicated group — not done by
-/// default, to avoid silently broadening who can change DNS.
+/// can change DNS. The socket is created, then `chmod`ed to `0600`,
+/// restricting control to the user running the daemon (for the system
+/// service, root). The containing directory is enforced to `0700` first, so
+/// the brief window between `bind()` and the `chmod` is not reachable by other
+/// users. (`umask` is avoided deliberately: it is process-global and would
+/// race file creation in other tasks of this multi-threaded daemon.) For
+/// unprivileged multi-user control, an operator would widen this to `0660`
+/// owned by a dedicated group — not done by default, to avoid silently
+/// broadening who can change DNS.
 pub fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(dir) = path.parent() {
-        if !dir.exists() {
-            std::fs::create_dir_all(dir)?;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        }
+        // Enforce 0700 on the parent unconditionally (not just when we create
+        // it): the socket's own mode is only applied after bind(), and a 0700
+        // parent is what closes that window. For $XDG_RUNTIME_DIR this is
+        // already the case; for /run/splitway we own it. A failure here is
+        // fatal (propagated), since the security model depends on it.
+        std::fs::create_dir_all(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     // An existing socket file is either stale (from an unclean shutdown) or a
     // live daemon. Probe it before removing: unconditionally unlinking would
@@ -89,12 +69,8 @@ pub fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
             }
         }
     }
-    // Create the socket 0600 atomically: the guard restores the prior umask
-    // on drop, success or error.
-    let listener = {
-        let _umask = UmaskGuard::owner_only();
-        UnixListener::bind(path)?
-    };
+    let listener = UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
 }
 
@@ -126,6 +102,16 @@ pub async fn serve(listener: UnixListener, state_tx: mpsc::Sender<StateCommand>)
 /// multiple requests can still share a connection.
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
+/// Outcome of reading one request line.
+enum LineRead {
+    /// A complete line is available in the caller's buffer.
+    Line,
+    /// Clean EOF with no pending line.
+    Eof,
+    /// The line exceeded [`MAX_REQUEST_BYTES`] before a newline was seen.
+    TooLong,
+}
+
 async fn handle_connection(
     stream: UnixStream,
     state_tx: mpsc::Sender<StateCommand>,
@@ -135,51 +121,73 @@ async fn handle_connection(
     let mut line = Vec::new();
     loop {
         line.clear();
-        let n = read_line_capped(&mut reader, &mut line, MAX_REQUEST_BYTES).await?;
-        if n == 0 {
-            break; // EOF
-        }
-        let response = match std::str::from_utf8(&line) {
-            Ok(text) if text.trim().is_empty() => continue,
-            Ok(text) => process_line(text, &state_tx).await,
-            Err(_) => Response::Error("malformed request: not valid UTF-8".to_string()),
+        let response = match read_line_capped(&mut reader, &mut line, MAX_REQUEST_BYTES).await? {
+            LineRead::Eof => break,
+            LineRead::TooLong => {
+                // The stream is desynced past the cap; answer with an error
+                // (per the documented contract — never silently drop) and
+                // close the connection rather than try to resynchronize.
+                log::warn!("IPC request exceeded {MAX_REQUEST_BYTES} bytes; rejecting");
+                write_response(
+                    &mut write_half,
+                    &Response::Error("request exceeds maximum length".to_string()),
+                )
+                .await?;
+                break;
+            }
+            LineRead::Line => match std::str::from_utf8(&line) {
+                Ok(text) if text.trim().is_empty() => continue,
+                Ok(text) => process_line(text, &state_tx).await,
+                Err(_) => Response::Error("malformed request: not valid UTF-8".to_string()),
+            },
         };
-        let mut encoded = serde_json::to_string(&response)
-            .unwrap_or_else(|e| format!("{{\"Error\":\"failed to encode response: {e}\"}}"));
-        encoded.push('\n');
-        write_half.write_all(encoded.as_bytes()).await?;
-        write_half.flush().await?;
+        write_response(&mut write_half, &response).await?;
     }
     Ok(())
 }
 
-/// Read one `\n`-terminated line into `buf`, erroring if it would exceed
-/// `max` bytes. Returns the number of bytes read (0 at EOF).
+async fn write_response(
+    write_half: &mut (impl tokio::io::AsyncWrite + Unpin),
+    response: &Response,
+) -> std::io::Result<()> {
+    let mut encoded = serde_json::to_string(response)
+        .unwrap_or_else(|e| format!("{{\"Error\":\"failed to encode response: {e}\"}}"));
+    encoded.push('\n');
+    write_half.write_all(encoded.as_bytes()).await?;
+    write_half.flush().await
+}
+
+/// Read one `\n`-terminated line into `buf`, enforcing the `max` cap whether
+/// or not the terminating newline lands in the same `fill_buf` chunk.
 async fn read_line_capped(
     reader: &mut (impl AsyncBufRead + Unpin),
     buf: &mut Vec<u8>,
     max: usize,
-) -> std::io::Result<usize> {
+) -> std::io::Result<LineRead> {
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
-            return Ok(buf.len()); // EOF
+            return Ok(if buf.is_empty() {
+                LineRead::Eof
+            } else {
+                LineRead::Line
+            });
         }
         match available.iter().position(|&b| b == b'\n') {
             Some(i) => {
+                if buf.len() + i + 1 > max {
+                    return Ok(LineRead::TooLong);
+                }
                 buf.extend_from_slice(&available[..=i]);
                 reader.consume(i + 1);
-                return Ok(buf.len());
+                return Ok(LineRead::Line);
             }
             None => {
                 buf.extend_from_slice(available);
                 let consumed = available.len();
                 reader.consume(consumed);
                 if buf.len() > max {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "IPC request line exceeds maximum length",
-                    ));
+                    return Ok(LineRead::TooLong);
                 }
             }
         }
