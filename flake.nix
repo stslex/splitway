@@ -8,10 +8,13 @@
   outputs =
     { self, nixpkgs }:
     let
-      # x86_64-linux: primary target and NixOS host platform.
-      # aarch64-darwin: Apple Silicon dev shells.
+      # Linux hosts (x86_64 + aarch64): build targets and NixOS host
+      # platforms — the NixOS module's default package resolves against
+      # these. aarch64-darwin: Apple Silicon dev shells. Mirrors the
+      # release matrix in .github/workflows/release.yml.
       systems = [
         "x86_64-linux"
+        "aarch64-linux"
         "aarch64-darwin"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
