@@ -30,15 +30,30 @@ use crate::daemon::state::StateCommand;
 pub fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(dir) = path.parent() {
         // The socket's own mode is only applied after bind(), so a 0700 parent
-        // is what closes that window. For the /run/splitway fallback (which we
-        // own) create it and enforce 0700. We do not touch $XDG_RUNTIME_DIR:
-        // the XDG spec already mandates it be 0700 owned by the user, and it is
-        // a shared session dir we should not chmod. A failure here is fatal
-        // (propagated), since the security model depends on the 0700 parent.
+        // is what closes that window. A failure here is fatal (propagated),
+        // since the security model depends on the 0700 parent.
         let is_xdg_runtime = std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|value| !value.is_empty())
             .is_some_and(|value| Path::new(&value) == dir);
-        if !is_xdg_runtime {
+        if is_xdg_runtime {
+            // We do not chmod the shared session dir, but we must not trust it
+            // blindly either: if $XDG_RUNTIME_DIR is misconfigured to be
+            // group/other-accessible, the bind()->chmod window below would be
+            // exposed. Verify it is user-private and fail fast otherwise.
+            let mode = std::fs::metadata(dir)?.permissions().mode();
+            if mode & 0o077 != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to bind: {} is not user-private (mode {:o}); \
+                         expected no group/other access",
+                        dir.display(),
+                        mode & 0o7777
+                    ),
+                ));
+            }
+        } else {
+            // The /run/splitway fallback is ours: create it and enforce 0700.
             std::fs::create_dir_all(dir)?;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
@@ -94,9 +109,13 @@ pub async fn serve(listener: UnixListener, state_tx: mpsc::Sender<StateCommand>)
                 });
             }
             Err(e) => {
-                // A persistent accept error would otherwise spin this loop.
-                log::error!("IPC accept failed: {e}");
-                break;
+                // Most accept() errors are transient: a client that hangs up
+                // between connect and accept yields ECONNABORTED; fd pressure
+                // yields EMFILE/ENFILE. Keep serving rather than tearing down
+                // the control socket for the rest of the daemon's lifetime; a
+                // short backoff avoids a busy-spin if the condition persists.
+                log::warn!("IPC accept failed (continuing): {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
     }
