@@ -8,22 +8,23 @@ Corporate VPNs like GlobalProtect capture all traffic by default. Splitting requ
 
 ## What it does
 
-Splitway automates DNS-based traffic splitting: domains matching the rules are resolved through the VPN's DNS server; everything else goes direct. Today this is a one-shot command (`run`/`revert`); automatic apply/revert on VPN interface up/down is the headline feature of Phase 2 in the roadmap.
+Splitway automates DNS-based traffic splitting: domains matching the rules are resolved through the VPN's DNS server; everything else goes direct. The daemon watches the VPN interface and applies/reverts rules automatically on up/down, and is controllable at runtime via the `splitway` CLI over a Unix socket.
 
-## Current state (MVP)
+## Current state
 
-- Daemon reads config from `~/.config/splitway/config.json`
-- Auto-detects VPN DNS server via NetworkManager
+- Long-running daemon: auto-applies rules on VPN up, auto-reverts on down
+- Auto-detects VPN DNS server via NetworkManager (D-Bus event stream)
 - Applies/reverts split-DNS rules through `resolvectl`
-- CLI commands: `run`, `revert`, `status`
-- Linux only, GlobalProtect as first supported VPN, one-shot (no interface monitoring yet)
+- Runtime control over a Unix socket: `splitway status/enable/disable/add/remove/list/reload`
+- Reverts DNS rules on `SIGTERM`/`SIGINT` so a stop never leaves the system half-configured
+- Linux only, GlobalProtect as first supported VPN
 
 ## Workspace layout
 
 ```
 splitway/
 ├── splitway-daemon/   # Core daemon — applies/reverts resolvectl rules
-├── splitway-cli/      # CLI frontend (IPC client, in progress)
+├── splitway-cli/      # CLI frontend (IPC client over the daemon socket)
 └── splitway-shared/   # Shared types and config parsing
 ```
 
@@ -40,16 +41,36 @@ Create `~/.config/splitway/config.json` (auto-created as empty on first run):
 
 ## Usage
 
+`splitway-daemon run` is a long-running daemon: it watches the configured VPN
+interface and automatically applies split-DNS rules when it comes up and
+reverts them when it goes down. It also serves a Unix control socket. Run it
+as a service — see [packaging/](packaging/README.md) (systemd) or the flake's
+`nixosModules.default` (NixOS).
+
 ```sh
-# Apply split-DNS rules for configured VPN interface
+# Start the daemon (normally via systemd, not by hand)
 splitway-daemon run
 
-# Revert all rules for the VPN interface
-splitway-daemon revert
-
-# Show current routing status
-splitway-daemon status
+# Daemon's own subcommands:
+splitway-daemon status   # query the running daemon over IPC
+splitway-daemon revert   # emergency direct revert; works even with no daemon
 ```
+
+Control a running daemon with the `splitway` CLI over the socket:
+
+```sh
+splitway status            # show enabled / vpn_up / applied / domains
+splitway enable            # start applying rules (persisted)
+splitway disable           # stop applying and revert (persisted)
+splitway add corp.example  # route a domain through the VPN (persisted)
+splitway remove corp.example
+splitway list              # list configured domains
+splitway reload            # re-read config.json from disk
+```
+
+`disable` tells the running daemon to stop applying and persists that choice;
+`splitway-daemon revert` is a one-shot escape hatch that talks straight to the
+DNS backend and works even when no daemon is running.
 
 ## Build
 

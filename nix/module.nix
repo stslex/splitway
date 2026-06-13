@@ -31,22 +31,31 @@ in
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ cfg.package ];
 
-    # No systemd service yet. The binary is one-shot today
-    # (`splitway-daemon run` / `revert` / `status`); the long-running
-    # daemon that watches the VPN interface and applies/reverts DNS rules
-    # automatically arrives in Phase 2. The eventual unit will look
-    # roughly like the sketch below — kept commented out so this module
-    # does not invent behavior the binary does not have yet:
+    # Long-running daemon: watches the VPN interface and applies/reverts
+    # split-DNS rules automatically, and serves the CLI's control socket.
     #
-    # systemd.services.splitway = {
-    #   description = "Splitway split-DNS daemon";
-    #   after = [ "network-online.target" "NetworkManager.service" ];
-    #   wants = [ "network-online.target" ];
-    #   wantedBy = [ "multi-user.target" ];
-    #   serviceConfig = {
-    #     ExecStart = "${lib.getExe cfg.package} run";
-    #     Restart = "on-failure";
-    #   };
-    # };
+    # Runs as root (the default): `resolvectl` DNS changes are privileged.
+    # The 0600 control socket is the privilege boundary for the CLI; see
+    # packaging/README.md for the threat model.
+    systemd.services.splitway = {
+      description = "Splitway split-DNS daemon";
+      documentation = [ "https://github.com/stslex/splitway" ];
+      after = [
+        "network-online.target"
+        "NetworkManager.service"
+        "systemd-resolved.service"
+      ];
+      wants = [ "network-online.target" ];
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        ExecStart = "${lib.getExe cfg.package} run";
+        Restart = "on-failure";
+        RestartSec = 2;
+        # SIGTERM is trapped by the daemon to revert DNS rules before exit,
+        # so a stop never leaves the system half-configured.
+        KillSignal = "SIGTERM";
+        TimeoutStopSec = 10;
+      };
+    };
   };
 }
