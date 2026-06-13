@@ -531,7 +531,9 @@ mod tests {
         sm.on_event(vpn_up("wg0")).await;
         assert!(sm.applied.is_some());
 
-        let resp = sm.on_request(Request::RemoveDomain("a.com".to_string())).await;
+        let resp = sm
+            .on_request(Request::RemoveDomain("a.com".to_string()))
+            .await;
 
         assert_eq!(resp, Response::Ok);
         // The last domain is gone → revert rather than apply an empty set.
