@@ -73,6 +73,17 @@ Goal: enable/disable toggle + config file selection. Nothing more in v1.
 
 **Done when:** toggle + config picker work on Linux and macOS against a live daemon.
 
+## Phase 5 — Packaging & release
+
+Goal: distributable packages + a release pipeline. Deliberately deferred until here: releasing before the daemon is real (Phase 2) would ship a one-shot CLI that misses the headline feature and burns first impressions.
+
+- Tag-triggered release CI: `cargo build --release` for x86_64/aarch64, attach binaries to a GitHub Release
+- Packages: deb / rpm / pacman / AppImage / nix (pattern reusable from `stslex/claude-desktop-linux`)
+- apt/dnf repositories hosted on GitHub Pages for `apt install` / `dnf install`
+- First public tag `v0.1.0` only after Phase 2 (working daemon)
+
+A lightweight tag→build→artifacts workflow may land earlier as a small standalone PR (build only, no public announcement) if useful, but the full distribution story stays in this phase.
+
 ## Later (explicitly out of near-term scope)
 
 - Windows support (stub remains)
