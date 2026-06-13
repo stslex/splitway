@@ -16,9 +16,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use splitway_shared::config::{self, LocalConfig};
 use splitway_shared::ipc::{Request, Response, StatusInfo};
-use splitway_shared::platform::{DnsBackend, VpnEvent, VpnInfo};
+use splitway_shared::platform::{DnsBackend, PlatformError, VpnEvent, VpnInfo};
 
-/// Everything funneled into the state-owner task.
+/// Routine commands funneled into the state-owner task. Shutdown is delivered
+/// out-of-band (see [`run_state`]) so it can preempt a backlog of these.
 pub enum StateCommand {
     /// A VPN up/down event from the detector.
     Vpn(VpnEvent),
@@ -27,8 +28,6 @@ pub enum StateCommand {
         request: Request,
         reply: oneshot::Sender<Response>,
     },
-    /// Revert active rules, then ack so the daemon can exit.
-    Shutdown(oneshot::Sender<()>),
 }
 
 /// A snapshot of what is currently applied to the system.
@@ -72,8 +71,9 @@ impl StateMachine {
 
     /// Drive the system toward [`Self::desired`], applying or reverting only
     /// when reality differs from the goal (so it is idempotent and a no-op
-    /// when already converged).
-    async fn reconcile(&mut self) {
+    /// when already converged). Returns the backend outcome so callers can
+    /// surface a failure instead of silently swallowing it.
+    async fn reconcile(&mut self) -> Result<(), PlatformError> {
         match self.desired() {
             Some((info, domains)) => {
                 let target = Applied {
@@ -81,7 +81,7 @@ impl StateMachine {
                     domains,
                 };
                 if self.applied.as_ref() == Some(&target) {
-                    return;
+                    return Ok(());
                 }
                 let backend = self.backend.clone();
                 let info_for_apply = info.clone();
@@ -98,21 +98,33 @@ impl StateMachine {
                             target.domains.len()
                         );
                         self.applied = Some(target);
+                        Ok(())
                     }
                     Ok(Err(e)) => {
-                        log::error!("apply_rules failed on {}: {e}", info.interface_name)
+                        // apply_rules rolls back a partial apply, so the
+                        // interface is left reverted, not half-configured.
+                        log::error!("apply_rules failed on {}: {e}", info.interface_name);
+                        self.applied = None;
+                        Err(e)
                     }
-                    Err(e) => log::error!("apply task panicked: {e}"),
+                    Err(e) => {
+                        log::error!("apply task panicked: {e}");
+                        self.applied = None;
+                        Err(PlatformError::CommandFailed(format!(
+                            "apply task panicked: {e}"
+                        )))
+                    }
                 }
             }
             None => self.revert().await,
         }
     }
 
-    /// Revert whatever is currently applied (no-op if nothing is).
-    async fn revert(&mut self) {
+    /// Revert whatever is currently applied (no-op if nothing is). On failure
+    /// `applied` is left set, so a later reconcile or shutdown retries it.
+    async fn revert(&mut self) -> Result<(), PlatformError> {
         let Some(applied) = self.applied.clone() else {
-            return;
+            return Ok(());
         };
         let backend = self.backend.clone();
         let interface = applied.interface.clone();
@@ -121,9 +133,18 @@ impl StateMachine {
             Ok(Ok(())) => {
                 log::info!("reverted rules on {}", applied.interface);
                 self.applied = None;
+                Ok(())
             }
-            Ok(Err(e)) => log::error!("revert_rules failed on {}: {e}", applied.interface),
-            Err(e) => log::error!("revert task panicked: {e}"),
+            Ok(Err(e)) => {
+                log::error!("revert_rules failed on {}: {e}", applied.interface);
+                Err(e)
+            }
+            Err(e) => {
+                log::error!("revert task panicked: {e}");
+                Err(PlatformError::CommandFailed(format!(
+                    "revert task panicked: {e}"
+                )))
+            }
         }
     }
 
@@ -143,7 +164,9 @@ impl StateMachine {
                 self.vpn_up = false;
             }
         }
-        self.reconcile().await;
+        // Event-driven reconcile is fire-and-forget; failures are logged
+        // inside reconcile and retried on the next event.
+        let _ = self.reconcile().await;
     }
 
     pub async fn on_request(&mut self, request: Request) -> Response {
@@ -159,13 +182,21 @@ impl StateMachine {
     }
 
     /// Revert active rules on shutdown so the system never stays
-    /// half-configured after the daemon exits.
-    pub async fn shutdown(&mut self) {
-        if self.applied.is_some() {
-            log::info!("shutdown: reverting active rules");
-            self.revert().await;
-        } else {
+    /// half-configured after the daemon exits. Returns `true` if the system
+    /// is left clean (revert succeeded or nothing was applied), `false` if a
+    /// revert failed and rules may still be in place.
+    pub async fn shutdown(&mut self) -> bool {
+        if self.applied.is_none() {
             log::info!("shutdown: nothing applied, nothing to revert");
+            return true;
+        }
+        log::info!("shutdown: reverting active rules");
+        match self.revert().await {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!("shutdown: revert failed: {e}; system may be left half-configured");
+                false
+            }
         }
     }
 
@@ -219,8 +250,12 @@ impl StateMachine {
                     );
                 }
                 self.config = next;
-                self.reconcile().await;
-                Response::Ok
+                match self.reconcile().await {
+                    Ok(()) => Response::Ok,
+                    Err(e) => {
+                        Response::Error(format!("config reloaded, but applying it failed: {e}"))
+                    }
+                }
             }
             Err(e) => Response::Error(format!("failed to reload config: {e}")),
         }
@@ -228,30 +263,53 @@ impl StateMachine {
 
     /// Persist `next` first; only adopt it in memory if the write succeeds,
     /// then reconcile. This keeps the in-memory config and disk in lockstep.
+    /// A persisted change whose re-apply fails is reported as an error so the
+    /// caller is not told "ok" while DNS is out of sync.
     async fn commit(&mut self, next: LocalConfig) -> Response {
         if let Err(e) = config::save_config_to(&self.config_path, &next) {
             return Response::Error(format!("failed to persist config: {e}"));
         }
         self.config = next;
-        self.reconcile().await;
-        Response::Ok
+        match self.reconcile().await {
+            Ok(()) => Response::Ok,
+            Err(e) => Response::Error(format!("config saved, but applying it failed: {e}")),
+        }
     }
 }
 
 /// The state-owner task loop. Owns the [`StateMachine`] outright.
-pub async fn run_state(mut machine: StateMachine, mut rx: mpsc::Receiver<StateCommand>) {
-    while let Some(command) = rx.recv().await {
-        match command {
-            StateCommand::Vpn(event) => machine.on_event(event).await,
-            StateCommand::Ipc { request, reply } => {
-                let response = machine.on_request(request).await;
-                // The client may have hung up; that is fine.
-                let _ = reply.send(response);
-            }
-            StateCommand::Shutdown(ack) => {
-                machine.shutdown().await;
-                let _ = ack.send(());
+///
+/// `shutdown` carries the reply channel for the shutdown ack. It is selected
+/// `biased`, ahead of routine commands, so the revert preempts any backlog of
+/// queued VPN events / IPC requests rather than waiting behind them. The ack
+/// reports whether the system was left clean.
+pub async fn run_state(
+    mut machine: StateMachine,
+    mut rx: mpsc::Receiver<StateCommand>,
+    mut shutdown: oneshot::Receiver<oneshot::Sender<bool>>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+
+            ack = &mut shutdown => {
+                let clean = machine.shutdown().await;
+                if let Ok(ack_tx) = ack {
+                    let _ = ack_tx.send(clean);
+                }
                 break;
+            }
+
+            command = rx.recv() => {
+                match command {
+                    Some(StateCommand::Vpn(event)) => machine.on_event(event).await,
+                    Some(StateCommand::Ipc { request, reply }) => {
+                        let response = machine.on_request(request).await;
+                        // The client may have hung up; that is fine.
+                        let _ = reply.send(response);
+                    }
+                    None => break,
+                }
             }
         }
     }
@@ -262,14 +320,13 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    use splitway_shared::platform::PlatformError;
-
     /// Records what the state machine asks the backend to do.
     #[derive(Default)]
     struct MockBackend {
         applies: Mutex<Vec<(String, Vec<String>)>>,
         reverts: Mutex<Vec<String>>,
         fail_apply: bool,
+        fail_revert: bool,
     }
 
     impl DnsBackend for MockBackend {
@@ -288,6 +345,11 @@ mod tests {
 
         fn revert_rules(&self, interface: &str) -> Result<(), PlatformError> {
             self.reverts.lock().unwrap().push(interface.to_string());
+            if self.fail_revert {
+                return Err(PlatformError::CommandFailed(
+                    "mock revert failure".to_string(),
+                ));
+            }
             Ok(())
         }
 
@@ -442,8 +504,9 @@ mod tests {
         );
 
         sm.on_event(vpn_up("wg0")).await;
-        sm.shutdown().await;
+        let clean = sm.shutdown().await;
 
+        assert!(clean);
         assert_eq!(backend.reverts.lock().unwrap().as_slice(), &["wg0"]);
         assert!(sm.applied.is_none());
     }
@@ -477,5 +540,47 @@ mod tests {
         // Apply failed: nothing is recorded as applied, so a later revert
         // won't run against a state we never reached.
         assert!(sm.applied.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_revert_failure_reports_unclean() {
+        let backend = Arc::new(MockBackend {
+            fail_revert: true,
+            ..Default::default()
+        });
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "shutdown-revert-fails",
+        );
+
+        sm.on_event(vpn_up("wg0")).await;
+        let clean = sm.shutdown().await;
+
+        // Revert failed: shutdown reports unclean and keeps `applied` set.
+        assert!(!clean);
+        assert!(sm.applied.is_some());
+    }
+
+    #[tokio::test]
+    async fn config_mutation_reports_apply_failure_but_still_persists() {
+        let backend = Arc::new(MockBackend {
+            fail_apply: true,
+            ..Default::default()
+        });
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "commit-apply-fails",
+        );
+
+        sm.on_event(vpn_up("wg0")).await; // first apply fails (applied stays None)
+        let resp = sm.on_request(Request::AddDomain("b.com".to_string())).await;
+
+        // The re-apply fails, so the caller is told so rather than "ok"...
+        assert!(matches!(resp, Response::Error(_)));
+        // ...but the config change is still persisted to disk.
+        let saved = config::load_config_from(&sm.config_path).unwrap();
+        assert_eq!(saved.vpn_hosts, vec!["a.com", "b.com"]);
     }
 }

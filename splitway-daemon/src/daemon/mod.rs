@@ -46,10 +46,12 @@ async fn run_async(config: LocalConfig) {
     let backend: Arc<dyn DnsBackend> = Arc::from(create_dns_backend());
     let detector = create_vpn_detector();
 
-    // Single state-owner task.
+    // Single state-owner task. Shutdown is delivered out-of-band via its own
+    // channel so the revert preempts any queued commands.
     let (state_tx, state_rx) = mpsc::channel::<StateCommand>(64);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<oneshot::Sender<bool>>();
     let machine = StateMachine::new(backend, config, config::config_file_path());
-    let state_handle = tokio::spawn(run_state(machine, state_rx));
+    let state_handle = tokio::spawn(run_state(machine, state_rx, shutdown_rx));
 
     // VPN event stream -> state task.
     match detector.watch(&interface) {
@@ -87,11 +89,16 @@ async fn run_async(config: LocalConfig) {
     wait_for_shutdown_signal().await;
     log::info!("shutdown signal received; reverting active rules");
 
-    // Ask the state task to revert, then wait for it to finish.
-    let (ack_tx, ack_rx) = oneshot::channel();
-    if state_tx.send(StateCommand::Shutdown(ack_tx)).await.is_ok() {
-        let _ = ack_rx.await;
-    }
+    // Ask the state task to revert (this preempts any queued commands), then
+    // wait for it to report whether the system was left clean.
+    let clean = {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if shutdown_tx.send(ack_tx).is_ok() {
+            ack_rx.await.unwrap_or(false)
+        } else {
+            false
+        }
+    };
     let _ = state_handle.await;
 
     // Best-effort socket cleanup so the next start is clean.
@@ -100,24 +107,36 @@ async fn run_async(config: LocalConfig) {
             log::debug!("could not remove socket {}: {e}", socket.display());
         }
     }
-    log::info!("splitway daemon stopped");
+
+    if clean {
+        log::info!("splitway daemon stopped");
+    } else {
+        log::error!(
+            "splitway daemon stopped, but reverting DNS rules failed; \
+             the system may be left half-configured"
+        );
+        exit(1);
+    }
 }
 
 /// Wait for either `SIGINT` (Ctrl-C) or `SIGTERM` (systemd stop). Both
 /// trigger the graceful revert-then-exit path.
 async fn wait_for_shutdown_signal() {
+    // A failure to install the handlers is a fatal startup error, not a
+    // shutdown trigger — exit(1) (like the other fatal startup paths) so it
+    // does not masquerade as a received signal and exit cleanly.
     let mut sigint = match signal(SignalKind::interrupt()) {
         Ok(stream) => stream,
         Err(e) => {
             log::error!("failed to install SIGINT handler: {e}");
-            return;
+            exit(1);
         }
     };
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(stream) => stream,
         Err(e) => {
             log::error!("failed to install SIGTERM handler: {e}");
-            return;
+            exit(1);
         }
     };
     tokio::select! {
