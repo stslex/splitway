@@ -29,13 +29,19 @@ use crate::daemon::state::StateCommand;
 /// broadening who can change DNS.
 pub fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(dir) = path.parent() {
-        // Enforce 0700 on the parent unconditionally (not just when we create
-        // it): the socket's own mode is only applied after bind(), and a 0700
-        // parent is what closes that window. For $XDG_RUNTIME_DIR this is
-        // already the case; for /run/splitway we own it. A failure here is
-        // fatal (propagated), since the security model depends on it.
-        std::fs::create_dir_all(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        // The socket's own mode is only applied after bind(), so a 0700 parent
+        // is what closes that window. For the /run/splitway fallback (which we
+        // own) create it and enforce 0700. We do not touch $XDG_RUNTIME_DIR:
+        // the XDG spec already mandates it be 0700 owned by the user, and it is
+        // a shared session dir we should not chmod. A failure here is fatal
+        // (propagated), since the security model depends on the 0700 parent.
+        let is_xdg_runtime = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .is_some_and(|value| Path::new(&value) == dir);
+        if !is_xdg_runtime {
+            std::fs::create_dir_all(dir)?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
     // An existing socket file is either stale (from an unclean shutdown) or a
     // live daemon. Probe it before removing: unconditionally unlinking would

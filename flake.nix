@@ -28,7 +28,7 @@
         in
         {
           # Builds the whole workspace, i.e. both binaries
-          # (splitway-daemon, splitway-cli).
+          # (splitway-daemon and the `splitway` CLI).
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "splitway";
             version = "0.0.1";
