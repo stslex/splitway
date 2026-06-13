@@ -120,10 +120,37 @@ pub mod client {
 
     impl std::error::Error for ClientError {}
 
+    /// Candidate sockets to try, in order: the per-user socket (if
+    /// `$XDG_RUNTIME_DIR` is set) then the system socket. A login-session CLI
+    /// thus reaches a system-service daemon (which binds `/run/splitway`)
+    /// even though its own `socket_path()` resolves to `$XDG_RUNTIME_DIR`.
+    fn candidate_sockets() -> Vec<std::path::PathBuf> {
+        let mut paths = vec![socket_path()];
+        let system = std::path::PathBuf::from("/run/splitway/splitway.sock");
+        if !paths.contains(&system) {
+            paths.push(system);
+        }
+        paths
+    }
+
     /// Connect to the daemon socket, send `request`, and return its reply.
     pub fn send_request(request: Request) -> Result<Response, ClientError> {
-        let path = socket_path();
-        let stream = UnixStream::connect(&path).map_err(ClientError::NotRunning)?;
+        let mut stream = None;
+        let mut last_err = None;
+        for path in candidate_sockets() {
+            match UnixStream::connect(&path) {
+                Ok(connected) => {
+                    stream = Some(connected);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let stream = stream.ok_or_else(|| {
+            ClientError::NotRunning(last_err.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no socket candidates")
+            }))
+        })?;
 
         let mut writer = stream.try_clone().map_err(ClientError::Io)?;
         let mut line = serde_json::to_string(&RequestEnvelope::new(request))
