@@ -25,15 +25,19 @@ impl VpnDetector for LinuxDetector {
     }
 
     /// Spawns the NetworkManager D-Bus watch task on the ambient tokio
-    /// runtime. Panics if called outside one; the `watch` subcommand
-    /// handler owns the runtime until the daemon goes async in Phase 2.
+    /// runtime. Returns a `PlatformError` if called outside one; the
+    /// `watch` subcommand handler owns the runtime until the daemon goes
+    /// async in Phase 2.
     fn watch(
         &self,
         interface: &str,
     ) -> Result<tokio::sync::mpsc::Receiver<VpnEvent>, PlatformError> {
+        let handle = tokio::runtime::Handle::try_current().map_err(|e| {
+            PlatformError::CommandFailed(format!("watch requires a running tokio runtime: {e}"))
+        })?;
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let interface = interface.to_string();
-        tokio::spawn(async move {
+        handle.spawn(async move {
             log::debug!("starting NetworkManager watch for {interface}");
             if let Err(e) = super::dbus::watch_loop(interface.clone(), tx).await {
                 log::error!("VPN watch for {interface} terminated: {e}");
