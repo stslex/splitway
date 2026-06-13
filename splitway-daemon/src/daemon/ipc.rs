@@ -6,7 +6,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
@@ -14,15 +14,40 @@ use splitway_shared::ipc::{RequestEnvelope, Response, PROTOCOL_VERSION};
 
 use crate::daemon::state::StateCommand;
 
+/// Restores the previous process umask when dropped, so a tightened umask
+/// around `bind()` cannot leak to the rest of the process (including on the
+/// error path).
+struct UmaskGuard(libc::mode_t);
+
+impl UmaskGuard {
+    /// Tighten the umask to `0o177` so a freshly created file gets mode
+    /// `0600` (owner read/write only).
+    fn owner_only() -> Self {
+        // SAFETY: `umask` is always safe to call; it just swaps a per-process
+        // value and returns the prior one.
+        UmaskGuard(unsafe { libc::umask(0o177) })
+    }
+}
+
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `owner_only`.
+        unsafe {
+            libc::umask(self.0);
+        }
+    }
+}
+
 /// Bind the control socket with owner-only (`0600`) permissions.
 ///
 /// Security model: the daemon makes privileged DNS changes; the CLI does
 /// not. The socket is the privilege boundary — any process that can write it
-/// can change DNS. `0600` restricts that to the user running the daemon (for
-/// the system service, root). The containing directory is `0700`
-/// (`$XDG_RUNTIME_DIR` already is; the `/run/splitway` fallback is created
-/// that way), which also covers the brief window between `bind` and the
-/// `set_permissions` below. For unprivileged multi-user control, an operator
+/// can change DNS. The socket is created `0600` *atomically* via a tightened
+/// umask around `bind()` (no world-accessible window), restricting control to
+/// the user running the daemon (for the system service, root). The containing
+/// directory is also `0700` (`$XDG_RUNTIME_DIR` already is; the
+/// `/run/splitway` fallback is created that way, or pre-created by systemd's
+/// `RuntimeDirectory=`). For unprivileged multi-user control, an operator
 /// would widen this to `0660` owned by a dedicated group — not done by
 /// default, to avoid silently broadening who can change DNS.
 pub fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
@@ -37,8 +62,12 @@ pub fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
     if path.exists() {
         std::fs::remove_file(path)?;
     }
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    // Create the socket 0600 atomically: the guard restores the prior umask
+    // on drop, success or error.
+    let listener = {
+        let _umask = UmaskGuard::owner_only();
+        UnixListener::bind(path)?
+    };
     Ok(listener)
 }
 
@@ -64,17 +93,30 @@ pub async fn serve(listener: UnixListener, state_tx: mpsc::Sender<StateCommand>)
     }
 }
 
+/// Cap a single request line. Requests are tiny (a domain at most), so this
+/// is generous; it just stops a buggy or hostile client from making the
+/// daemon buffer an unbounded line. Per-request (not per-connection) so
+/// multiple requests can still share a connection.
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
 async fn handle_connection(
     stream: UnixStream,
     state_tx: mpsc::Sender<StateCommand>,
 ) -> std::io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
+    let mut reader = BufReader::new(read_half);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = read_line_capped(&mut reader, &mut line, MAX_REQUEST_BYTES).await?;
+        if n == 0 {
+            break; // EOF
         }
-        let response = process_line(&line, &state_tx).await;
+        let response = match std::str::from_utf8(&line) {
+            Ok(text) if text.trim().is_empty() => continue,
+            Ok(text) => process_line(text, &state_tx).await,
+            Err(_) => Response::Error("malformed request: not valid UTF-8".to_string()),
+        };
         let mut encoded = serde_json::to_string(&response)
             .unwrap_or_else(|e| format!("{{\"Error\":\"failed to encode response: {e}\"}}"));
         encoded.push('\n');
@@ -82,6 +124,39 @@ async fn handle_connection(
         write_half.flush().await?;
     }
     Ok(())
+}
+
+/// Read one `\n`-terminated line into `buf`, erroring if it would exceed
+/// `max` bytes. Returns the number of bytes read (0 at EOF).
+async fn read_line_capped(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<usize> {
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(buf.len()); // EOF
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                buf.extend_from_slice(&available[..=i]);
+                reader.consume(i + 1);
+                return Ok(buf.len());
+            }
+            None => {
+                buf.extend_from_slice(available);
+                let consumed = available.len();
+                reader.consume(consumed);
+                if buf.len() > max {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "IPC request line exceeds maximum length",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 async fn process_line(line: &str, state_tx: &mpsc::Sender<StateCommand>) -> Response {
