@@ -8,10 +8,13 @@ polkit otherwise gates behind interactive authentication — impractical for an
 unattended daemon, so it runs as root. A user service would instead need
 polkit rules granting the `resolvectl` DNS actions.
 
+The CLI is installed as `splitway` (the name it advertises: `splitway status`,
+`splitway enable`, …); the daemon as `splitway-daemon`.
+
 ```sh
 sudo install -Dm644 packaging/systemd/splitway.service /etc/systemd/system/splitway.service
 sudo install -Dm755 target/release/splitway-daemon /usr/bin/splitway-daemon
-sudo install -Dm755 target/release/splitway-cli     /usr/bin/splitway-cli
+sudo install -Dm755 target/release/splitway-cli     /usr/bin/splitway
 sudo systemctl enable --now splitway
 ```
 
