@@ -3,5 +3,13 @@ name = "splitway-cli"
 version = "0.0.1"
 edition = "2021"
 
+# The user-facing command is `splitway` (matching the clap name and the docs),
+# even though the crate is `splitway-cli`.
+[[bin]]
+name = "splitway"
+path = "src/main.rs"
+
 [dependencies]
 splitway-shared = { path = "../splitway-shared" }
+
+clap = { version = "4", features = ["derive"] }
