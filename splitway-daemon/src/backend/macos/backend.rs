@@ -65,13 +65,16 @@ enum Prior {
 }
 
 /// Reconcile the resolver files in `dir` to exactly `domains`, each pointing at
-/// `servers`. Transactional and **non-destructive on failure**: each target
-/// file's prior state is captured before it is overwritten, so a mid-write
-/// failure restores overwritten files to their original bytes and removes only
-/// the files this call newly created. A failed re-apply therefore leaves the
-/// previously-live split-DNS exactly as it was — never a partial or empty set.
-/// Then prunes our now-unwanted files (best effort — the target set is already
-/// fully written, so pruning failures don't corrupt it).
+/// `servers`. A target path that already exists *without* our marker is the
+/// user's own resolver: we refuse to overwrite it (replacing it would let a
+/// later revert delete the user's config). Transactional and **non-destructive
+/// on failure**: each target file's prior state is captured before it is
+/// overwritten, so a mid-write failure restores overwritten files to their
+/// original bytes and removes only the files this call newly created. A failed
+/// re-apply therefore leaves the previously-live split-DNS exactly as it was —
+/// never a partial or empty set. Then prunes our now-unwanted files (best
+/// effort — the target set is already fully written, so pruning failures don't
+/// corrupt it).
 fn apply_to_dir(dir: &Path, servers: &[String], domains: &[String]) -> Result<(), PlatformError> {
     // Reject names that are not safe single path components before touching the
     // filesystem: `dir.join("../x")` would escape /etc/resolver, and a
@@ -92,7 +95,21 @@ fn apply_to_dir(dir: &Path, servers: &[String], domains: &[String]) -> Result<()
         let path = resolver_path(dir, domain);
         // Snapshot the prior state so a later failure can restore it exactly.
         let prior = match fs::read(&path) {
-            Ok(bytes) => Prior::Existed(bytes),
+            // Only overwrite a resolver file we previously wrote. If one exists
+            // without our marker it is the user's: refuse rather than replace
+            // it, because revert would later delete it (it now carries our
+            // marker) and the user's original DNS config would be lost — the
+            // in-call snapshot does not survive a successful apply.
+            Ok(bytes) => {
+                if !is_managed(&String::from_utf8_lossy(&bytes)) {
+                    rollback(&written);
+                    return Err(PlatformError::CommandFailed(format!(
+                        "refusing to overwrite resolver file not created by splitway: {}",
+                        path.display()
+                    )));
+                }
+                Prior::Existed(bytes)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Prior::Absent,
             // Present but unreadable: don't risk clobbering it irrecoverably.
             Err(e) => {
@@ -335,6 +352,21 @@ mod tests {
         assert!(dir.join("b.com").is_file());
         assert!(a_before.contains("nameserver 10.0.0.1"));
         assert!(!a_before.contains("10.9.9.9"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn apply_refuses_to_overwrite_a_user_authored_resolver() {
+        let dir = temp_dir("apply-refuse-unmanaged");
+        // The user already has a hand-written resolver for this domain.
+        let user = dir.join("corp.example.com");
+        fs::write(&user, "nameserver 9.9.9.9\n").unwrap();
+
+        let err = apply_to_dir(&dir, &servers(), &["corp.example.com".to_string()]).unwrap_err();
+        assert!(matches!(err, PlatformError::CommandFailed(_)));
+        // The user's file is left exactly as it was — not replaced by a managed
+        // file that a later revert would delete.
+        assert_eq!(fs::read_to_string(&user).unwrap(), "nameserver 9.9.9.9\n");
         fs::remove_dir_all(&dir).unwrap();
     }
 
