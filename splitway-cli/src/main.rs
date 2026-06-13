@@ -1,10 +1,12 @@
 //! `splitway` CLI: a thin, single-shot client for the daemon's IPC socket.
 //! It holds no daemon logic — it parses a subcommand, sends one request,
 //! prints the reply, and exits.
+//!
+//! The IPC client is Unix-only (Unix domain socket). On non-Unix the binary
+//! still builds — via the stub path in `main` — so the cross-platform release
+//! matrix stays green; see ROADMAP.md.
 
 use clap::{Parser, Subcommand};
-
-use splitway_shared::ipc::{self, Request, Response};
 
 #[derive(Parser)]
 #[command(
@@ -36,6 +38,22 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
+
+    #[cfg(unix)]
+    run(cli);
+
+    #[cfg(not(unix))]
+    {
+        let _ = cli;
+        eprintln!("splitway is only supported on Unix platforms (Linux/macOS)");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(unix)]
+fn run(cli: Cli) {
+    use splitway_shared::ipc::{self, Request};
+
     let request = match cli.command {
         Commands::Status => Request::Status,
         Commands::Enable => Request::Enable,
@@ -48,11 +66,10 @@ fn main() {
 
     match ipc::client::send_request(request) {
         Ok(response) => {
+            print_response(&response);
             if is_error(&response) {
-                print_response(&response);
                 std::process::exit(1);
             }
-            print_response(&response);
         }
         Err(e) => {
             eprintln!("{e}");
@@ -61,11 +78,15 @@ fn main() {
     }
 }
 
-fn is_error(response: &Response) -> bool {
-    matches!(response, Response::Error(_))
+#[cfg(unix)]
+fn is_error(response: &splitway_shared::ipc::Response) -> bool {
+    matches!(response, splitway_shared::ipc::Response::Error(_))
 }
 
-fn print_response(response: &Response) {
+#[cfg(unix)]
+fn print_response(response: &splitway_shared::ipc::Response) {
+    use splitway_shared::ipc::Response;
+
     match response {
         Response::Ok => println!("ok"),
         Response::Status(info) => {
