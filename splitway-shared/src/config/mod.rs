@@ -2,6 +2,7 @@ use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -62,12 +63,15 @@ pub fn save_config_to(path: &Path, config: &LocalConfig) -> Result<(), ConfigPar
     })
 }
 
-/// Write `contents` to `path` atomically: write a sibling temp file, fsync
+/// Write `contents` to `path` atomically: write a unique temp sibling, fsync
 /// it, then rename it over `path`. A crash mid-write leaves either the old
-/// file or the complete new file behind — never a truncated config.
+/// file or the complete new file behind — never a truncated file.
 ///
-/// Callers serialize their writes (the daemon's single state-owner task),
-/// so the fixed `.tmp` sibling never races another writer.
+/// The temp name is a hidden, per-process-unique sibling
+/// (`.splitway.<pid>.<n>.tmp`) opened with `O_EXCL`, so it can neither alias nor
+/// truncate an existing target whose name is caller-controlled — e.g. an
+/// `/etc/resolver/<domain>` file, where a domain like `foo.tmp` would otherwise
+/// collide with a `with_extension("tmp")` temp path.
 pub fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| {
         io::Error::new(
@@ -77,19 +81,39 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     })?;
     fs::create_dir_all(dir)?;
 
-    let tmp = path.with_extension("tmp");
-    {
-        let mut file = File::create(&tmp)?;
+    let tmp = dir.join(temp_file_name());
+    let write_result = (|| {
+        // create_new (O_EXCL) refuses to open (and thus never truncates) any
+        // pre-existing file at the temp path; the unique name makes that
+        // essentially impossible anyway.
+        let mut file = File::create_new(&tmp)?;
         file.write_all(contents)?;
-        file.sync_all()?;
+        file.sync_all()
+    })();
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    fs::rename(&tmp, path)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
 
     // Best-effort: fsync the directory so the rename itself is durable.
     if let Ok(dir_file) = File::open(dir) {
         let _ = dir_file.sync_all();
     }
     Ok(())
+}
+
+/// A hidden temp filename unique within this process, used as the atomic-write
+/// sibling. Dot-prefixed and `.tmp`-suffixed so it is never mistaken for a real
+/// target; the pid + monotonic counter make repeated or concurrent writes
+/// collision-free.
+fn temp_file_name() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(".splitway.{}.{n}.tmp", std::process::id())
 }
 
 pub fn config_file_path() -> PathBuf {
@@ -219,7 +243,11 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "world!");
 
         // No temp file is left behind.
-        assert!(!path.with_extension("tmp").exists());
+        let leftover_temp = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().starts_with(".splitway."));
+        assert!(!leftover_temp, "atomic_write left a temp file behind");
     }
 
     #[test]
