@@ -67,10 +67,18 @@ impl StateMachine {
     /// `resolvectl domain <iface>` with zero domains does not clear existing
     /// ones, so applying an empty set would leave stale split-DNS active.
     /// Removing the last domain therefore reverts instead.
+    ///
+    /// The last event's interface must also match the configured `vpn_name`.
+    /// After a `ReloadConfig` that changes `vpn_name`, the previous event
+    /// refers to the old interface, so this returns `None` and the old
+    /// interface is reverted. (Auto-apply for the new interface needs a
+    /// restart — the detector watch is not restarted on reload.)
     fn desired(&self) -> Option<(VpnInfo, Vec<String>)> {
         let active = self.config.enabled && self.vpn_up && !self.config.vpn_hosts.is_empty();
-        match (&self.last_info, active) {
-            (Some(info), true) => Some((info.clone(), self.config.vpn_hosts.clone())),
+        match &self.last_info {
+            Some(info) if active && info.interface_name == self.config.vpn_name => {
+                Some((info.clone(), self.config.vpn_hosts.clone()))
+            }
             _ => None,
         }
     }
@@ -537,6 +545,30 @@ mod tests {
 
         assert_eq!(resp, Response::Ok);
         // The last domain is gone → revert rather than apply an empty set.
+        assert_eq!(backend.reverts.lock().unwrap().as_slice(), &["wg0"]);
+        assert!(sm.applied.is_none());
+    }
+
+    #[tokio::test]
+    async fn reload_changing_interface_reverts_old() {
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend.clone(), config(true, &["a.com"]), "reload-iface");
+
+        sm.on_event(vpn_up("wg0")).await;
+        assert!(sm.applied.is_some());
+
+        // Operator changes the configured interface and reloads.
+        let new_cfg = LocalConfig {
+            vpn_name: "wg1".to_string(),
+            vpn_hosts: vec!["a.com".to_string()],
+            enabled: true,
+        };
+        config::save_config_to(&sm.config_path, &new_cfg).unwrap();
+        let resp = sm.on_request(Request::ReloadConfig).await;
+
+        assert_eq!(resp, Response::Ok);
+        // The old interface's rules are reverted; nothing is applied to the new
+        // interface (its watch is not started until a restart).
         assert_eq!(backend.reverts.lock().unwrap().as_slice(), &["wg0"]);
         assert!(sm.applied.is_none());
     }
