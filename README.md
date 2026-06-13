@@ -17,7 +17,7 @@ Splitway automates DNS-based traffic splitting: domains matching the rules are r
 - Applies/reverts split-DNS rules through `resolvectl`
 - Runtime control over a Unix socket: `splitway status/enable/disable/add/remove/list/reload`
 - Reverts DNS rules on `SIGTERM`/`SIGINT` so a stop never leaves the system half-configured
-- Linux only; GlobalProtect and OpenVPN — both NetworkManager-managed — supported
+- Linux only; GlobalProtect (via openconnect) and OpenVPN — both NetworkManager-managed — supported. The official GlobalProtect client (not NM-managed) is not covered
 
 ## Workspace layout
 
