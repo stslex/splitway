@@ -99,6 +99,9 @@ pub mod client {
     pub enum ClientError {
         /// The socket could not be reached — most likely the daemon is down.
         NotRunning(std::io::Error),
+        /// The socket exists but the caller is not allowed to connect — the
+        /// daemon is running, but the user lacks access to its control socket.
+        PermissionDenied(std::io::Error),
         /// An I/O error after connecting.
         Io(std::io::Error),
         /// A malformed or unexpected reply.
@@ -111,6 +114,11 @@ pub mod client {
                 ClientError::NotRunning(e) => write!(
                     f,
                     "cannot reach the splitway daemon socket ({e}); is splitway-daemon running?"
+                ),
+                ClientError::PermissionDenied(e) => write!(
+                    f,
+                    "permission denied on the splitway daemon socket ({e}); \
+                     the daemon is running but you lack access — try sudo or the daemon's group"
                 ),
                 ClientError::Io(e) => write!(f, "IPC I/O error: {e}"),
                 ClientError::Protocol(m) => write!(f, "IPC protocol error: {m}"),
@@ -137,20 +145,35 @@ pub mod client {
     pub fn send_request(request: Request) -> Result<Response, ClientError> {
         let mut stream = None;
         let mut last_err = None;
+        let mut permission_denied = None;
         for path in candidate_sockets() {
             match UnixStream::connect(&path) {
                 Ok(connected) => {
                     stream = Some(connected);
                     break;
                 }
+                // A 0600 socket owned by another user (e.g. the root system
+                // daemon) reports PermissionDenied — the daemon *is* running.
+                // Keep it regardless of candidate order, so it is never masked
+                // by a NotFound from a different candidate.
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    permission_denied = Some(e);
+                }
                 Err(e) => last_err = Some(e),
             }
         }
-        let stream = stream.ok_or_else(|| {
-            ClientError::NotRunning(last_err.unwrap_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "no socket candidates")
-            }))
-        })?;
+        let stream = match stream {
+            Some(connected) => connected,
+            None => {
+                if let Some(e) = permission_denied {
+                    return Err(ClientError::PermissionDenied(e));
+                }
+                let err = last_err.unwrap_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "no socket candidates")
+                });
+                return Err(ClientError::NotRunning(err));
+            }
+        };
 
         let mut writer = stream.try_clone().map_err(ClientError::Io)?;
         let mut line = serde_json::to_string(&RequestEnvelope::new(request))
