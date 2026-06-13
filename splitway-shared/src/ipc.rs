@@ -74,13 +74,22 @@ pub struct StatusInfo {
     pub domains: Vec<String>,
 }
 
+/// System-service socket directory, used when `XDG_RUNTIME_DIR` is unset (a
+/// root service rather than a login session). macOS has no `/run` and a
+/// read-only root volume, so the daemon (which creates this dir on bind) uses
+/// `/var/run`; Linux keeps `/run` (systemd provisions `/run/splitway`).
+#[cfg(target_os = "macos")]
+const SYSTEM_SOCKET_DIR: &str = "/var/run/splitway";
+#[cfg(not(target_os = "macos"))]
+const SYSTEM_SOCKET_DIR: &str = "/run/splitway";
+
 /// Resolve the control socket path: `$XDG_RUNTIME_DIR/splitway.sock` when
-/// the runtime dir is set (already a `0700` user-private directory), else
-/// `/run/splitway/splitway.sock` for a system service.
+/// the runtime dir is set (already a `0700` user-private directory), else the
+/// per-platform [`SYSTEM_SOCKET_DIR`] for a system service.
 pub fn socket_path() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("splitway.sock"),
-        _ => PathBuf::from("/run/splitway/splitway.sock"),
+        _ => PathBuf::from(SYSTEM_SOCKET_DIR).join("splitway.sock"),
     }
 }
 
@@ -130,11 +139,11 @@ pub mod client {
 
     /// Candidate sockets to try, in order: the per-user socket (if
     /// `$XDG_RUNTIME_DIR` is set) then the system socket. A login-session CLI
-    /// thus reaches a system-service daemon (which binds `/run/splitway`)
+    /// thus reaches a system-service daemon (which binds [`SYSTEM_SOCKET_DIR`])
     /// even though its own `socket_path()` resolves to `$XDG_RUNTIME_DIR`.
     fn candidate_sockets() -> Vec<std::path::PathBuf> {
         let mut paths = vec![socket_path()];
-        let system = std::path::PathBuf::from("/run/splitway/splitway.sock");
+        let system = std::path::PathBuf::from(super::SYSTEM_SOCKET_DIR).join("splitway.sock");
         if !paths.contains(&system) {
             paths.push(system);
         }
