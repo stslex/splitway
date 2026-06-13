@@ -1,6 +1,6 @@
 # Splitway
 
-Domain-based traffic splitting tool for Linux desktops (macOS support planned — see [ROADMAP.md](ROADMAP.md)). Routes traffic through VPN or direct connection based on configurable domain rules.
+Domain-based traffic splitting tool for Linux and macOS desktops. Routes traffic through VPN or direct connection based on configurable domain rules.
 
 ## Problem
 
@@ -13,11 +13,11 @@ Splitway automates DNS-based traffic splitting: domains matching the rules are r
 ## Current state
 
 - Long-running daemon: auto-applies rules on VPN up, auto-reverts on down
-- Auto-detects VPN DNS server via NetworkManager (D-Bus event stream)
-- Applies/reverts split-DNS rules through `resolvectl`
+- Auto-detects the VPN DNS server: NetworkManager D-Bus on Linux, SCDynamicStore + `scutil` on macOS
+- Applies/reverts split-DNS rules through `resolvectl` (Linux) or `/etc/resolver` files (macOS)
 - Runtime control over a Unix socket: `splitway status/enable/disable/add/remove/list/reload`
 - Reverts DNS rules on `SIGTERM`/`SIGINT` so a stop never leaves the system half-configured
-- Linux only; GlobalProtect (via openconnect) and OpenVPN — both NetworkManager-managed — supported. The official GlobalProtect client (not NM-managed) is not covered
+- Linux (GlobalProtect via openconnect, and OpenVPN — both NetworkManager-managed) and macOS (any `utun*` VPN) supported. The official GlobalProtect client (not NM-managed) is not covered
 
 ## Workspace layout
 
@@ -40,8 +40,8 @@ Create `~/.config/splitway/config.json` (auto-created as empty on first run):
 ```
 
 `vpn_name` is the **network interface (device) name**, not the NetworkManager
-connection name. Find it with `nmcli device status` (or `ip link`) while the VPN
-is up:
+connection name. Find it with `nmcli device status` / `ip link` (Linux) or
+`scutil --nwi` / `ifconfig` (macOS) while the VPN is up:
 
 - **OpenVPN via NetworkManager** creates a `tun*` device — usually `tun0`. Set
   `vpn_name` to that device (e.g. `tun0`), *not* the NM connection's name. NM
@@ -51,6 +51,9 @@ is up:
 - **GlobalProtect** (openconnect) behaves the same way — a `tun*` device.
 - **WireGuard** typically appears as the connection's own device name (e.g.
   `wg0`).
+- **macOS** VPNs appear as `utun*` devices. The macOS backend writes one
+  `/etc/resolver/<domain>` file per host and needs root; install it as a
+  LaunchDaemon — see [packaging/](packaging/README.md) ("macOS (launchd)").
 
 ## Usage
 
@@ -116,4 +119,4 @@ Workflow rules live in [CLAUDE.md](CLAUDE.md): one phase = one branch = one PR i
 
 ## Stack
 
-Rust, systemd-resolved, NetworkManager, Cargo workspace
+Rust, systemd-resolved, NetworkManager (Linux), SCDynamicStore + `/etc/resolver` (macOS), Cargo workspace

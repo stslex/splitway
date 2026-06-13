@@ -44,6 +44,32 @@ before exiting, so a stop never leaves the system half-configured.
 
 ## macOS (launchd)
 
-Not yet. The macOS DNS backend and VPN detector are still `todo!()` stubs, so
-the daemon cannot run there. A launchd plist arrives with the macOS runtime in
-**Phase 3** (see `ROADMAP.md`).
+`launchd/com.splitway.daemon.plist` runs `splitway-daemon run` as a
+**LaunchDaemon (root)**. Root is required: the backend writes
+`/etc/resolver/<domain>` files and flushes the DNS cache
+(`dscacheutil -flushcache`, `killall -HUP mDNSResponder`). VPN up/down is
+detected via SCDynamicStore (`scutil --dns` for the DNS servers).
+
+```sh
+sudo install -Dm755 target/release/splitway-daemon /usr/local/bin/splitway-daemon
+sudo install -Dm755 target/release/splitway         /usr/local/bin/splitway
+sudo install -Dm644 packaging/launchd/com.splitway.daemon.plist \
+    /Library/LaunchDaemons/com.splitway.daemon.plist
+sudo launchctl load -w /Library/LaunchDaemons/com.splitway.daemon.plist
+# stop + revert:
+sudo launchctl unload -w /Library/LaunchDaemons/com.splitway.daemon.plist
+```
+
+Configure the VPN interface in `~/.config/splitway/config.json` (`vpn_name` is
+the `utun*` interface — find it with `scutil --nwi` or `ifconfig` while the VPN
+is up); the daemon reads `$HOME/.config/splitway` of the user it runs as.
+
+### Socket on macOS
+
+There is no `$XDG_RUNTIME_DIR` for a LaunchDaemon, so the control socket falls
+back to a system path: **`/var/run/splitway/splitway.sock`** on macOS (macOS has
+no `/run`, and `/` is read-only). The daemon creates that `0700` directory on
+start and binds a `0600` socket inside it. Drive the daemon with the `splitway`
+CLI via `sudo` (the socket is root-owned), exactly as on the Linux system
+service. `SIGTERM` (from `launchctl unload`) makes the daemon revert active
+`/etc/resolver` rules before exiting.

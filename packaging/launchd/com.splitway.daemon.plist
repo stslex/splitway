@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Splitway split-DNS daemon, as a macOS LaunchDaemon (runs as root).
+
+  Root is required: the daemon writes /etc/resolver/<domain> files and flushes
+  the DNS cache (dscacheutil / killall -HUP mDNSResponder). The privilege
+  boundary for the unprivileged CLI is the Unix control socket; see
+  packaging/README.md for the threat model.
+
+  Install: see packaging/README.md ("macOS (launchd)").
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.splitway.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/splitway-daemon</string>
+        <string>run</string>
+    </array>
+
+    <!-- Start at boot and restart on crash. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+
+    <!-- On `launchctl unload`/stop, launchd sends SIGTERM, which the daemon
+         traps to revert active /etc/resolver rules before exiting — the system
+         is never left half-configured. -->
+    <key>StandardOutPath</key>
+    <string>/var/log/splitway.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/splitway.log</string>
+</dict>
+</plist>
