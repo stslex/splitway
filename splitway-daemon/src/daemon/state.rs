@@ -30,11 +30,15 @@ pub enum StateCommand {
     },
 }
 
-/// A snapshot of what is currently applied to the system.
+/// A snapshot of what is currently applied to the system. Includes the DNS
+/// servers so that a VPN DNS rotation (same interface and domains, different
+/// servers) is seen as out-of-sync and re-applied rather than treated as
+/// already converged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Applied {
     interface: String,
     domains: Vec<String>,
+    dns_servers: Vec<String>,
 }
 
 pub struct StateMachine {
@@ -93,6 +97,7 @@ impl StateMachine {
                 let target = Applied {
                     interface: info.interface_name.clone(),
                     domains,
+                    dns_servers: info.dns_servers.clone(),
                 };
                 if self.applied.as_ref() == Some(&target) {
                     return Ok(());
@@ -464,6 +469,27 @@ mod tests {
 
         assert_eq!(backend.reverts.lock().unwrap().as_slice(), &["wg0"]);
         assert!(sm.applied.is_none());
+    }
+
+    #[tokio::test]
+    async fn dns_server_change_reapplies() {
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend.clone(), config(true, &["a.com"]), "dns-rotate");
+
+        sm.on_event(vpn_up("wg0")).await; // applies with 10.0.0.1
+                                          // Same interface and domains, but the VPN's DNS server rotated: this is
+                                          // not "already converged" — the rules must be re-applied.
+        sm.on_event(VpnEvent::Up(VpnInfo {
+            interface_name: "wg0".to_string(),
+            dns_servers: vec!["10.9.9.9".to_string()],
+        }))
+        .await;
+
+        assert_eq!(
+            backend.applies.lock().unwrap().len(),
+            2,
+            "a DNS server change must trigger a re-apply"
+        );
     }
 
     #[tokio::test]

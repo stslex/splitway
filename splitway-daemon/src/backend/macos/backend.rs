@@ -1,0 +1,470 @@
+//! The macOS [`DnsBackend`]: writes `/etc/resolver/<domain>` files and flushes
+//! the system DNS cache. Transactional like the Linux backend — a failed apply
+//! never leaves a partial split-DNS set behind — and revert only removes files
+//! Splitway itself wrote (ownership via [`resolver::is_managed`]).
+
+use std::collections::BTreeSet;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use splitway_shared::config::atomic_write;
+use splitway_shared::platform::{DnsBackend, PlatformError, VpnInfo};
+
+use super::resolver::{is_managed, is_valid_domain, resolver_contents, resolver_path};
+use super::MacosBackend;
+
+/// macOS reads per-domain resolvers from here (`man 5 resolver`).
+const RESOLVER_DIR: &str = "/etc/resolver";
+
+impl DnsBackend for MacosBackend {
+    fn apply_rules(&self, vpn_info: &VpnInfo, domains: &[String]) -> Result<(), PlatformError> {
+        if vpn_info.dns_servers.is_empty() {
+            return Err(PlatformError::CommandFailed(
+                "no DNS servers in VpnInfo".to_string(),
+            ));
+        }
+        apply_to_dir(Path::new(RESOLVER_DIR), &vpn_info.dns_servers, domains)?;
+        flush_dns_cache();
+        Ok(())
+    }
+
+    fn revert_rules(&self, _interface: &str) -> Result<(), PlatformError> {
+        // There is no per-interface resolver state on macOS — resolver files
+        // are keyed by domain. Reverting removes every file we own.
+        let removed = remove_managed(Path::new(RESOLVER_DIR), None).map_err(|e| {
+            PlatformError::CommandFailed(format!("failed to remove resolver files: {e}"))
+        })?;
+        if removed > 0 {
+            flush_dns_cache();
+        }
+        log::info!("reverted {removed} splitway resolver file(s)");
+        Ok(())
+    }
+
+    fn status(&self, _interface: &str) -> Result<(), PlatformError> {
+        // Mirror the Linux backend: shell out to the system resolver inspector.
+        let status = Command::new("scutil").arg("--dns").status()?;
+        if !status.success() {
+            return Err(PlatformError::CommandFailed(
+                "scutil --dns failed".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Prior on-disk state of a resolver file before this apply touched it, used to
+/// undo a failed apply.
+enum Prior {
+    /// The file existed; these are its bytes, restored on rollback.
+    Existed(Vec<u8>),
+    /// The file did not exist; removed on rollback.
+    Absent,
+}
+
+/// Reconcile the resolver files in `dir` to exactly `domains`, each pointing at
+/// `servers`. A target path that already exists *without* our marker is the
+/// user's own resolver: we refuse to overwrite it (replacing it would let a
+/// later revert delete the user's config). Transactional and **non-destructive
+/// on failure**: each target file's prior state is captured before it is
+/// overwritten, so a mid-write failure restores overwritten files to their
+/// original bytes and removes only the files this call newly created. A failed
+/// re-apply therefore leaves the previously-live split-DNS exactly as it was —
+/// never a partial or empty set. Then prunes our now-unwanted files; a prune
+/// failure is returned (not swallowed) so the caller retries rather than
+/// recording success while a dropped domain's file keeps routing.
+fn apply_to_dir(dir: &Path, servers: &[String], domains: &[String]) -> Result<(), PlatformError> {
+    // Reject names that are not safe single path components before touching the
+    // filesystem: `dir.join("../x")` would escape /etc/resolver, and a
+    // slash-containing name would never match the single-component filenames
+    // prune compares against.
+    for domain in domains {
+        if !is_valid_domain(domain) {
+            return Err(PlatformError::CommandFailed(format!(
+                "refusing to apply invalid domain name: {domain:?}"
+            )));
+        }
+    }
+
+    let contents = resolver_contents(servers);
+
+    let mut written: Vec<(PathBuf, Prior)> = Vec::with_capacity(domains.len());
+    for domain in domains {
+        let path = resolver_path(dir, domain);
+        // Snapshot the prior state so a later failure can restore it exactly.
+        // symlink_metadata does not follow links, so we classify the entry
+        // itself, not a symlink target.
+        let prior = match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => {
+                let bytes = match fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    // Present but unreadable: don't risk clobbering it.
+                    Err(e) => {
+                        rollback(&written);
+                        return Err(PlatformError::CommandFailed(format!(
+                            "failed to read resolver file {} before overwrite: {e}",
+                            path.display()
+                        )));
+                    }
+                };
+                // Only overwrite a resolver file we previously wrote. If one
+                // exists without our marker it is the user's: refuse rather than
+                // replace it, because revert would later delete it (it now
+                // carries our marker) and the user's original DNS config would
+                // be lost — the in-call snapshot does not survive a successful
+                // apply.
+                if !is_managed(&String::from_utf8_lossy(&bytes)) {
+                    rollback(&written);
+                    return Err(PlatformError::CommandFailed(format!(
+                        "refusing to overwrite resolver file not created by splitway: {}",
+                        path.display()
+                    )));
+                }
+                Prior::Existed(bytes)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Prior::Absent,
+            // Exists but is a symlink / directory / other non-regular entry:
+            // refuse. We never follow a symlink (rollback could not restore it,
+            // and the write would replace the link with a regular file).
+            Ok(_) => {
+                rollback(&written);
+                return Err(PlatformError::CommandFailed(format!(
+                    "refusing to overwrite non-regular resolver entry: {}",
+                    path.display()
+                )));
+            }
+            Err(e) => {
+                rollback(&written);
+                return Err(PlatformError::CommandFailed(format!(
+                    "failed to stat resolver file {} before overwrite: {e}",
+                    path.display()
+                )));
+            }
+        };
+        // atomic_write is itself atomic, so on failure `path` is untouched
+        // (still in its `prior` state) and only the earlier writes need undoing.
+        if let Err(e) = atomic_write(&path, contents.as_bytes()) {
+            rollback(&written);
+            return Err(PlatformError::CommandFailed(format!(
+                "failed to write resolver file {}: {e}; rolled back {} file(s)",
+                path.display(),
+                written.len()
+            )));
+        }
+        written.push((path, prior));
+    }
+
+    let keep: BTreeSet<&str> = domains.iter().map(String::as_str).collect();
+    // Surface prune failures: a leftover file for a dropped domain keeps routing
+    // it through the VPN. Roll back this call's writes first — on a failed
+    // reconcile the state machine does not record `applied`, so newly-created
+    // files left behind would be skipped by a later revert. This undoes only
+    // this call's writes; a partially-completed prune is not un-deleted, but
+    // prune only ever removes files that are being dropped or are already stale,
+    // so those deletions are safe to leave. The result stays consistent with the
+    // retained `applied` state.
+    if let Err(e) = remove_managed(dir, Some(&keep)) {
+        rollback(&written);
+        return Err(PlatformError::CommandFailed(format!(
+            "failed to prune stale resolver files: {e}"
+        )));
+    }
+    Ok(())
+}
+
+/// Undo the writes recorded in `written`, most recent first: restore each
+/// overwritten file to its prior bytes and remove files this call created.
+fn rollback(written: &[(PathBuf, Prior)]) {
+    for (path, prior) in written.iter().rev() {
+        match prior {
+            Prior::Existed(bytes) => {
+                if let Err(e) = atomic_write(path, bytes) {
+                    log::error!("rollback could not restore {}: {e}", path.display());
+                }
+            }
+            Prior::Absent => {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// Remove every Splitway-owned resolver file in `dir`, except those whose
+/// filename is in `keep` (when `Some`). A missing `dir` is treated as "nothing
+/// to remove". Returns how many files were removed. Files we do not own (no
+/// marker) and unreadable files are left untouched.
+fn remove_managed(dir: &Path, keep: Option<&BTreeSet<&str>>) -> io::Result<usize> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+
+    let mut removed = 0;
+    for entry in entries {
+        let path = entry?.path();
+        // Only ever consider real files we could have written. `symlink_metadata`
+        // does not follow links, so a symlink — even one pointing at a
+        // marker-prefixed file — is skipped rather than read through and
+        // classified as managed.
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => {}
+            _ => continue,
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if keep.is_some_and(|keep| keep.contains(name)) {
+            continue;
+        }
+        // Only touch files we wrote; never a user-authored resolver file.
+        match fs::read_to_string(&path) {
+            Ok(contents) if is_managed(&contents) => {
+                fs::remove_file(&path)?;
+                removed += 1;
+            }
+            _ => {}
+        }
+    }
+    Ok(removed)
+}
+
+/// Best-effort flush of the macOS DNS caches after resolver files change.
+/// Failures are logged, not fatal: the resolver files are already correct and
+/// the cache expires on its own.
+fn flush_dns_cache() {
+    run_best_effort("dscacheutil", &["-flushcache"]);
+    run_best_effort("killall", &["-HUP", "mDNSResponder"]);
+}
+
+fn run_best_effort(cmd: &str, args: &[&str]) {
+    match Command::new(cmd).args(args).output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => log::warn!(
+            "{cmd} {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(e) => log::warn!("could not run {cmd}: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "splitway-resolver-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn servers() -> Vec<String> {
+        vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()]
+    }
+
+    #[test]
+    fn apply_writes_one_marked_file_per_domain() {
+        let dir = temp_dir("apply-writes");
+        apply_to_dir(
+            &dir,
+            &servers(),
+            &["a.com".to_string(), "b.com".to_string()],
+        )
+        .unwrap();
+
+        for domain in ["a.com", "b.com"] {
+            let body = fs::read_to_string(dir.join(domain)).unwrap();
+            assert!(is_managed(&body), "{domain} should be marked ours");
+            assert!(body.contains("nameserver 10.0.0.1"));
+            assert!(body.contains("nameserver 10.0.0.2"));
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn apply_creates_missing_resolver_dir() {
+        let parent = temp_dir("apply-mkdir");
+        let dir = parent.join("resolver"); // does not exist yet
+        apply_to_dir(&dir, &servers(), &["a.com".to_string()]).unwrap();
+        assert!(dir.join("a.com").is_file());
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn reapply_with_fewer_domains_prunes_the_dropped_one() {
+        let dir = temp_dir("apply-prune");
+        apply_to_dir(
+            &dir,
+            &servers(),
+            &["a.com".to_string(), "b.com".to_string()],
+        )
+        .unwrap();
+        // Re-apply with b.com dropped: its file must be pruned, a.com kept.
+        apply_to_dir(&dir, &servers(), &["a.com".to_string()]).unwrap();
+        assert!(dir.join("a.com").is_file());
+        assert!(!dir.join("b.com").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn revert_removes_only_files_we_own() {
+        let dir = temp_dir("revert-owned");
+        apply_to_dir(&dir, &servers(), &["a.com".to_string()]).unwrap();
+        // A resolver file the user wrote by hand.
+        let user_file = dir.join("user.example");
+        fs::write(&user_file, "nameserver 9.9.9.9\n").unwrap();
+
+        let removed = remove_managed(&dir, None).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!dir.join("a.com").exists(), "our file is removed");
+        assert!(user_file.exists(), "the user's file is untouched");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn revert_on_missing_dir_is_noop() {
+        let mut missing = std::env::temp_dir();
+        missing.push(format!("splitway-absent-resolver-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(remove_managed(&missing, None).unwrap(), 0);
+    }
+
+    #[test]
+    fn failed_write_rolls_back_files_written_in_this_call() {
+        // Make the second domain unwritable by pre-creating it as a directory:
+        // atomic_write renames a temp file over the path, which fails on a dir.
+        let dir = temp_dir("apply-rollback");
+        fs::create_dir(dir.join("b.com")).unwrap();
+
+        let err = apply_to_dir(
+            &dir,
+            &servers(),
+            &["a.com".to_string(), "b.com".to_string()],
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlatformError::CommandFailed(_)));
+        // a.com was newly created then rolled back when b.com failed: no
+        // partial split-DNS set remains.
+        assert!(!dir.join("a.com").exists(), "a.com must be rolled back");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_reapply_restores_previously_live_files() {
+        let dir = temp_dir("reapply-rollback");
+        // Establish a live set with the original servers.
+        let v1 = vec!["10.0.0.1".to_string()];
+        apply_to_dir(&dir, &v1, &["a.com".to_string(), "b.com".to_string()]).unwrap();
+        let a_before = fs::read_to_string(dir.join("a.com")).unwrap();
+
+        // Force a re-apply (with NEW servers) to fail at c.com — a directory
+        // cannot be atomically overwritten by a file.
+        fs::create_dir(dir.join("c.com")).unwrap();
+        let v2 = vec!["10.9.9.9".to_string()];
+        let err = apply_to_dir(
+            &dir,
+            &v2,
+            &[
+                "a.com".to_string(),
+                "b.com".to_string(),
+                "c.com".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlatformError::CommandFailed(_)));
+
+        // The previously-live files survive with their ORIGINAL contents — a
+        // failed re-apply is non-destructive, not a partial/empty wipe.
+        assert_eq!(fs::read_to_string(dir.join("a.com")).unwrap(), a_before);
+        assert!(dir.join("b.com").is_file());
+        assert!(a_before.contains("nameserver 10.0.0.1"));
+        assert!(!a_before.contains("10.9.9.9"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn apply_refuses_to_overwrite_a_user_authored_resolver() {
+        let dir = temp_dir("apply-refuse-unmanaged");
+        // The user already has a hand-written resolver for this domain.
+        let user = dir.join("corp.example.com");
+        fs::write(&user, "nameserver 9.9.9.9\n").unwrap();
+
+        let err = apply_to_dir(&dir, &servers(), &["corp.example.com".to_string()]).unwrap_err();
+        assert!(matches!(err, PlatformError::CommandFailed(_)));
+        // The user's file is left exactly as it was — not replaced by a managed
+        // file that a later revert would delete.
+        assert_eq!(fs::read_to_string(&user).unwrap(), "nameserver 9.9.9.9\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn apply_refuses_to_overwrite_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = temp_dir("apply-refuse-symlink");
+        // A resolver entry that is a symlink — even pointing at a file that
+        // carries our marker — must not be followed or replaced.
+        let target = dir.join("real-target");
+        fs::write(&target, resolver_contents(&servers())).unwrap();
+        let link = dir.join("corp.example.com");
+        symlink(&target, &link).unwrap();
+
+        let err = apply_to_dir(&dir, &servers(), &["corp.example.com".to_string()]).unwrap_err();
+        assert!(matches!(err, PlatformError::CommandFailed(_)));
+        // The symlink is left as-is (not followed, not replaced by a file).
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_domain_is_rejected_before_any_write() {
+        let dir = temp_dir("invalid-domain");
+        let err = apply_to_dir(&dir, &servers(), &["../escape".to_string()]).unwrap_err();
+        assert!(matches!(err, PlatformError::CommandFailed(_)));
+        assert!(!dir.join("../escape").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_prune_rolls_back_this_calls_writes() {
+        use std::process::Command;
+        // Exercises the prune-failure branch the write-failure tests can't reach:
+        // a stale managed file for a dropped domain is made immutable (chflags
+        // uchg) so remove_managed fails AFTER the fresh write for a.com succeeds.
+        let dir = temp_dir("prune-rollback");
+        let stale = dir.join("b.com");
+        fs::write(&stale, resolver_contents(&servers())).unwrap();
+        assert!(Command::new("chflags")
+            .args(["uchg"])
+            .arg(&stale)
+            .status()
+            .unwrap()
+            .success());
+
+        let err = apply_to_dir(&dir, &servers(), &["a.com".to_string()]).unwrap_err();
+        assert!(matches!(err, PlatformError::CommandFailed(_)));
+        // The freshly-written a.com (Prior::Absent) is rolled back, and the
+        // un-prunable file is left untouched.
+        assert!(
+            !dir.join("a.com").exists(),
+            "the fresh write must be rolled back when prune fails"
+        );
+        assert!(stale.exists(), "an un-prunable file is left intact");
+
+        // Teardown: clear the immutable flag so the dir can be removed.
+        let _ = Command::new("chflags")
+            .args(["nouchg"])
+            .arg(&stale)
+            .status();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}
