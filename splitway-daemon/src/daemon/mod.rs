@@ -45,7 +45,7 @@ async fn run_async(config: LocalConfig) {
     }
 
     let backend: Arc<dyn DnsBackend> = Arc::from(create_dns_backend());
-    let detector = create_vpn_detector();
+    let detector = create_vpn_detector(&config);
 
     // Single state-owner task. Shutdown is delivered out-of-band via its own
     // channel so the revert preempts any queued commands.

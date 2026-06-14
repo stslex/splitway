@@ -409,6 +409,8 @@ mod tests {
             vpn_name: "wg0".to_string(),
             vpn_hosts: hosts.iter().map(|s| s.to_string()).collect(),
             enabled,
+            vpn_backend: config::VpnBackend::default(),
+            openvpn: config::OpenVpnConfig::default(),
         }
     }
 
@@ -598,6 +600,8 @@ mod tests {
             vpn_name: "wg1".to_string(),
             vpn_hosts: vec!["a.com".to_string()],
             enabled: true,
+            vpn_backend: config::VpnBackend::default(),
+            openvpn: config::OpenVpnConfig::default(),
         };
         config::save_config_to(&sm.config_path, &new_cfg).unwrap();
         let resp = sm.on_request(Request::ReloadConfig).await;
