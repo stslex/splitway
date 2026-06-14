@@ -20,6 +20,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use core_foundation::array::CFArray;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
@@ -32,7 +33,10 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use splitway_shared::platform::{PlatformError, VpnEvent, VpnInfo};
 
 use super::detector::current_dns;
-use super::state::{Deduper, Emit};
+use super::state::{sample_with_retry, Deduper, Emit, INITIAL_SAMPLE_ATTEMPTS};
+
+/// Delay between retries of the post-arm initial sample (see [`emit_initial`]).
+const INITIAL_SAMPLE_RETRY_DELAY: Duration = Duration::from_millis(300);
 
 /// State carried through the SCDynamicStore callback (a bare `fn`, so it cannot
 /// capture — everything it needs lives here). The dedup is shared (`Rc`) with
@@ -114,7 +118,7 @@ fn run_watch(interface: String, tx: Sender<VpnEvent>) {
     // source live, any such change is queued and delivered once the run loop
     // starts; the shared dedup keeps this sample and that delivery from
     // double-emitting.
-    if !emit_current(&interface, &tx, &mut dedup.borrow_mut()) {
+    if !emit_initial(&interface, &tx, &mut dedup.borrow_mut()) {
         return; // receiver already gone
     }
 
@@ -144,19 +148,59 @@ fn on_change(_store: SCDynamicStore, _changed_keys: CFArray<CFString>, ctx: &mut
     }
 }
 
-/// Read the interface's current DNS, decide whether it represents a new state,
-/// and send the corresponding event. Returns `false` if the receiver has been
-/// dropped.
+/// Steady-state callback path: read the interface's current DNS, decide whether
+/// it represents a new state, and send the corresponding event. Returns `false`
+/// if the receiver has been dropped.
 fn emit_current(interface: &str, tx: &Sender<VpnEvent>, dedup: &mut Deduper) -> bool {
-    let servers = match current_dns(interface) {
-        Ok(servers) => servers,
+    match current_dns(interface) {
+        Ok(servers) => emit_servers(interface, tx, dedup, servers),
         // A transient `scutil` failure is not "VPN down": keep the last known
         // state instead of emitting a spurious Down that would revert rules.
+        // SCDynamicStore re-fires the callback on the next change, so a one-off
+        // hiccup here recovers on its own.
         Err(e) => {
             log::warn!("reading DNS for {interface} failed: {e}; keeping last state");
-            return true;
+            true
         }
-    };
+    }
+}
+
+/// Post-arm initial sample — the daemon's *only* startup detection path
+/// (`daemon/mod.rs` wires `watch()` as the sole VPN-state source; there is no
+/// startup `detect()`). The steady-state callback can keep the last state on a
+/// transient `scutil` error because the next notification will re-fire it, but
+/// at startup `last` is `None` and an already-up VPN may sit on a quiescent link
+/// for a long time before any notification arrives — so a single `scutil` hiccup
+/// here would silently leave split-DNS off until something perturbs the network.
+/// Retry the read a few times before giving up. The source is already armed, so
+/// notifications that fire during the retries are queued and delivered once the
+/// run loop starts, and the shared dedup prevents a double-emit.
+fn emit_initial(interface: &str, tx: &Sender<VpnEvent>, dedup: &mut Deduper) -> bool {
+    let sample = sample_with_retry(
+        INITIAL_SAMPLE_ATTEMPTS,
+        || current_dns(interface),
+        || std::thread::sleep(INITIAL_SAMPLE_RETRY_DELAY),
+    );
+    match sample {
+        Ok(servers) => emit_servers(interface, tx, dedup, servers),
+        Err(e) => {
+            log::error!(
+                "initial DNS read for {interface} failed after {INITIAL_SAMPLE_ATTEMPTS} \
+                 attempts: {e}; auto-apply will start on the next DNS/network change"
+            );
+            true // stay alive; a later notification can still recover
+        }
+    }
+}
+
+/// Dedup a freshly-read server list and send the resulting event. Returns
+/// `false` if the receiver has been dropped.
+fn emit_servers(
+    interface: &str,
+    tx: &Sender<VpnEvent>,
+    dedup: &mut Deduper,
+    servers: Vec<String>,
+) -> bool {
     let event = match dedup.decide(&servers) {
         Emit::Up => VpnEvent::Up(VpnInfo {
             interface_name: interface.to_string(),
