@@ -59,15 +59,41 @@ sudo install -m 755 target/release/splitway-daemon /usr/local/bin/splitway-daemo
 sudo install -m 755 target/release/splitway         /usr/local/bin/splitway
 sudo install -m 644 packaging/launchd/com.splitway.daemon.plist \
     /Library/LaunchDaemons/com.splitway.daemon.plist
+```
+
+Configure the VPN interface **before** starting the daemon. The plist runs the
+daemon as root and pins `HOME=/var/root`, so the config lives at
+`/var/root/.config/splitway/config.json` (`vpn_name` is the `utun*` interface —
+find it with `scutil --nwi` or `ifconfig` while the VPN is up):
+
+```sh
+sudo mkdir -p /var/root/.config/splitway
+sudo tee /var/root/.config/splitway/config.json >/dev/null <<'EOF'
+{
+  "vpn_name": "utun0",
+  "vpn_hosts": [],
+  "enabled": true
+}
+EOF
+```
+
+Then start the daemon:
+
+```sh
 sudo launchctl load -w /Library/LaunchDaemons/com.splitway.daemon.plist
 # stop + revert:
 sudo launchctl unload -w /Library/LaunchDaemons/com.splitway.daemon.plist
 ```
 
-The plist runs the daemon as root and pins `HOME=/var/root`, so configure the
-VPN interface in `/var/root/.config/splitway/config.json` (`vpn_name` is the
-`utun*` interface — find it with `scutil --nwi` or `ifconfig` while the VPN is
-up).
+The daemon fixes the interface it watches at startup, so `vpn_name` must be set
+before the first `launchctl load`. Changing `vpn_name` afterwards needs a
+service restart to take effect — a config reload re-reads `vpn_hosts` and
+`enabled`, but not the watched interface:
+
+```sh
+sudo launchctl unload -w /Library/LaunchDaemons/com.splitway.daemon.plist
+sudo launchctl load   -w /Library/LaunchDaemons/com.splitway.daemon.plist
+```
 
 ### Socket on macOS
 
