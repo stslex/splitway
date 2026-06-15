@@ -6,7 +6,11 @@
 //! - real-time state notifications, `>STATE:<time>,<state>,<desc>,<localip>,...`,
 //!   and the bare `<time>,<state>,...` form the `state` command replies with;
 //! - the pushed-DNS line surfaced by `log on`, a `>LOG:<time>,<flags>,PUSH:
-//!   Received control message: 'PUSH_REPLY,...,dhcp-option DNS <ip>,...'`;
+//!   Received control message: 'PUSH_REPLY,...,dhcp-option DNS <ip>,...'`. Note
+//!   the `log on all` *history replay* (used for attach-after-connect recovery)
+//!   emits the same content WITHOUT the real-time `>LOG:` prefix — a bare
+//!   `<time>,<flags>,PUSH: ...` line — so the DNS parser keys on `PUSH_REPLY`
+//!   and the option structure, never on the prefix;
 //! - the management address from config, either `host:port` (TCP) or a unix
 //!   socket path.
 //!
@@ -217,6 +221,19 @@ mod tests {
         // The no-pushed-DNS case: a PUSH_REPLY carrying no dhcp-option DNS.
         let line = ">LOG:1700000000,I,PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,route 10.8.0.0,topology subnet,ping 10'";
         assert!(parse_push_reply_dns(line).is_empty());
+    }
+
+    #[test]
+    fn push_reply_parses_prefixless_history_replay_form() {
+        // The `log on all` history replay (attach-after-connect DNS recovery)
+        // emits the PUSH line WITHOUT the real-time `>LOG:` prefix, as a bare
+        // `<time>,<flags>,PUSH: ...`. The parser keys on `PUSH_REPLY`, not the
+        // prefix, so the same DNS is recovered from the replayed form.
+        let line = "1700000000,I,PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.8.0.1,dhcp-option DNS6 2001:db8::1,route 10.8.0.0'";
+        assert_eq!(
+            parse_push_reply_dns(line),
+            vec!["10.8.0.1".to_string(), "2001:db8::1".to_string()]
+        );
     }
 
     #[test]
