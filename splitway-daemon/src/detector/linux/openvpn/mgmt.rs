@@ -233,9 +233,21 @@ async fn handle_line(
             interface_name: interface.to_string(),
             dns_servers: last_dns.clone(),
         }),
-        Transition::Down => VpnEvent::Down {
-            interface_name: interface.to_string(),
-        },
+        Transition::Down => {
+            // A real OpenVPN down ends this session's DNS context, so drop the
+            // cached pushed DNS: the next `Up` must not reuse the previous
+            // session's servers. If the management socket reconnects only after
+            // the new tunnel is already up and its `PUSH_REPLY` has aged out of
+            // the bounded `log on all` replay (or the new session pushes no
+            // DNS), the following `Up` then carries empty `dns_servers` (the
+            // backend no-ops) instead of applying stale split-DNS rules. Only a
+            // fresh `PUSH_REPLY` repopulates it. (A socket-level drop, by
+            // contrast, emits no `Down` and keeps `last_dns` — see `run`.)
+            last_dns.clear();
+            VpnEvent::Down {
+                interface_name: interface.to_string(),
+            }
+        }
     };
     send_event(tx, event).await;
 }
@@ -259,10 +271,10 @@ async fn send_event(tx: &Sender<VpnEvent>, event: VpnEvent) {
 }
 
 /// One-shot blocking probe for `OpenVpnDetector::detect`: connect, arm `log on
-/// all` + `state`, read until the `state` reply's `END` (or a short deadline),
-/// and report whether the VPN is connected plus any pushed DNS observed. Uses
-/// blocking std sockets so `detect` needs no async runtime, mirroring the NM
-/// detector's synchronous `nmcli` call.
+/// all` + `state`, read past the `log` replay to the `state` reply's `END` (or
+/// a short deadline), and report whether the VPN is connected plus any pushed
+/// DNS observed. Uses blocking std sockets so `detect` needs no async runtime,
+/// mirroring the NM detector's synchronous `nmcli` call.
 pub(super) fn blocking_sample(
     addr: &ManagementAddr,
     password: Option<&str>,
@@ -292,14 +304,34 @@ fn blocking_session<S: Read + Write>(
     if let Some(password) = password {
         write_line_blocking(&mut stream, password)?;
     }
+    // `log on all` replays the buffered log first (so an attach-after-connect
+    // probe still recovers the historical `PUSH_REPLY`), then `state` reports
+    // whether the tunnel is up. Both are multi-line command replies, and the
+    // management interface terminates every multi-line reply with an `END` line
+    // and answers commands strictly in order — so the stream carries exactly
+    // two `END`s: the first ends the `log` replay, the second ends the `state`
+    // reply. The `state` answer follows the first `END`, so we must read past
+    // it and stop only at the second.
+    //
+    // We key on the `END` count, not on line content, by design: a replayed
+    // history log line is emitted WITHOUT the real-time `>LOG:` prefix (bare
+    // `<time>,<flags>,<msg>`), so it is structurally indistinguishable from a
+    // `state` reply line and a "stop at the first state-looking line" check
+    // would stop at the log replay. (Its `<flags>` field is never a
+    // CONNECTED/EXITING/RECONNECTING token, so it cannot corrupt `connected`.)
+    // The deadline / read-timeout below is the backstop if a reply is missing.
     write_line_blocking(&mut stream, "log on all")?;
     write_line_blocking(&mut stream, "state")?;
+
+    // `log on all` then `state`: the `state` answer completes at the 2nd `END`.
+    const END_TERMINATED_REPLIES: u32 = 2;
 
     let deadline = Instant::now() + DETECT_DEADLINE;
     let mut reader = std::io::BufReader::new(stream);
     let mut line = String::new();
     let mut connected = false;
     let mut dns = Vec::new();
+    let mut ends_seen: u32 = 0;
 
     while Instant::now() < deadline {
         line.clear();
@@ -308,7 +340,11 @@ fn blocking_session<S: Read + Write>(
             Ok(_) => {
                 let trimmed = line.trim_end();
                 if trimmed == "END" {
-                    break; // the `state` reply is complete
+                    ends_seen += 1;
+                    if ends_seen >= END_TERMINATED_REPLIES {
+                        break; // the `state` reply is complete
+                    }
+                    continue; // terminator of the `log` replay — keep reading
                 }
                 if trimmed.contains("PUSH_REPLY") {
                     let parsed = parse_push_reply_dns(trimmed);
