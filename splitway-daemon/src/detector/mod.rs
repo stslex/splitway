@@ -24,7 +24,7 @@ pub fn create_vpn_detector(config: &LocalConfig) -> Box<dyn VpnDetector> {
         use splitway_shared::config::VpnBackend;
         match config.vpn_backend {
             VpnBackend::NetworkManager => Box::new(linux::LinuxDetector),
-            VpnBackend::Openvpn => Box::new(linux::openvpn::OpenVpnDetector::from_config(
+            VpnBackend::OpenVpn => Box::new(linux::openvpn::OpenVpnDetector::from_config(
                 &config.openvpn,
             )),
         }
