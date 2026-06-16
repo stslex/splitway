@@ -170,11 +170,15 @@ pub enum VpnBackend {
     #[default]
     NetworkManager,
     /// Detect a standalone OpenVPN connection via its management interface.
-    Openvpn,
+    /// `rename` pins the config token to `openvpn` (kebab-case of `OpenVpn`
+    /// would be `open-vpn`); the Rust name matches `OpenVpnConfig` /
+    /// `OpenVpnDetector` for consistent casing across the codebase.
+    #[serde(rename = "openvpn")]
+    OpenVpn,
 }
 
 /// Connection settings for a standalone OpenVPN's management interface. Used
-/// only when [`LocalConfig::vpn_backend`] is [`VpnBackend::Openvpn`].
+/// only when [`LocalConfig::vpn_backend`] is [`VpnBackend::OpenVpn`].
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct OpenVpnConfig {
     /// The management interface address: either a TCP endpoint `host:port`
@@ -274,7 +278,7 @@ mod tests {
             vpn_name: "wg0".to_string(),
             vpn_hosts: vec!["example.com".to_string(), "internal.corp".to_string()],
             enabled: false,
-            vpn_backend: VpnBackend::Openvpn,
+            vpn_backend: VpnBackend::OpenVpn,
             openvpn: OpenVpnConfig {
                 management: "127.0.0.1:7505".to_string(),
                 management_password_file: Some("/etc/splitway/mgmt.pass".to_string()),
@@ -318,7 +322,7 @@ mod tests {
         );
         let ovpn = r#"{"vpn_name":"tun0","vpn_hosts":[],"vpn_backend":"openvpn","openvpn":{"management":"127.0.0.1:7505"}}"#;
         let parsed: LocalConfig = serde_json::from_str(ovpn).unwrap();
-        assert_eq!(parsed.vpn_backend, VpnBackend::Openvpn);
+        assert_eq!(parsed.vpn_backend, VpnBackend::OpenVpn);
         assert_eq!(parsed.openvpn.management, "127.0.0.1:7505");
     }
 

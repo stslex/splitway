@@ -99,11 +99,17 @@ Then configure Splitway:
   state and the pushed DNS, not the device.
 - `openvpn.management_password_file` is optional — set it (to a file whose first
   line is the password) only when the management interface is password-protected.
+- If OpenVPN pushes **no DNS servers** (a `PUSH_REPLY` with no `dhcp-option DNS`),
+  there is nowhere to route the selected domains, so Splitway leaves DNS unchanged
+  and applies nothing; any rules from a previous session are reverted.
 
 Splitway sends only **read-only** management commands (`state`, `log`); it never
-sends `signal`/`hold` or otherwise controls the tunnel. If the management socket
-drops while the VPN stays up, Splitway reconnects with backoff and keeps the
-rules in place — only an OpenVPN `EXITING`/`RECONNECTING` state reverts them.
+sends `signal`/`hold` or otherwise controls the tunnel. A management-socket drop
+is never itself treated as VPN-down: Splitway reconnects with backoff, then
+re-samples the tunnel and reconciles — keeping the rules unchanged when the
+pushed DNS is the same, re-applying when it changed, and reverting when the
+reconnected session pushes no DNS (as well as on a genuine OpenVPN
+`EXITING`/`RECONNECTING` state).
 
 > **Known limitation:** if OpenVPN pushes *different* DNS servers mid-session
 > (a TLS renegotiation that changes `dhcp-option DNS` without a reconnect),

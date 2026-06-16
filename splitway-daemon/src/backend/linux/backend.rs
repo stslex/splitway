@@ -11,6 +11,11 @@ impl DnsBackend for LinuxBackend {
         // `resolvectl dns <iface>` with zero servers — or applying routing
         // domains that point at a link with no resolver — would leave a broken,
         // half-configured rule. Treat it as a successful no-op and log instead.
+        //
+        // The state machine's `desired()` already gates this out (an Up with no
+        // DNS reverts/no-ops rather than applying), so this branch is normally
+        // unreached from the daemon; it stays as defense-in-depth for any direct
+        // caller so a zero-server apply can never half-configure the link.
         if vpn_info.dns_servers.is_empty() {
             log::info!(
                 "{}: VPN up but no DNS servers were provided; leaving DNS unchanged \

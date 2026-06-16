@@ -1,12 +1,15 @@
 //! Thin OpenVPN management-interface plumbing for the VPN event stream.
 //!
-//! All real logic lives in the pure `parser`/`state` modules; this file is the
-//! socket glue and is intentionally not unit-tested. It connects to the
-//! management interface, optionally authenticates, arms `log on all` + `state
-//! on`, samples the current `state`, and feeds parsed transitions + pushed DNS
-//! into the same `tokio::sync::mpsc::Sender<VpnEvent>` contract the other
-//! detectors use. Only read-only commands are sent (`state`, `log`); the
-//! detector never sends `signal`/`hold`.
+//! All real logic lives in the pure `parser`/`state` modules. The socket
+//! *connection* glue (connect / reconnect / backoff) needs a live management
+//! interface and is not unit-tested, but the generic `blocking_session`
+//! read-loop is driven by an in-memory stream in the tests below.
+//!
+//! The plumbing connects to the management interface, optionally authenticates,
+//! arms `log on all` + `state on`, samples the current `state`, and feeds parsed
+//! transitions + pushed DNS into the same `tokio::sync::mpsc::Sender<VpnEvent>`
+//! contract the other detectors use. Only read-only commands are sent (`state`,
+//! `log`); the detector never sends `signal`/`hold`.
 //!
 //! Reconnect policy mirrors the macOS "transient read error → keep last state"
 //! rule: a dropped/erroring management socket is **not** treated as VPN-down
@@ -39,18 +42,31 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// under this and keeps the backoff escalating toward [`MAX_BACKOFF`], instead
 /// of pinning at a tight reconnect loop.
 const MIN_HEALTHY_SESSION: Duration = Duration::from_secs(10);
+/// Connect timeout for the async watch loop. A misconfigured or firewall-
+/// blackholed management endpoint would otherwise hang the connect for the
+/// OS-level timeout, stalling backoff/retry and shutdown; this caps it so the
+/// loop stays responsive (the connect is also raced against receiver-drop).
+const WATCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Connect timeout for the one-shot `detect` probe (blocking).
 const DETECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Per-read timeout for the one-shot `detect` probe (blocking).
 const DETECT_READ_TIMEOUT: Duration = Duration::from_secs(2);
-/// Overall budget for the one-shot `detect` probe.
+/// Read-loop budget for the one-shot `detect` probe, measured from *after* the
+/// socket is connected: it bounds how long we wait for the `log` + `state`
+/// replies, not the connect (that is [`DETECT_CONNECT_TIMEOUT`]). Worst-case
+/// `detect` latency is therefore connect-timeout + this, not this alone.
 const DETECT_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Drive the management watch until the receiver is dropped. Reconnects with
 /// backoff on any connection error, never emitting `Down` for a socket problem
-/// (only OpenVPN state does). The `Deduper` and last-seen pushed DNS persist
-/// across reconnects, so re-sampling `CONNECTED` after a transient drop is
-/// suppressed rather than re-emitted.
+/// (only OpenVPN state does). The last-seen pushed DNS persists across
+/// reconnects (a transient drop must not discard known-good DNS), but the
+/// `Deduper` is reset on each reconnect so the re-sampled state is delivered
+/// fresh — a socket drop may hide a tunnel restart, and suppressing the
+/// re-sampled `Up` would strand stale/missing split-DNS until the next
+/// observed down/up. The downstream state machine dedups on the server set, so
+/// a re-sample over an unchanged tunnel is a cheap no-op (and a reconnect that
+/// reveals no pushed DNS reverts).
 pub(super) async fn run(
     interface: String,
     addr: ManagementAddr,
@@ -83,6 +99,21 @@ pub(super) async fn run(
                     "openvpn management ({addr}) error: {e}; reconnecting in {backoff:?} \
                      (VPN state left unchanged)"
                 );
+                // A dropped management socket does not tell us the tunnel
+                // survived: OpenVPN may have restarted and recreated the `tun`
+                // link (losing its per-link resolver settings, possibly with
+                // different pushed DNS). Forget the last emitted transition so
+                // the post-reconnect re-sample is delivered fresh instead of
+                // being suppressed as a duplicate `Up`. The state machine then
+                // re-applies only if the DNS actually changed (it dedups on the
+                // server set), reverts if the reconnected session now pushes no
+                // DNS, and no-ops otherwise — so a transient blip over a still-
+                // healthy tunnel stays cheap. (A tunnel that restarts with the
+                // *same* pushed DNS is treated as converged and not re-applied:
+                // the same server-set-keyed limitation noted for a mid-session
+                // DNS rotation — see README.) We still never synthesize a `Down`
+                // for a socket error; only OpenVPN state does that.
+                dedup = Deduper::default();
                 tokio::select! {
                     _ = tx.closed() => return Ok(()),
                     _ = tokio::time::sleep(backoff) => {}
@@ -107,14 +138,45 @@ async fn connect_and_stream(
 ) -> Result<(), PlatformError> {
     match addr {
         ManagementAddr::Tcp(endpoint) => {
-            let stream = TcpStream::connect(endpoint).await?;
+            let Some(stream) = connect_or_shutdown(TcpStream::connect(endpoint), addr, tx).await?
+            else {
+                return Ok(()); // receiver dropped while connecting
+            };
             log::debug!("connected to openvpn management at tcp {endpoint}");
             run_session(stream, interface, password, dedup, last_dns, backoff, tx).await
         }
         ManagementAddr::Unix(path) => {
-            let stream = UnixStream::connect(path).await?;
+            let Some(stream) = connect_or_shutdown(UnixStream::connect(path), addr, tx).await?
+            else {
+                return Ok(()); // receiver dropped while connecting
+            };
             log::debug!("connected to openvpn management at unix {}", path.display());
             run_session(stream, interface, password, dedup, last_dns, backoff, tx).await
+        }
+    }
+}
+
+/// Await a connect future, but cap it with [`WATCH_CONNECT_TIMEOUT`] and race it
+/// against the receiver being dropped. Returns `Ok(None)` when the receiver is
+/// gone (the watch should stop without backing off); a timeout surfaces as a
+/// `CommandFailed` so the caller logs it and reconnects with backoff, instead of
+/// the task stalling on a blackholed endpoint's OS-level connect timeout.
+async fn connect_or_shutdown<F, S>(
+    connect: F,
+    addr: &ManagementAddr,
+    tx: &Sender<VpnEvent>,
+) -> Result<Option<S>, PlatformError>
+where
+    F: std::future::Future<Output = std::io::Result<S>>,
+{
+    tokio::select! {
+        _ = tx.closed() => Ok(None),
+        result = tokio::time::timeout(WATCH_CONNECT_TIMEOUT, connect) => match result {
+            Ok(Ok(stream)) => Ok(Some(stream)),
+            Ok(Err(e)) => Err(PlatformError::Io(e)),
+            Err(_) => Err(PlatformError::CommandFailed(format!(
+                "timed out connecting to openvpn management ({addr}) after {WATCH_CONNECT_TIMEOUT:?}"
+            ))),
         }
     }
 }
@@ -287,19 +349,23 @@ pub(super) fn blocking_sample(
                 .ok_or_else(|| PlatformError::ParseError(format!("cannot resolve {endpoint}")))?;
             let stream = StdTcpStream::connect_timeout(&socket_addr, DETECT_CONNECT_TIMEOUT)?;
             stream.set_read_timeout(Some(DETECT_READ_TIMEOUT))?;
-            blocking_session(stream, password)
+            blocking_session(stream, password, DETECT_DEADLINE)
         }
         ManagementAddr::Unix(path) => {
             let stream = StdUnixStream::connect(path)?;
             stream.set_read_timeout(Some(DETECT_READ_TIMEOUT))?;
-            blocking_session(stream, password)
+            blocking_session(stream, password, DETECT_DEADLINE)
         }
     }
 }
 
+/// `read_budget` bounds the read loop measured from entry (after connect) — the
+/// production caller passes [`DETECT_DEADLINE`]; tests pass a large value so the
+/// in-memory stream terminates by EOF, never by the wall clock.
 fn blocking_session<S: Read + Write>(
     mut stream: S,
     password: Option<&str>,
+    read_budget: Duration,
 ) -> Result<(bool, Vec<String>), PlatformError> {
     if let Some(password) = password {
         write_line_blocking(&mut stream, password)?;
@@ -326,7 +392,7 @@ fn blocking_session<S: Read + Write>(
     // `log on all` then `state`: the `state` answer completes at the 2nd `END`.
     const END_TERMINATED_REPLIES: u32 = 2;
 
-    let deadline = Instant::now() + DETECT_DEADLINE;
+    let deadline = Instant::now() + read_budget;
     let mut reader = std::io::BufReader::new(stream);
     let mut line = String::new();
     let mut connected = false;
@@ -347,10 +413,13 @@ fn blocking_session<S: Read + Write>(
                     continue; // terminator of the `log` replay — keep reading
                 }
                 if trimmed.contains("PUSH_REPLY") {
-                    let parsed = parse_push_reply_dns(trimmed);
-                    if !parsed.is_empty() {
-                        dns = parsed;
-                    }
+                    // Last PUSH_REPLY wins, empty or not — exactly as the
+                    // streaming `handle_line` path overwrites `last_dns`. The
+                    // `log on all` replay can carry an older session's
+                    // DNS-bearing PUSH_REPLY ahead of the current session's
+                    // no-DNS one; keeping the latter (even when empty) prevents
+                    // `detect()` from returning a prior session's stale servers.
+                    dns = parse_push_reply_dns(trimmed);
                 } else if let Some(state) = parse_state_line(trimmed) {
                     match transition_for_state(state) {
                         Some(Transition::Up) => connected = true,
@@ -380,4 +449,104 @@ fn write_line_blocking<W: Write>(writer: &mut W, command: &str) -> Result<(), Pl
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An in-memory management stream: reads come from a canned script of
+    /// management output; writes (the `log on all` / `state` commands) are
+    /// discarded. Lets the generic `blocking_session` read-loop be exercised
+    /// without a live socket.
+    struct CannedStream {
+        reads: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl CannedStream {
+        fn new(script: &str) -> Self {
+            Self {
+                reads: std::io::Cursor::new(script.as_bytes().to_vec()),
+            }
+        }
+    }
+
+    impl Read for CannedStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.read(buf)
+        }
+    }
+
+    impl Write for CannedStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A read budget far larger than any test takes, so the canned in-memory
+    /// stream always terminates by EOF rather than the wall-clock deadline —
+    /// keeping these tests deterministic under CPU contention.
+    const UNBOUNDED: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn blocking_session_reads_state_past_the_log_replay_terminator() {
+        // The first `END` terminates the `log on all` replay; the CONNECTED
+        // `state` reply only arrives after it, so the probe must read past the
+        // first `END` and stop at the second. It also collects the replay's
+        // pushed DNS.
+        let script = concat!(
+            "1700000000,I,PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1,dhcp-option DNS 10.8.0.2,route 10.8.0.0'\n",
+            "END\n",
+            "1700000200,CONNECTED,SUCCESS,10.8.0.2,192.0.2.10,1194,,\n",
+            "END\n",
+        );
+        let (connected, dns) =
+            blocking_session(CannedStream::new(script), None, UNBOUNDED).unwrap();
+        assert!(connected, "state reply after the second END must be read");
+        assert_eq!(
+            dns,
+            vec!["10.8.0.1".to_string(), "10.8.0.2".to_string()],
+            "pushed DNS from the log replay must be collected"
+        );
+    }
+
+    #[test]
+    fn blocking_session_last_push_reply_wins_even_when_it_clears_dns() {
+        // The `log on all` replay carries an older, DNS-bearing PUSH_REPLY ahead
+        // of the current session's no-DNS PUSH_REPLY. The last one must win even
+        // though it is empty, so `detect()` never returns a prior session's
+        // stale servers (mirrors the streaming `handle_line` behavior).
+        let script = concat!(
+            ">INFO:OpenVPN Management Interface Version 5\n",
+            "1700000000,I,PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.9,route 10.8.0.0'\n",
+            "1700000100,I,PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,route 10.8.0.0'\n",
+            "END\n",
+            "1700000200,CONNECTED,SUCCESS,10.8.0.2,192.0.2.10,1194,,\n",
+            "END\n",
+        );
+        let (connected, dns) =
+            blocking_session(CannedStream::new(script), None, UNBOUNDED).unwrap();
+        assert!(connected);
+        assert!(
+            dns.is_empty(),
+            "the newer no-DNS PUSH_REPLY must clear the older session's DNS"
+        );
+    }
+
+    #[test]
+    fn blocking_session_reports_down_state_as_not_connected() {
+        // A `state` reply of RECONNECTING (tunnel down) must report not-connected.
+        let script = concat!(
+            "END\n",
+            "1700000200,RECONNECTING,ping-restart,,,,,\n",
+            "END\n"
+        );
+        let (connected, dns) =
+            blocking_session(CannedStream::new(script), None, UNBOUNDED).unwrap();
+        assert!(!connected);
+        assert!(dns.is_empty());
+    }
 }
