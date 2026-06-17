@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 
-use splitway_shared::config::{self, LocalConfig};
-use splitway_shared::ipc::{Request, Response, StatusInfo};
+use splitway_shared::config::{self, LocalConfig, OpenVpnConfig};
+use splitway_shared::ipc::{ConfigView, Request, Response, StatusInfo};
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnEvent, VpnInfo};
 
 /// Routine commands funneled into the state-owner task. Shutdown is delivered
@@ -247,6 +247,8 @@ impl StateMachine {
             Request::RemoveDomain(domain) => self.remove_domain(domain).await,
             Request::ListDomains => Response::Domains(self.config.vpn_hosts.clone()),
             Request::ReloadConfig => self.reload_config().await,
+            Request::GetConfig => Response::Config(self.config_view()),
+            Request::SetConfig(view) => self.set_config(view).await,
         }
     }
 
@@ -316,24 +318,7 @@ impl StateMachine {
     async fn reload_config(&mut self) -> Response {
         match config::load_config_from(&self.config_path) {
             Ok(next) => {
-                if next.vpn_name != self.config.vpn_name {
-                    log::warn!(
-                        "config reload changed vpn_name {} -> {}; the interface change \
-                         takes effect after a daemon restart",
-                        self.config.vpn_name,
-                        next.vpn_name
-                    );
-                }
-                if next.vpn_backend != self.config.vpn_backend
-                    || next.openvpn != self.config.openvpn
-                {
-                    log::warn!(
-                        "config reload changed the VPN detector settings \
-                         (vpn_backend/openvpn); the detector is selected and its watcher spawned \
-                         once at startup and is not restarted on reload, so this takes effect \
-                         only after a daemon restart"
-                    );
-                }
+                self.warn_on_restart_only_changes(&next);
                 self.config = next;
                 match self.reconcile().await {
                     Ok(()) => Response::Ok,
@@ -343,6 +328,58 @@ impl StateMachine {
                 }
             }
             Err(e) => Response::Error(format!("failed to reload config: {e}")),
+        }
+    }
+
+    /// Build the editable config projection sent in reply to
+    /// [`Request::GetConfig`]. `config_path` is the daemon's effective file
+    /// path, informational only — [`Self::set_config`] ignores it.
+    fn config_view(&self) -> ConfigView {
+        ConfigView {
+            vpn_name: self.config.vpn_name.clone(),
+            vpn_backend: self.config.vpn_backend,
+            openvpn_management: self.config.openvpn.management.clone(),
+            openvpn_management_password_file: self.config.openvpn.management_password_file.clone(),
+            config_path: self.config_path.display().to_string(),
+        }
+    }
+
+    /// Apply a [`Request::SetConfig`] update. Overwrites only the editable
+    /// projection's fields (`vpn_name`, `vpn_backend`, `openvpn.*`), preserving
+    /// `enabled` and the domain list owned by the other verbs, then persists
+    /// and reconciles through the single-writer [`Self::commit`] path. The
+    /// incoming `config_path` is ignored: the active path is fixed at launch.
+    async fn set_config(&mut self, view: ConfigView) -> Response {
+        let mut next = self.config.clone();
+        next.vpn_name = view.vpn_name;
+        next.vpn_backend = view.vpn_backend;
+        next.openvpn = OpenVpnConfig {
+            management: view.openvpn_management,
+            management_password_file: view.openvpn_management_password_file,
+        };
+        self.warn_on_restart_only_changes(&next);
+        self.commit(next).await
+    }
+
+    /// Warn when a pending config change touches fields whose effect needs a
+    /// daemon restart: the interface watch and detector are set up once at
+    /// startup and are not re-armed on a live change. Must be called before
+    /// `self.config` is replaced, so it compares against the current config.
+    fn warn_on_restart_only_changes(&self, next: &LocalConfig) {
+        if next.vpn_name != self.config.vpn_name {
+            log::warn!(
+                "config change updated vpn_name {} -> {}; the interface change \
+                 takes effect after a daemon restart",
+                self.config.vpn_name,
+                next.vpn_name
+            );
+        }
+        if next.vpn_backend != self.config.vpn_backend || next.openvpn != self.config.openvpn {
+            log::warn!(
+                "config change updated the VPN detector settings (vpn_backend/openvpn); \
+                 the detector is selected and its watcher spawned once at startup and is not \
+                 restarted on a live change, so this takes effect only after a daemon restart"
+            );
         }
     }
 
@@ -944,5 +981,67 @@ mod tests {
             "a reconnect after a failed revert must re-apply on the new link"
         );
         assert!(sm.applied.is_some());
+    }
+
+    #[tokio::test]
+    async fn get_config_returns_editable_projection() {
+        let backend = Arc::new(MockBackend::default());
+        let mut cfg = config(true, &["a.com"]);
+        cfg.vpn_backend = config::VpnBackend::OpenVpn;
+        cfg.openvpn = config::OpenVpnConfig {
+            management: "127.0.0.1:7505".to_string(),
+            management_password_file: Some("/etc/mgmt.pass".to_string()),
+        };
+        let mut sm = machine(backend.clone(), cfg, "get-config");
+
+        let Response::Config(view) = sm.on_request(Request::GetConfig).await else {
+            panic!("expected Config response");
+        };
+        assert_eq!(view.vpn_name, "wg0");
+        assert_eq!(view.vpn_backend, config::VpnBackend::OpenVpn);
+        assert_eq!(view.openvpn_management, "127.0.0.1:7505");
+        assert_eq!(
+            view.openvpn_management_password_file.as_deref(),
+            Some("/etc/mgmt.pass")
+        );
+        // The daemon reports its effective config path, informational only.
+        assert_eq!(view.config_path, sm.config_path.display().to_string());
+    }
+
+    #[tokio::test]
+    async fn set_config_updates_fields_persists_and_preserves_domains_and_enabled() {
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com", "b.com"]),
+            "set-config",
+        );
+
+        let view = ConfigView {
+            vpn_name: "tun9".to_string(),
+            vpn_backend: config::VpnBackend::OpenVpn,
+            openvpn_management: "/run/ovpn.sock".to_string(),
+            openvpn_management_password_file: None,
+            // A path here must be ignored: the active file is fixed at launch.
+            config_path: "/ignored/by/the/daemon.json".to_string(),
+        };
+        let resp = sm.on_request(Request::SetConfig(view)).await;
+        assert_eq!(resp, Response::Ok);
+
+        // The editable fields are updated...
+        assert_eq!(sm.config.vpn_name, "tun9");
+        assert_eq!(sm.config.vpn_backend, config::VpnBackend::OpenVpn);
+        assert_eq!(sm.config.openvpn.management, "/run/ovpn.sock");
+        assert!(sm.config.openvpn.management_password_file.is_none());
+        // ...the domain list and `enabled` (owned by the other verbs) survive...
+        assert_eq!(sm.config.vpn_hosts, vec!["a.com", "b.com"]);
+        assert!(sm.config.enabled);
+        // ...and the change is persisted to the active file (whose path the
+        // incoming view did not alter).
+        let saved = config::load_config_from(&sm.config_path).unwrap();
+        assert_eq!(saved.vpn_name, "tun9");
+        assert_eq!(saved.vpn_hosts, vec!["a.com", "b.com"]);
+        assert!(saved.enabled);
+        assert_eq!(saved.openvpn.management, "/run/ovpn.sock");
     }
 }

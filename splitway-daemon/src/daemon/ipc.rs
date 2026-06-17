@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
-use splitway_shared::ipc::{RequestEnvelope, Response, PROTOCOL_VERSION};
+use splitway_shared::ipc::{RequestEnvelope, Response, PROTOCOL_VERSION, VERSION_MISMATCH_PREFIX};
 
 use crate::daemon::state::StateCommand;
 
@@ -231,7 +231,38 @@ async fn read_line_capped(
     }
 }
 
+/// The protocol version alone, decoded without the `request` body. Unknown
+/// fields (including `request`) are ignored, so this parses regardless of which
+/// request variants the peer knows — letting a version check run *before* the
+/// request body is deserialized.
+#[derive(serde::Deserialize)]
+struct VersionPeek {
+    version: u32,
+}
+
 async fn process_line(line: &str, state_tx: &mpsc::Sender<StateCommand>) -> Response {
+    // Check the version first, from a peek that ignores the `request` body. A
+    // client newer than this daemon may send a request variant the daemon does
+    // not know; deserializing the full envelope first would fail that as a raw
+    // "unknown variant" decode error rather than the actionable version
+    // mismatch below. Peeking the version keeps skew reported as "update
+    // splitway", never a decode error.
+    match serde_json::from_str::<VersionPeek>(line) {
+        Ok(peek) if peek.version != PROTOCOL_VERSION => {
+            return Response::Error(format!(
+                "{VERSION_MISMATCH_PREFIX}: daemon speaks {PROTOCOL_VERSION}, \
+                 client speaks {} — update splitway so the daemon and client run \
+                 the same protocol version",
+                peek.version
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log::warn!("malformed IPC request: {e}");
+            return Response::Error(format!("malformed request: {e}"));
+        }
+    }
+
     let envelope: RequestEnvelope = match serde_json::from_str(line) {
         Ok(envelope) => envelope,
         Err(e) => {
@@ -239,12 +270,6 @@ async fn process_line(line: &str, state_tx: &mpsc::Sender<StateCommand>) -> Resp
             return Response::Error(format!("malformed request: {e}"));
         }
     };
-    if envelope.version != PROTOCOL_VERSION {
-        return Response::Error(format!(
-            "protocol version mismatch: daemon speaks {PROTOCOL_VERSION}, client sent {}",
-            envelope.version
-        ));
-    }
 
     let (reply_tx, reply_rx) = oneshot::channel();
     if state_tx
@@ -260,5 +285,38 @@ async fn process_line(line: &str, state_tx: &mpsc::Sender<StateCommand>) -> Resp
     match reply_rx.await {
         Ok(response) => response,
         Err(_) => Response::Error("daemon dropped the request".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn version_mismatch_is_reported_before_request_parse() {
+        let (tx, _rx) = mpsc::channel::<StateCommand>(1);
+        // A wrong version carrying a request variant this daemon does not know:
+        // the version is checked from a peek first, so this is reported as a
+        // version mismatch ("update splitway"), never a raw decode error.
+        let line = r#"{"version":999,"request":{"FutureVerb":{}}}"#;
+        match process_line(line, &tx).await {
+            Response::Error(msg) => {
+                assert!(
+                    msg.starts_with(VERSION_MISMATCH_PREFIX),
+                    "expected a version-mismatch error, got: {msg}"
+                );
+            }
+            other => panic!("expected a version-mismatch error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_json_is_rejected_as_error() {
+        let (tx, _rx) = mpsc::channel::<StateCommand>(1);
+        assert!(matches!(
+            process_line("this is not json", &tx).await,
+            Response::Error(_)
+        ));
     }
 }

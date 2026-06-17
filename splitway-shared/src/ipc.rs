@@ -10,9 +10,25 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::VpnBackend;
+
 /// Bumped on any incompatible change to [`Request`] / [`Response`]. The
 /// daemon rejects envelopes whose version it does not speak.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Bumped to `2` in Phase 4 for the additive `GetConfig`/`SetConfig` verbs and
+/// the [`Response::Config`] reply. The daemon enforces *strict equality* (see
+/// `daemon::ipc::process_line`): a v2 daemon rejects a v1 client and vice
+/// versa, so there is no silent mixed-version operation. The daemon, CLI and
+/// GUI all build from this one workspace, so they upgrade in lockstep; a
+/// mismatch only happens across separately-updated installs and is surfaced as
+/// actionable "update splitway" guidance, never a raw decode error.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Stable prefix the daemon uses to introduce a protocol-version-mismatch
+/// error reply. Shared so a client (CLI/GUI) can recognize skew and render
+/// "update splitway" guidance distinctly, instead of string-matching a literal
+/// that could drift from the daemon's wording.
+pub const VERSION_MISMATCH_PREFIX: &str = "protocol version mismatch";
 
 /// Versioned wrapper around a [`Request`]. Carrying the version per request
 /// keeps a single-shot client trivial — no separate handshake.
@@ -47,6 +63,13 @@ pub enum Request {
     ListDomains,
     /// Re-read the config file from disk and reconcile.
     ReloadConfig,
+    /// Read the editable config projection (the settings not covered by the
+    /// other verbs). Replied to with [`Response::Config`].
+    GetConfig,
+    /// Update the editable config projection (persisted). The daemon handles
+    /// this in its single-writer state actor via the same `commit()` path as
+    /// the other mutating verbs, so it stays the sole config writer.
+    SetConfig(ConfigView),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,8 +80,43 @@ pub enum Response {
     Status(StatusInfo),
     /// Reply to [`Request::ListDomains`].
     Domains(Vec<String>),
+    /// Reply to [`Request::GetConfig`].
+    Config(ConfigView),
     /// The request failed; the string is a human-readable reason.
     Error(String),
+}
+
+/// The editable projection of `LocalConfig` carried over IPC — deliberately a
+/// small, dedicated wire type rather than `LocalConfig` itself, so the wire
+/// format stays independently versionable and is not coupled to the on-disk
+/// serde layout.
+///
+/// It covers exactly the gap the other verbs leave: `vpn_name`, `vpn_backend`
+/// and the `openvpn.*` settings. `enabled` stays owned by `Enable`/`Disable`
+/// and the domain list by `AddDomain`/`RemoveDomain`/`ListDomains`, so
+/// [`Request::SetConfig`] is a *partial* update that never clobbers another
+/// verb's slice of the config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigView {
+    /// The configured VPN interface (device) name.
+    pub vpn_name: String,
+    /// Which Linux VPN detector to use. `#[serde(default)]` keeps the wire type
+    /// forward-compatible if the field is ever omitted by an older peer.
+    #[serde(default)]
+    pub vpn_backend: VpnBackend,
+    /// Standalone-OpenVPN management endpoint (`host:port` or a unix socket
+    /// path); ignored unless `vpn_backend = openvpn`.
+    #[serde(default)]
+    pub openvpn_management: String,
+    /// Optional path to the management password file. `None` = no password.
+    #[serde(default)]
+    pub openvpn_management_password_file: Option<String>,
+    /// Read-only: the daemon's effective config file path. The daemon fills
+    /// this on [`Request::GetConfig`] and *ignores* it on
+    /// [`Request::SetConfig`] — the active path is fixed at daemon launch
+    /// (via `--config`), so the GUI cannot switch it at runtime.
+    #[serde(default)]
+    pub config_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +276,16 @@ pub mod client {
 mod tests {
     use super::*;
 
+    fn sample_config_view() -> ConfigView {
+        ConfigView {
+            vpn_name: "tun0".to_string(),
+            vpn_backend: VpnBackend::OpenVpn,
+            openvpn_management: "127.0.0.1:7505".to_string(),
+            openvpn_management_password_file: Some("/etc/splitway/mgmt.pass".to_string()),
+            config_path: "/home/user/.config/splitway/config.json".to_string(),
+        }
+    }
+
     #[test]
     fn envelope_round_trip_carries_version() {
         let env = RequestEnvelope::new(Request::AddDomain("example.com".to_string()));
@@ -228,6 +296,18 @@ mod tests {
             parsed.request,
             Request::AddDomain("example.com".to_string())
         );
+    }
+
+    #[test]
+    fn config_verbs_round_trip_in_envelope() {
+        // The new GetConfig / SetConfig verbs ride the same versioned envelope.
+        for request in [Request::GetConfig, Request::SetConfig(sample_config_view())] {
+            let env = RequestEnvelope::new(request.clone());
+            let json = serde_json::to_string(&env).unwrap();
+            let parsed: RequestEnvelope = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.version, PROTOCOL_VERSION);
+            assert_eq!(parsed.request, request);
+        }
     }
 
     #[test]
@@ -243,12 +323,34 @@ mod tests {
                 applied: false,
                 domains: vec!["a.com".to_string()],
             }),
+            Response::Config(sample_config_view()),
         ];
         for response in responses {
             let json = serde_json::to_string(&response).unwrap();
             let parsed: Response = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, response);
         }
+    }
+
+    #[test]
+    fn config_view_round_trips() {
+        let view = sample_config_view();
+        let json = serde_json::to_string(&view).unwrap();
+        let parsed: ConfigView = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, view);
+    }
+
+    #[test]
+    fn config_view_optional_fields_default_when_absent() {
+        // Mirror the LocalConfig back-compat discipline: a peer that omits the
+        // optional fields still parses, with the defaults applied.
+        let json = r#"{"vpn_name":"wg0"}"#;
+        let parsed: ConfigView = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.vpn_name, "wg0");
+        assert_eq!(parsed.vpn_backend, VpnBackend::NetworkManager);
+        assert!(parsed.openvpn_management.is_empty());
+        assert!(parsed.openvpn_management_password_file.is_none());
+        assert!(parsed.config_path.is_empty());
     }
 
     #[test]

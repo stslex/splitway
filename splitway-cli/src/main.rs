@@ -116,6 +116,21 @@ fn print_response(response: &splitway_shared::ipc::Response) {
                 }
             }
         }
+        // The CLI has no get/set-config subcommand, so it never sends
+        // `GetConfig` and should not receive this. Render it defensively rather
+        // than panic, so a future peer that does reply with it stays readable.
+        Response::Config(view) => {
+            println!("vpn_name:    {}", view.vpn_name);
+            println!("vpn_backend: {:?}", view.vpn_backend);
+            println!("openvpn.management: {}", view.openvpn_management);
+            println!(
+                "openvpn.management_password_file: {}",
+                view.openvpn_management_password_file
+                    .as_deref()
+                    .unwrap_or("(none)")
+            );
+            println!("config_path: {}", view.config_path);
+        }
         Response::Error(message) => eprintln!("error: {message}"),
     }
 }
