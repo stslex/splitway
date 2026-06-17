@@ -259,12 +259,29 @@ impl SplitwayApp {
     /// have not been edited since the last sync, so a reconnect refresh never
     /// clobbers an in-progress edit.
     fn load_config_view(&mut self, view: ConfigView) {
+        let path_changed = !self.cfg_path.is_empty() && self.cfg_path != view.config_path;
         self.cfg_path = view.config_path;
         let dirty = self
             .loaded
             .as_ref()
             .is_some_and(|snap| *snap != self.current_snapshot());
-        if !dirty {
+        if dirty {
+            // Kept the unsaved edits — but if the daemon's active file changed
+            // underneath them (a restart against a different --config), warn:
+            // Save writes to the daemon's *current* file, so editing values from
+            // the old file and saving them onto the new one would be silent and
+            // misleading.
+            if path_changed {
+                self.message = Some((
+                    MessageKind::Error,
+                    format!(
+                        "the daemon's active config file changed to {} while you have unsaved \
+                         edits — re-check before saving (Save writes to the daemon's current file)",
+                        self.cfg_path
+                    ),
+                ));
+            }
+        } else {
             self.cfg_vpn_name = view.vpn_name;
             self.cfg_backend = view.vpn_backend;
             self.cfg_openvpn_management = view.openvpn_management;
@@ -594,8 +611,9 @@ impl SplitwayApp {
                  with:",
             );
             // Subcommand first, matching the daemon's parser (`run --config …`);
-            // `--config` before the subcommand is rejected.
-            ui.monospace(format!("splitway-daemon run --config {}", path.display()));
+            // `--config` before the subcommand is rejected. The path is quoted
+            // (`{:?}`) so a path with spaces stays copy/paste-able into a shell.
+            ui.monospace(format!("splitway-daemon run --config {path:?}"));
         }
     }
 
