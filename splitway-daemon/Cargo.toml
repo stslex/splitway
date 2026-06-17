@@ -10,3 +10,22 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4.20"
 env_logger = "0.11"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "net",
+    "io-util",
+    "signal",
+    "time",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+# SCDynamicStore VPN/DNS event source. core-foundation is pinned to 0.9 to match
+# system-configuration 0.7's own dependency — 0.10 would resolve to a second,
+# incompatible core_foundation and break the CFArray/CFRunLoop types.
+[target.'cfg(target_os = "macos")'.dependencies]
+system-configuration = "0.7"
+core-foundation = "0.9"

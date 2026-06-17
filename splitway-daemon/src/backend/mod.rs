@@ -9,7 +9,7 @@ mod windows;
 
 use splitway_shared::platform::DnsBackend;
 
-pub fn create_backend() -> Box<dyn DnsBackend> {
+pub fn create_dns_backend() -> Box<dyn DnsBackend> {
     #[cfg(target_os = "linux")]
     {
         Box::new(linux::LinuxBackend)

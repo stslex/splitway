@@ -1,83 +1,102 @@
+// Splitway's daemon and IPC are Unix-only (Unix domain sockets, POSIX
+// signals, resolvectl). Windows support is deferred (see ROADMAP.md); the
+// crate still compiles there — via the stub `main` below — so the
+// cross-platform release matrix stays green.
+#[cfg(unix)]
+use std::env;
+#[cfg(unix)]
 use std::process::exit;
 
-use splitway_shared::config::{get_config, ConfigParseError};
+#[cfg(unix)]
+use splitway_shared::config;
+#[cfg(unix)]
+use splitway_shared::ipc::{self, Request, Response};
 
+#[cfg(unix)]
+use crate::command::{Command, CommandParser};
+
+#[cfg(unix)]
 mod backend;
+#[cfg(unix)]
+mod command;
+#[cfg(unix)]
+mod daemon;
+#[cfg(unix)]
+mod detector;
 
+#[cfg(unix)]
 fn main() {
     env_logger::init();
-
-    let args: Vec<String> = std::env::args().collect();
-    let command = args.get(1).map(|s| s.as_str());
-
-    match command {
-        Some("run") => launch_daemon(),
-        Some("revert") => revert_dns_domain(),
-        Some("status") => show_status(),
-        _ => println!("usage: splitway-daemon <apply|revert|status>"),
+    match env::args().parse_command() {
+        Ok(Command::Run) => daemon::run(),
+        Ok(Command::Status) => status(),
+        Ok(Command::Revert) => revert(),
+        Err(message) => {
+            eprintln!("{message}");
+            exit(2);
+        }
     }
 }
 
-fn show_status() {
-    let vpn_name = get_config().map_or("default".to_string(), |config| config.vpn_name.clone());
-    let backend = backend::create_backend();
-
-    if let Err(e) = backend.status(&vpn_name) {
-        panic!("error show_status: {e}");
-    }
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("splitway-daemon is only supported on Unix platforms (Linux/macOS)");
+    std::process::exit(1);
 }
 
-fn launch_daemon() {
-    let local_config = match get_config() {
-        Ok(config) => config,
-        Err(e) => {
-            handle_config_error(&e);
+/// Quick one-shot status: query the running daemon over IPC. If no daemon is
+/// running, say so (it does not fall back to a direct backend read).
+#[cfg(unix)]
+fn status() {
+    match ipc::client::send_request(Request::Status) {
+        Ok(Response::Status(info)) => {
+            println!("enabled:   {}", info.enabled);
+            println!("interface: {}", info.interface);
+            println!("vpn_up:    {}", info.vpn_up);
+            println!("applied:   {}", info.applied);
+            println!(
+                "domains:   {}",
+                if info.domains.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    info.domains.join(", ")
+                }
+            );
+        }
+        Ok(other) => {
+            eprintln!("unexpected response from daemon: {other:?}");
             exit(1);
         }
-    };
-
-    let backend = backend::create_backend();
-
-    let vpn_info = match backend.detect_vpn(&local_config.vpn_name) {
-        Ok(info) => info,
         Err(e) => {
-            log::error!("Failed to detect VPN: {e}");
+            eprintln!("{e}");
             exit(1);
         }
-    };
-
-    log::info!("Detected VPN: {:?}", vpn_info);
-
-    if let Err(e) = backend.apply_rules(&vpn_info, &local_config.vpn_hosts) {
-        log::error!("Failed to apply rules: {e}");
-        exit(1);
     }
 }
 
-fn revert_dns_domain() {
-    let name = match get_config() {
+/// Emergency one-shot revert straight to the backend. Works even with no
+/// daemon running — an escape hatch. Distinct from `splitway-cli disable`,
+/// which tells a *running* daemon to stop applying and persists that choice.
+#[cfg(unix)]
+fn revert() {
+    let interface = match config::get_config() {
         Ok(config) => config.vpn_name,
         Err(e) => {
-            handle_config_error(&e);
+            eprintln!("failed to read config: {e}");
             exit(1);
         }
     };
-
-    let backend = backend::create_backend();
-
-    if let Err(e) = backend.revert_rules(&name) {
-        println!("error revert_dns_domain: {e}");
+    if interface.is_empty() {
+        eprintln!("no vpn_name configured to revert");
+        exit(1);
     }
-}
 
-fn handle_config_error(e: &ConfigParseError) {
-    match e {
-        ConfigParseError::ConfigNotFound => {
-            log::error!("Config file not found, creating empty config");
-            if let Err(e) = splitway_shared::config::create_empty_config() {
-                log::error!("Error create empty config: {e}");
-            }
+    let backend = backend::create_dns_backend();
+    match backend.revert_rules(&interface) {
+        Ok(()) => println!("reverted DNS rules on {interface}"),
+        Err(e) => {
+            eprintln!("revert failed on {interface}: {e}");
+            exit(1);
         }
-        _ => log::error!("Error get config: {e}"),
     }
 }
