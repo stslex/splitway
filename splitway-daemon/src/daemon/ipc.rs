@@ -180,8 +180,15 @@ async fn write_response(
     write_half: &mut (impl tokio::io::AsyncWrite + Unpin),
     response: &Response,
 ) -> std::io::Result<()> {
-    let mut encoded = serde_json::to_string(response)
-        .unwrap_or_else(|e| format!("{{\"Error\":\"failed to encode response: {e}\"}}"));
+    // Serializing a `Response` does not fail in practice, but if it ever did,
+    // build the fallback through the serializer too so the error text is
+    // JSON-escaped and the client still receives parseable JSON — a hand-built
+    // string could embed a raw quote or control character and desync the
+    // client. The final arm is a fixed, already-valid JSON literal.
+    let mut encoded = serde_json::to_string(response).unwrap_or_else(|e| {
+        serde_json::to_string(&Response::Error(format!("failed to encode response: {e}")))
+            .unwrap_or_else(|_| r#"{"Error":"failed to encode response"}"#.to_string())
+    });
     encoded.push('\n');
     write_half.write_all(encoded.as_bytes()).await?;
     write_half.flush().await

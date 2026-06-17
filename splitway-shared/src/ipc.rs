@@ -5,6 +5,7 @@
 //! one [`RequestEnvelope`] object per line, to which the daemon replies with
 //! exactly one [`Response`] line.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -87,7 +88,13 @@ const SYSTEM_SOCKET_DIR: &str = "/run/splitway";
 /// the runtime dir is set (already a `0700` user-private directory), else the
 /// per-platform [`SYSTEM_SOCKET_DIR`] for a system service.
 pub fn socket_path() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
+    socket_path_from(std::env::var_os("XDG_RUNTIME_DIR"))
+}
+
+/// Pure resolver split out so the `XDG_RUNTIME_DIR` preference is unit-testable
+/// without mutating the process-global environment.
+fn socket_path_from(runtime_dir: Option<OsString>) -> PathBuf {
+    match runtime_dir {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("splitway.sock"),
         _ => PathBuf::from(SYSTEM_SOCKET_DIR).join("splitway.sock"),
     }
@@ -246,8 +253,18 @@ mod tests {
 
     #[test]
     fn socket_path_prefers_xdg_runtime_dir() {
-        // Not mutating the process env here (tests share it); just assert the
-        // resolved path ends with the socket file name regardless of env.
-        assert!(socket_path().ends_with("splitway.sock"));
+        // A non-empty XDG_RUNTIME_DIR places the socket directly under it.
+        assert_eq!(
+            socket_path_from(Some(OsString::from("/run/user/1000"))),
+            PathBuf::from("/run/user/1000/splitway.sock")
+        );
+    }
+
+    #[test]
+    fn socket_path_falls_back_to_system_dir_without_xdg() {
+        // An unset or empty XDG_RUNTIME_DIR falls back to the system socket dir.
+        let expected = PathBuf::from(SYSTEM_SOCKET_DIR).join("splitway.sock");
+        assert_eq!(socket_path_from(None), expected);
+        assert_eq!(socket_path_from(Some(OsString::new())), expected);
     }
 }
