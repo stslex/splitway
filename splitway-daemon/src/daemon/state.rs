@@ -145,22 +145,28 @@ impl StateMachine {
                         Ok(())
                     }
                     Ok(Err(e)) => {
-                        // Don't assume the system is clean on failure: apply may
-                        // have left the *previous* rules in place (the backend
-                        // can return Err without reverting, e.g. when the DNS
-                        // step itself fails). Keep `applied` so a later
-                        // disable/down/shutdown still reverts it; clearing it
-                        // would skip that and leave stale DNS active. But the
-                        // snapshot can no longer be trusted as "live" — the
-                        // backend may instead have rolled the link back to clean
-                        // — so mark `needs_resync` to force the next reconcile to
-                        // re-apply rather than treat an equal target as converged.
+                        // A failed apply may have changed the system before
+                        // failing: the backend can return Err after a partial
+                        // change whose own rollback also failed (e.g. resolvectl
+                        // `dns` set, `domain` failed, then `revert` failed),
+                        // leaving the link half-configured — even on the *first*
+                        // apply, when there is no previous snapshot. Record the
+                        // attempted target as the cleanup state so a later
+                        // down/disable/shutdown still reverts the interface, and
+                        // set `needs_resync` so the next reconcile re-applies
+                        // rather than trusting this now-uncertain snapshot as
+                        // converged.
                         log::error!("apply_rules failed on {}: {e}", info.interface_name);
+                        self.applied = Some(target);
                         self.needs_resync = true;
                         Err(e)
                     }
                     Err(e) => {
+                        // Same reasoning as the error case: a panic mid-apply may
+                        // have left the link partially configured, so record the
+                        // target for cleanup rather than assuming it was untouched.
                         log::error!("apply task panicked: {e}");
+                        self.applied = Some(target);
                         self.needs_resync = true;
                         Err(PlatformError::CommandFailed(format!(
                             "apply task panicked: {e}"
@@ -739,7 +745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_first_apply_leaves_state_unapplied() {
+    async fn failed_first_apply_records_a_cleanup_target() {
         let backend = Arc::new(MockBackend {
             fail_apply: AtomicBool::new(true),
             ..Default::default()
@@ -748,8 +754,19 @@ mod tests {
 
         sm.on_event(vpn_up("wg0")).await;
 
-        // The very first apply failed and nothing was applied before, so there
-        // is correctly nothing to revert later.
+        // Even on the first apply, the backend may have changed the system
+        // before returning Err (e.g. resolvectl `dns` set, `domain` failed, and
+        // the rollback also failed). The machine records the interface as
+        // needing cleanup rather than assuming the failed apply left the system
+        // untouched, so a later down/disable/shutdown still reverts it.
+        assert!(sm.applied.is_some());
+
+        backend.set_fail_apply(false);
+        sm.on_event(VpnEvent::Down {
+            interface_name: "wg0".to_string(),
+        })
+        .await;
+        assert_eq!(backend.reverts.lock().unwrap().as_slice(), &["wg0"]);
         assert!(sm.applied.is_none());
     }
 
@@ -835,7 +852,7 @@ mod tests {
             "commit-apply-fails",
         );
 
-        sm.on_event(vpn_up("wg0")).await; // first apply fails (applied stays None)
+        sm.on_event(vpn_up("wg0")).await; // first apply fails
         let resp = sm.on_request(Request::AddDomain("b.com".to_string())).await;
 
         // The re-apply fails, so the caller is told so rather than "ok"...
