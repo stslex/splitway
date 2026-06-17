@@ -16,6 +16,19 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # This workflow builds the whole workspace, which now includes the
+      # splitway-gui crate (eframe/glow). The GUI compiles without these (its
+      # windowing/GL libs are dlopen'd at runtime, not linked at build time), so
+      # the build is green without them — but install them anyway to stay
+      # consistent with ci.yml and robust against future image/eframe changes
+      # that could add a build-time link. Runner is always ubuntu-latest here.
+      - name: Install Linux GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev
+
       - name: Build
         run: cargo build --verbose
 
