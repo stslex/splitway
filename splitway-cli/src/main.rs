@@ -6,8 +6,10 @@
 //! still builds — via the stub path in `main` — so the cross-platform release
 //! matrix stays green; see ROADMAP.md.
 
+#[cfg(unix)]
 use clap::{Parser, Subcommand};
 
+#[cfg(unix)]
 #[derive(Parser)]
 #[command(
     name = "splitway",
@@ -18,6 +20,7 @@ struct Cli {
     command: Commands,
 }
 
+#[cfg(unix)]
 #[derive(Subcommand)]
 enum Commands {
     /// Show daemon and DNS routing status.
@@ -36,18 +39,19 @@ enum Commands {
     Reload,
 }
 
+#[cfg(unix)]
 fn main() {
+    // Parse only on Unix: the unsupported-platform path below must print its own
+    // message deterministically rather than letting clap exit first on a
+    // missing/invalid argument.
     let cli = Cli::parse();
-
-    #[cfg(unix)]
     run(cli);
+}
 
-    #[cfg(not(unix))]
-    {
-        let _ = cli;
-        eprintln!("splitway is only supported on Unix platforms (Linux/macOS)");
-        std::process::exit(1);
-    }
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("splitway is only supported on Unix platforms (Linux/macOS)");
+    std::process::exit(1);
 }
 
 #[cfg(unix)]

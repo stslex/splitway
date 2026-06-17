@@ -8,7 +8,7 @@ mod state;
 use std::process::exit;
 use std::sync::Arc;
 
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::{mpsc, oneshot};
 
 use splitway_shared::config::{self, ConfigParseError, LocalConfig};
@@ -45,6 +45,30 @@ async fn run_async(config: LocalConfig) {
     }
 
     let backend: Arc<dyn DnsBackend> = Arc::from(create_dns_backend());
+
+    // Bind the IPC control socket before anything can apply DNS. A bind failure
+    // is fatal (the socket is a core feature), and binding first guarantees that
+    // fatal `exit(1)` happens before the watch/state pipeline can install any
+    // rules — otherwise an already-up VPN could apply split-DNS on a worker
+    // thread while this thread is still binding, and a bind failure would then
+    // strand those rules with no daemon left to revert them. Serving the bound
+    // socket is deferred until `state_tx` exists (below).
+    let socket = socket_path();
+    let listener = match ipc::bind_socket(&socket) {
+        Ok(listener) => listener,
+        Err(e) => {
+            log::error!("failed to bind IPC socket {}: {e}", socket.display());
+            exit(1);
+        }
+    };
+    log::info!("listening on IPC socket {}", socket.display());
+
+    // Install the shutdown signal handlers before the pipeline can apply DNS,
+    // for the same reason as the bind above: failing to install them is a fatal
+    // startup error, and doing it now means that fatal exit cannot strand
+    // applied rules. The streams also capture any signal that arrives during
+    // startup, so an early shutdown still reverts gracefully.
+    let (mut sigint, mut sigterm) = install_shutdown_signals();
 
     // Start the VPN watch before `config` is moved into the state machine.
     // Skipped when vpn_name is unset: the state machine only applies for an
@@ -89,21 +113,13 @@ async fn run_async(config: LocalConfig) {
         });
     }
 
-    // IPC server. A bind failure is fatal: the socket is a core feature.
-    let socket = socket_path();
-    let listener = match ipc::bind_socket(&socket) {
-        Ok(listener) => listener,
-        Err(e) => {
-            log::error!("failed to bind IPC socket {}: {e}", socket.display());
-            exit(1);
-        }
-    };
-    log::info!("listening on IPC socket {}", socket.display());
+    // Serve IPC requests on the socket bound above (before the state pipeline
+    // started, so a bind failure could never have stranded any rules).
     tokio::spawn(ipc::serve(listener, state_tx.clone()));
 
     log::info!("splitway daemon started (interface: {interface})");
 
-    wait_for_shutdown_signal().await;
+    wait_for_shutdown_signal(&mut sigint, &mut sigterm).await;
     log::info!("shutdown signal received; reverting active rules");
 
     // Ask the state task to revert (this preempts any queued commands), then
@@ -136,26 +152,31 @@ async fn run_async(config: LocalConfig) {
     }
 }
 
-/// Wait for either `SIGINT` (Ctrl-C) or `SIGTERM` (systemd stop). Both
-/// trigger the graceful revert-then-exit path.
-async fn wait_for_shutdown_signal() {
-    // A failure to install the handlers is a fatal startup error, not a
-    // shutdown trigger — exit(1) (like the other fatal startup paths) so it
-    // does not masquerade as a received signal and exit cleanly.
-    let mut sigint = match signal(SignalKind::interrupt()) {
+/// Install the `SIGINT`/`SIGTERM` handlers. A failure to install them is a fatal
+/// startup error (`exit(1)`), done before the pipeline applies any rules so that
+/// fatal exit cannot strand them — and so it does not masquerade as a received
+/// signal that would exit "cleanly" without reverting.
+fn install_shutdown_signals() -> (Signal, Signal) {
+    let sigint = match signal(SignalKind::interrupt()) {
         Ok(stream) => stream,
         Err(e) => {
             log::error!("failed to install SIGINT handler: {e}");
             exit(1);
         }
     };
-    let mut sigterm = match signal(SignalKind::terminate()) {
+    let sigterm = match signal(SignalKind::terminate()) {
         Ok(stream) => stream,
         Err(e) => {
             log::error!("failed to install SIGTERM handler: {e}");
             exit(1);
         }
     };
+    (sigint, sigterm)
+}
+
+/// Wait for either `SIGINT` (Ctrl-C) or `SIGTERM` (systemd stop). Both trigger
+/// the graceful revert-then-exit path.
+async fn wait_for_shutdown_signal(sigint: &mut Signal, sigterm: &mut Signal) {
     tokio::select! {
         _ = sigint.recv() => log::info!("received SIGINT"),
         _ = sigterm.recv() => log::info!("received SIGTERM"),
