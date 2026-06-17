@@ -324,6 +324,14 @@ impl SplitwayApp {
     fn connected(&self) -> bool {
         self.connection.health == Health::Connected
     }
+
+    /// Whether the config editor has loaded and has no unsaved edits — i.e. it
+    /// is safe to adopt a fresh `GetConfig` without clobbering the user.
+    fn editor_clean(&self) -> bool {
+        self.loaded
+            .as_ref()
+            .is_some_and(|snap| *snap == self.current_snapshot())
+    }
 }
 
 /// Local alias for the worker's result error type, to keep signatures short.
@@ -339,6 +347,14 @@ impl eframe::App for SplitwayApp {
         // polls never stack behind a slow round-trip.
         if self.pending.is_empty() && !self.inflight && self.last_poll.elapsed() >= POLL_INTERVAL {
             self.enqueue(Request::Status);
+            // Also refresh the editable config while the editor is clean, so an
+            // external change made over the *same* connection — `splitway
+            // reload` or another client's SetConfig — is picked up without a
+            // reconnect (the only other trigger). Skipped while there are unsaved
+            // edits so the user's in-progress changes are never clobbered.
+            if self.editor_clean() {
+                self.enqueue(Request::GetConfig);
+            }
             self.last_poll = Instant::now();
         }
         self.pump();
@@ -441,7 +457,10 @@ impl SplitwayApp {
                 });
             }
             None => {
-                ui.label("status unavailable — the daemon is not reachable");
+                // Don't assert "not reachable": status is also dropped on
+                // permission-denied / version-mismatch, where the daemon *is*
+                // reachable. The banner above already states the precise reason.
+                ui.label("Live status unavailable — see the status above.");
             }
         }
     }
