@@ -324,6 +324,16 @@ impl StateMachine {
                         next.vpn_name
                     );
                 }
+                if next.vpn_backend != self.config.vpn_backend
+                    || next.openvpn != self.config.openvpn
+                {
+                    log::warn!(
+                        "config reload changed the VPN detector settings \
+                         (vpn_backend/openvpn); the detector is selected and its watcher spawned \
+                         once at startup and is not restarted on reload, so this takes effect \
+                         only after a daemon restart"
+                    );
+                }
                 self.config = next;
                 match self.reconcile().await {
                     Ok(()) => Response::Ok,

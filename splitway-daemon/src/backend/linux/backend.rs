@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::Command;
 
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnInfo};
@@ -114,6 +115,19 @@ impl DnsBackend for LinuxBackend {
         );
 
         if !result.status.success() {
+            // A revert can fail simply because the link has already vanished
+            // (the common VPN down/remove race): systemd-resolved drops a link's
+            // DNS settings when the link disappears, so there is nothing left to
+            // revert and the system is already in the desired (clean) state.
+            // Treat a now-absent interface as success; only a failure with the
+            // link still present is a real error worth surfacing.
+            if !interface_exists(interface) {
+                log::debug!(
+                    "resolvectl revert {interface} failed, but the link is gone; \
+                     treating as already reverted"
+                );
+                return Ok(());
+            }
             return Err(PlatformError::CommandFailed(
                 String::from_utf8_lossy(&result.stderr).to_string(),
             ));
@@ -136,6 +150,14 @@ impl DnsBackend for LinuxBackend {
 
         Ok(())
     }
+}
+
+/// Whether a network interface currently exists, via its sysfs entry. Used to
+/// treat a failed `resolvectl revert` as success when the link has already
+/// vanished — its per-link DNS state is gone with it, so there is nothing left
+/// to revert.
+fn interface_exists(interface: &str) -> bool {
+    Path::new("/sys/class/net").join(interface).exists()
 }
 
 #[cfg(test)]
