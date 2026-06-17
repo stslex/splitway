@@ -45,7 +45,29 @@ async fn run_async(config: LocalConfig) {
     }
 
     let backend: Arc<dyn DnsBackend> = Arc::from(create_dns_backend());
-    let detector = create_vpn_detector(&config);
+
+    // Start the VPN watch before `config` is moved into the state machine.
+    // Skipped when vpn_name is unset: the state machine only applies for an
+    // event whose interface matches the configured name (NM and macOS watches
+    // key on the interface; standalone OpenVPN detects via its management
+    // socket but its events are still gated on `vpn_name`), so with no name a
+    // watch can never drive an apply — it would only hold an idle D-Bus or
+    // management connection open. IPC still comes up below so the daemon stays
+    // controllable; set vpn_name and restart to enable auto-apply.
+    let vpn_events = if interface.is_empty() {
+        None
+    } else {
+        match create_vpn_detector(&config).watch(&interface) {
+            Ok(events) => Some(events),
+            Err(e) => {
+                log::error!(
+                    "failed to start VPN watch for {interface}: {e}; \
+                     IPC is still available, auto-apply is not"
+                );
+                None
+            }
+        }
+    };
 
     // Single state-owner task. Shutdown is delivered out-of-band via its own
     // channel so the revert preempts any queued commands.
@@ -54,23 +76,17 @@ async fn run_async(config: LocalConfig) {
     let machine = StateMachine::new(backend, config, config::config_file_path());
     let state_handle = tokio::spawn(run_state(machine, state_rx, shutdown_rx));
 
-    // VPN event stream -> state task.
-    match detector.watch(&interface) {
-        Ok(mut events) => {
-            let tx = state_tx.clone();
-            tokio::spawn(async move {
-                while let Some(event) = events.recv().await {
-                    if tx.send(StateCommand::Vpn(event)).await.is_err() {
-                        break;
-                    }
+    // Forward VPN events into the state task.
+    if let Some(mut events) = vpn_events {
+        let tx = state_tx.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if tx.send(StateCommand::Vpn(event)).await.is_err() {
+                    break;
                 }
-                log::warn!("VPN event stream ended");
-            });
-        }
-        Err(e) => log::error!(
-            "failed to start VPN watch for {interface}: {e}; \
-             IPC is still available, auto-apply is not"
-        ),
+            }
+            log::warn!("VPN event stream ended");
+        });
     }
 
     // IPC server. A bind failure is fatal: the socket is a core feature.
