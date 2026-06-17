@@ -3,7 +3,8 @@
 //! All real logic lives in the pure `parser`/`state` modules. The socket
 //! *connection* glue (connect / reconnect / backoff) needs a live management
 //! interface and is not unit-tested, but the generic `blocking_session`
-//! read-loop is driven by an in-memory stream in the tests below.
+//! read-loop and the streaming `handle_line` decision (including the
+//! reconnect/stale-DNS handling) are exercised by the tests below.
 //!
 //! The plumbing connects to the management interface, optionally authenticates,
 //! arms `log on all` + `state on`, samples the current `state`, and feeds parsed
@@ -27,7 +28,9 @@ use tokio::sync::mpsc::Sender;
 
 use splitway_shared::platform::{PlatformError, VpnEvent, VpnInfo};
 
-use super::parser::{parse_push_reply_dns, parse_state_line, ManagementAddr};
+use super::parser::{
+    parse_push_reply_dns, parse_state_line, parse_state_line_with_time, ManagementAddr,
+};
 use super::state::transition_for_state;
 use crate::detector::linux::state::{Deduper, Transition};
 
@@ -67,6 +70,11 @@ const DETECT_DEADLINE: Duration = Duration::from_secs(3);
 /// observed down/up. The downstream state machine dedups on the server set, so
 /// a re-sample over an unchanged tunnel is a cheap no-op (and a reconnect that
 /// reveals no pushed DNS reverts).
+///
+/// `last_connected_at` (the `CONNECTED` connect time) is tracked across
+/// reconnects so the re-sampled `Up` can tell a same-tunnel reconnect from a
+/// genuinely new tunnel: cached DNS is reused only for the former (see
+/// [`handle_line`]).
 pub(super) async fn run(
     interface: String,
     addr: ManagementAddr,
@@ -75,6 +83,7 @@ pub(super) async fn run(
 ) -> Result<(), PlatformError> {
     let mut dedup = Deduper::default();
     let mut last_dns: Vec<String> = Vec::new();
+    let mut last_connected_at: Option<u64> = None;
     let mut backoff = INITIAL_BACKOFF;
 
     loop {
@@ -87,6 +96,7 @@ pub(super) async fn run(
             password.as_deref(),
             &mut dedup,
             &mut last_dns,
+            &mut last_connected_at,
             &mut backoff,
             &tx,
         )
@@ -108,11 +118,16 @@ pub(super) async fn run(
                 // re-applies only if the DNS actually changed (it dedups on the
                 // server set), reverts if the reconnected session now pushes no
                 // DNS, and no-ops otherwise — so a transient blip over a still-
-                // healthy tunnel stays cheap. (A tunnel that restarts with the
-                // *same* pushed DNS is treated as converged and not re-applied:
-                // the same server-set-keyed limitation noted for a mid-session
-                // DNS rotation — see README.) We still never synthesize a `Down`
-                // for a socket error; only OpenVPN state does that.
+                // healthy tunnel stays cheap. `last_dns` is kept (not cleared)
+                // here precisely so a same-tunnel blip keeps its known-good DNS;
+                // `handle_line` then drops it on re-sample only when the connect
+                // time shows a genuinely new tunnel with no fresh `PUSH_REPLY`,
+                // so a restart that pushes different/no DNS no longer leaks the
+                // previous session's servers. (A restart with the *same* pushed
+                // DNS is still treated as converged and not re-applied: the
+                // server-set-keyed limitation noted for a mid-session DNS
+                // rotation — see README.) We still never synthesize a `Down` for
+                // a socket error; only OpenVPN state does that.
                 dedup = Deduper::default();
                 tokio::select! {
                     _ = tx.closed() => return Ok(()),
@@ -127,12 +142,14 @@ pub(super) async fn run(
 /// Connect to the management interface and stream until error or receiver drop.
 /// The backoff is reset by [`run_session`] only after a session proves healthy,
 /// not on mere connect — so a connect-then-fast-fail keeps escalating.
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_stream(
     interface: &str,
     addr: &ManagementAddr,
     password: Option<&str>,
     dedup: &mut Deduper,
     last_dns: &mut Vec<String>,
+    last_connected_at: &mut Option<u64>,
     backoff: &mut Duration,
     tx: &Sender<VpnEvent>,
 ) -> Result<(), PlatformError> {
@@ -143,7 +160,17 @@ async fn connect_and_stream(
                 return Ok(()); // receiver dropped while connecting
             };
             log::debug!("connected to openvpn management at tcp {endpoint}");
-            run_session(stream, interface, password, dedup, last_dns, backoff, tx).await
+            run_session(
+                stream,
+                interface,
+                password,
+                dedup,
+                last_dns,
+                last_connected_at,
+                backoff,
+                tx,
+            )
+            .await
         }
         ManagementAddr::Unix(path) => {
             let Some(stream) = connect_or_shutdown(UnixStream::connect(path), addr, tx).await?
@@ -151,7 +178,17 @@ async fn connect_and_stream(
                 return Ok(()); // receiver dropped while connecting
             };
             log::debug!("connected to openvpn management at unix {}", path.display());
-            run_session(stream, interface, password, dedup, last_dns, backoff, tx).await
+            run_session(
+                stream,
+                interface,
+                password,
+                dedup,
+                last_dns,
+                last_connected_at,
+                backoff,
+                tx,
+            )
+            .await
         }
     }
 }
@@ -186,12 +223,14 @@ where
 /// (rejected password, not-yet-ready socket) leaves `backoff` to keep growing in
 /// the caller, so repeated fast failures escalate toward [`MAX_BACKOFF`] rather
 /// than spinning at a tight retry loop.
+#[allow(clippy::too_many_arguments)]
 async fn run_session<S>(
     stream: S,
     interface: &str,
     password: Option<&str>,
     dedup: &mut Deduper,
     last_dns: &mut Vec<String>,
+    last_connected_at: &mut Option<u64>,
     backoff: &mut Duration,
     tx: &Sender<VpnEvent>,
 ) -> Result<(), PlatformError>
@@ -199,7 +238,16 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let started = Instant::now();
-    let result = stream_session(stream, interface, password, dedup, last_dns, tx).await;
+    let result = stream_session(
+        stream,
+        interface,
+        password,
+        dedup,
+        last_dns,
+        last_connected_at,
+        tx,
+    )
+    .await;
     if started.elapsed() >= MIN_HEALTHY_SESSION {
         *backoff = INITIAL_BACKOFF;
     }
@@ -215,6 +263,7 @@ async fn stream_session<S>(
     password: Option<&str>,
     dedup: &mut Deduper,
     last_dns: &mut Vec<String>,
+    last_connected_at: &mut Option<u64>,
     tx: &Sender<VpnEvent>,
 ) -> Result<(), PlatformError>
 where
@@ -222,6 +271,12 @@ where
 {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut lines = BufReader::new(read_half).lines();
+
+    // Per-session: set once this session observes a `PUSH_REPLY` (live or from
+    // the `log on all` replay). A reconnect that re-samples `CONNECTED` for a
+    // *new* tunnel without a fresh `PUSH_REPLY` must not reuse the previous
+    // session's `last_dns` — see `handle_line`.
+    let mut dns_seen_this_session = false;
 
     // A password-protected management interface expects the password as the
     // very first line sent by the client.
@@ -242,7 +297,18 @@ where
             _ = tx.closed() => return Ok(()),
             read = lines.next_line() => {
                 match read? {
-                    Some(line) => handle_line(&line, interface, dedup, last_dns, tx).await,
+                    Some(line) => {
+                        handle_line(
+                            &line,
+                            interface,
+                            dedup,
+                            last_dns,
+                            last_connected_at,
+                            &mut dns_seen_this_session,
+                            tx,
+                        )
+                        .await
+                    }
                     // EOF: OpenVPN closed the socket. Not "VPN down" — let the
                     // caller reconnect with backoff.
                     None => {
@@ -258,11 +324,18 @@ where
 
 /// Process one management line: a `PUSH_REPLY` updates the pushed DNS held for
 /// the next `Up`; a state line drives a deduplicated up/down event.
+///
+/// `last_connected_at` is the connect time of the tunnel `last_dns` belongs to,
+/// and `dns_seen_this_session` records whether *this* management session has
+/// observed a `PUSH_REPLY`. Together they stop a reconnect from emitting the
+/// previous tunnel's DNS for a new one (see the `Up` arm).
 async fn handle_line(
     line: &str,
     interface: &str,
     dedup: &mut Deduper,
     last_dns: &mut Vec<String>,
+    last_connected_at: &mut Option<u64>,
+    dns_seen_this_session: &mut bool,
     tx: &Sender<VpnEvent>,
 ) {
     if line.contains("PUSH_REPLY") {
@@ -279,9 +352,10 @@ async fn handle_line(
         // usually re-pushes the same servers); a DNS-server-aware re-emit (as
         // the macOS detector does) is a noted follow-up. See README.
         *last_dns = parse_push_reply_dns(line);
+        *dns_seen_this_session = true;
         return;
     }
-    let Some(state) = parse_state_line(line) else {
+    let Some((connected_at, state)) = parse_state_line_with_time(line) else {
         return;
     };
     let Some(transition) = transition_for_state(state) else {
@@ -291,10 +365,24 @@ async fn handle_line(
         return; // consecutive duplicate — already emitted
     }
     let event = match transition {
-        Transition::Up => VpnEvent::Up(VpnInfo {
-            interface_name: interface.to_string(),
-            dns_servers: last_dns.clone(),
-        }),
+        Transition::Up => {
+            // A reconnect re-samples `CONNECTED` (the `Deduper` was reset in
+            // `run`). If this is a genuinely *new* tunnel — a different connect
+            // time than the one `last_dns` was captured for — and this session
+            // has not observed a fresh `PUSH_REPLY`, the cached DNS belongs to
+            // the previous tunnel: drop it so the `Up` reverts/no-ops instead of
+            // applying the old session's servers. A reconnect over the *same*
+            // tunnel (unchanged connect time) keeps the known-good DNS even when
+            // the bounded `log on all` replay no longer carries its PUSH_REPLY.
+            if *last_connected_at != Some(connected_at) && !*dns_seen_this_session {
+                last_dns.clear();
+            }
+            *last_connected_at = Some(connected_at);
+            VpnEvent::Up(VpnInfo {
+                interface_name: interface.to_string(),
+                dns_servers: last_dns.clone(),
+            })
+        }
         Transition::Down => {
             // A real OpenVPN down ends this session's DNS context, so drop the
             // cached pushed DNS: the next `Up` must not reuse the previous
@@ -548,5 +636,115 @@ mod tests {
             blocking_session(CannedStream::new(script), None, UNBOUNDED).unwrap();
         assert!(!connected);
         assert!(dns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconnect_to_new_tunnel_without_fresh_push_drops_stale_dns() {
+        // A reconnect re-samples CONNECTED with a *later* connect time (a new
+        // tunnel) and this session saw no PUSH_REPLY (the replay aged out). The
+        // previous tunnel's cached DNS must not be reused: the Up carries empty
+        // servers so the state machine reverts rather than applying stale DNS.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut dedup = Deduper::default();
+        let mut last_dns = vec!["10.8.0.1".to_string()];
+        let mut last_connected_at = Some(1700000000u64);
+        let mut dns_seen = false;
+
+        handle_line(
+            "1700009999,CONNECTED,SUCCESS,10.9.0.2,192.0.2.11,1194,,",
+            "tun0",
+            &mut dedup,
+            &mut last_dns,
+            &mut last_connected_at,
+            &mut dns_seen,
+            &tx,
+        )
+        .await;
+
+        match rx.try_recv().unwrap() {
+            VpnEvent::Up(info) => assert!(
+                info.dns_servers.is_empty(),
+                "a new tunnel with no fresh PUSH_REPLY must not reuse the previous DNS"
+            ),
+            _ => panic!("expected Up"),
+        }
+        assert_eq!(last_connected_at, Some(1700009999));
+    }
+
+    #[tokio::test]
+    async fn reconnect_to_same_tunnel_keeps_cached_dns() {
+        // Same connect time: a transient management-socket blip over the same
+        // tunnel. The known-good DNS is kept even though this session observed
+        // no PUSH_REPLY (it aged out of the bounded `log on all` replay).
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut dedup = Deduper::default();
+        let mut last_dns = vec!["10.8.0.1".to_string()];
+        let mut last_connected_at = Some(1700000000u64);
+        let mut dns_seen = false;
+
+        handle_line(
+            "1700000000,CONNECTED,SUCCESS,10.8.0.2,192.0.2.10,1194,,",
+            "tun0",
+            &mut dedup,
+            &mut last_dns,
+            &mut last_connected_at,
+            &mut dns_seen,
+            &tx,
+        )
+        .await;
+
+        match rx.try_recv().unwrap() {
+            VpnEvent::Up(info) => assert_eq!(
+                info.dns_servers,
+                vec!["10.8.0.1".to_string()],
+                "a same-tunnel reconnect keeps the known-good DNS"
+            ),
+            _ => panic!("expected Up"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_to_new_tunnel_with_fresh_push_uses_new_dns() {
+        // The replay carries the new tunnel's PUSH_REPLY before its CONNECTED.
+        // Even though the connect time changed, the fresh DNS — not the previous
+        // session's — is emitted.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut dedup = Deduper::default();
+        let mut last_dns = vec!["10.8.0.1".to_string()];
+        let mut last_connected_at = Some(1700000000u64);
+        let mut dns_seen = false;
+
+        handle_line(
+            "1700009999,I,PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.9.0.1,route 10.9.0.0'",
+            "tun0",
+            &mut dedup,
+            &mut last_dns,
+            &mut last_connected_at,
+            &mut dns_seen,
+            &tx,
+        )
+        .await;
+        // A PUSH_REPLY emits no event but refreshes the cache for this session.
+        assert!(rx.try_recv().is_err());
+
+        handle_line(
+            "1700009999,CONNECTED,SUCCESS,10.9.0.2,192.0.2.11,1194,,",
+            "tun0",
+            &mut dedup,
+            &mut last_dns,
+            &mut last_connected_at,
+            &mut dns_seen,
+            &tx,
+        )
+        .await;
+
+        match rx.try_recv().unwrap() {
+            VpnEvent::Up(info) => assert_eq!(
+                info.dns_servers,
+                vec!["10.9.0.1".to_string()],
+                "a new tunnel's fresh PUSH_REPLY must replace the previous DNS"
+            ),
+            _ => panic!("expected Up"),
+        }
     }
 }

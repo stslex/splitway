@@ -66,6 +66,16 @@ pub(crate) fn parse_management_addr(raw: &str) -> Result<ManagementAddr, Platfor
 /// The state form is recognized structurally — a unix timestamp, then an
 /// uppercase state token — so a comma-bearing log line is not misread as state.
 pub(crate) fn parse_state_line(line: &str) -> Option<&str> {
+    parse_state_line_with_time(line).map(|(_, state)| state)
+}
+
+/// Like [`parse_state_line`], but also returns the leading unix timestamp — the
+/// time OpenVPN entered the state. For `CONNECTED` this is the tunnel's connect
+/// time: stable across a transient management-socket reconnect over the *same*
+/// tunnel, and renewed when the tunnel actually restarts. The watcher uses it to
+/// tell a same-tunnel reconnect (keep cached DNS) from a genuinely new session
+/// (do not reuse the previous session's pushed DNS).
+pub(crate) fn parse_state_line_with_time(line: &str) -> Option<(u64, &str)> {
     let rest = line.strip_prefix(">STATE:").unwrap_or(line);
     let (time, after) = rest.split_once(',')?;
     if time.is_empty() || !time.bytes().all(|b| b.is_ascii_digit()) {
@@ -76,7 +86,9 @@ pub(crate) fn parse_state_line(line: &str) -> Option<&str> {
     if state.is_empty() || !state.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') {
         return None;
     }
-    Some(state)
+    // An all-digit field that overflows u64 is not a real management timestamp.
+    let timestamp = time.parse::<u64>().ok()?;
+    Some((timestamp, state))
 }
 
 /// Collect the pushed DNS servers from a management log line carrying a
@@ -148,6 +160,21 @@ mod tests {
             parse_state_line(">STATE:1700000200,EXITING,exit-with-notification,,,,,"),
             Some("EXITING")
         );
+    }
+
+    #[test]
+    fn state_line_with_time_returns_timestamp_and_token() {
+        assert_eq!(
+            parse_state_line_with_time(">STATE:1700000000,CONNECTED,SUCCESS,10.8.0.2,192.0.2.10"),
+            Some((1700000000, "CONNECTED"))
+        );
+        assert_eq!(
+            parse_state_line_with_time("1700009999,CONNECTED,SUCCESS,10.9.0.2,192.0.2.11"),
+            Some((1700009999, "CONNECTED"))
+        );
+        // Non-state lines carry no timestamp/state pair.
+        assert_eq!(parse_state_line_with_time(">LOG:1,I,PUSH: ..."), None);
+        assert_eq!(parse_state_line_with_time("END"), None);
     }
 
     #[test]
