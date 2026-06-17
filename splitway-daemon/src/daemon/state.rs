@@ -72,6 +72,14 @@ impl StateMachine {
     /// ones, so applying an empty set would leave stale split-DNS active.
     /// Removing the last domain therefore reverts instead.
     ///
+    /// An Up with no pushed DNS servers also yields `None`: there is nowhere to
+    /// route the domains to (a standalone OpenVPN whose `PUSH_REPLY` carried no
+    /// `dhcp-option DNS`), so there is nothing to apply. Returning `None` rather
+    /// than a do-nothing apply keeps `applied` unset, so a later down/disable/
+    /// shutdown does not `resolvectl revert` per-link resolver state Splitway
+    /// never set (e.g. one an OpenVPN up-script installed). If a *prior* session
+    /// had DNS and the new one does not, this reverts that prior session's rules.
+    ///
     /// The last event's interface must also match the configured `vpn_name`.
     /// After a `ReloadConfig` that changes `vpn_name`, the previous event
     /// refers to the old interface, so this returns `None` and the old
@@ -80,7 +88,11 @@ impl StateMachine {
     fn desired(&self) -> Option<(VpnInfo, Vec<String>)> {
         let active = self.config.enabled && self.vpn_up && !self.config.vpn_hosts.is_empty();
         match &self.last_info {
-            Some(info) if active && info.interface_name == self.config.vpn_name => {
+            Some(info)
+                if active
+                    && !info.dns_servers.is_empty()
+                    && info.interface_name == self.config.vpn_name =>
+            {
                 Some((info.clone(), self.config.vpn_hosts.clone()))
             }
             _ => None,
@@ -409,6 +421,8 @@ mod tests {
             vpn_name: "wg0".to_string(),
             vpn_hosts: hosts.iter().map(|s| s.to_string()).collect(),
             enabled,
+            vpn_backend: config::VpnBackend::default(),
+            openvpn: config::OpenVpnConfig::default(),
         }
     }
 
@@ -568,6 +582,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn up_with_no_dns_does_not_apply_or_revert() {
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend.clone(), config(true, &["a.com"]), "up-no-dns");
+
+        // A standalone OpenVPN up whose PUSH_REPLY carried no DNS: there is
+        // nowhere to route, so nothing is applied — and crucially nothing is
+        // marked applied, so no later `resolvectl revert` runs against
+        // resolver state Splitway never set.
+        sm.on_event(VpnEvent::Up(VpnInfo {
+            interface_name: "wg0".to_string(),
+            dns_servers: Vec::new(),
+        }))
+        .await;
+
+        assert!(backend.applies.lock().unwrap().is_empty());
+        assert!(backend.reverts.lock().unwrap().is_empty());
+        assert!(sm.applied.is_none());
+
+        // A following Down must likewise not revert (nothing was ever applied).
+        sm.on_event(VpnEvent::Down {
+            interface_name: "wg0".to_string(),
+        })
+        .await;
+        assert!(backend.reverts.lock().unwrap().is_empty());
+        assert!(sm.applied.is_none());
+    }
+
+    #[tokio::test]
+    async fn up_losing_dns_reverts_prior_rules() {
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend.clone(), config(true, &["a.com"]), "up-loses-dns");
+
+        // First session pushes DNS and applies.
+        sm.on_event(vpn_up("wg0")).await;
+        assert!(sm.applied.is_some());
+
+        // The session re-pushes with no DNS (or a new no-DNS session on the same
+        // interface): the prior split-DNS now points at gone servers, so it must
+        // be reverted rather than left stale.
+        sm.on_event(VpnEvent::Up(VpnInfo {
+            interface_name: "wg0".to_string(),
+            dns_servers: Vec::new(),
+        }))
+        .await;
+
+        assert_eq!(backend.reverts.lock().unwrap().as_slice(), &["wg0"]);
+        assert!(sm.applied.is_none());
+    }
+
+    #[tokio::test]
     async fn removing_last_domain_reverts() {
         let backend = Arc::new(MockBackend::default());
         let mut sm = machine(backend.clone(), config(true, &["a.com"]), "remove-last");
@@ -598,6 +662,8 @@ mod tests {
             vpn_name: "wg1".to_string(),
             vpn_hosts: vec!["a.com".to_string()],
             enabled: true,
+            vpn_backend: config::VpnBackend::default(),
+            openvpn: config::OpenVpnConfig::default(),
         };
         config::save_config_to(&sm.config_path, &new_cfg).unwrap();
         let resp = sm.on_request(Request::ReloadConfig).await;

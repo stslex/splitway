@@ -41,6 +41,8 @@ pub fn create_empty_config() -> Result<(), ConfigParseError> {
         vpn_name: String::new(),
         vpn_hosts: Vec::new(),
         enabled: default_enabled(),
+        vpn_backend: VpnBackend::default(),
+        openvpn: OpenVpnConfig::default(),
     };
     save_config(&empty_config)
 }
@@ -158,6 +160,39 @@ fn default_enabled() -> bool {
     true
 }
 
+/// Which Linux VPN detector the daemon uses. macOS/Windows have a single
+/// detector and ignore this field. Defaults to [`VpnBackend::NetworkManager`]
+/// so configs written before this field existed keep their behavior.
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum VpnBackend {
+    /// Detect via NetworkManager over D-Bus (the original Linux detector).
+    #[default]
+    NetworkManager,
+    /// Detect a standalone OpenVPN connection via its management interface.
+    /// `rename` pins the config token to `openvpn` (kebab-case of `OpenVpn`
+    /// would be `open-vpn`); the Rust name matches `OpenVpnConfig` /
+    /// `OpenVpnDetector` for consistent casing across the codebase.
+    #[serde(rename = "openvpn")]
+    OpenVpn,
+}
+
+/// Connection settings for a standalone OpenVPN's management interface. Used
+/// only when [`LocalConfig::vpn_backend`] is [`VpnBackend::OpenVpn`].
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct OpenVpnConfig {
+    /// The management interface address: either a TCP endpoint `host:port`
+    /// (matching `management 127.0.0.1 7505` in `openvpn.conf`) or a path to a
+    /// unix socket (matching `management /run/openvpn/mgmt.sock unix`). A value
+    /// containing `/` is treated as a unix socket path, otherwise as `host:port`.
+    #[serde(default)]
+    pub management: String,
+    /// Optional path to a file whose first line is the management password,
+    /// for a password-protected management interface. `None` = no password.
+    #[serde(default)]
+    pub management_password_file: Option<String>,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct LocalConfig {
     pub vpn_name: String,
@@ -166,6 +201,14 @@ pub struct LocalConfig {
     /// written before this field existed keep applying as before.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Which VPN detector to use on Linux. `#[serde(default)]` keeps pre-3c
+    /// configs (without this field) selecting NetworkManager.
+    #[serde(default)]
+    pub vpn_backend: VpnBackend,
+    /// Standalone-OpenVPN management connection. `#[serde(default)]` keeps
+    /// pre-3c configs parsing; ignored unless `vpn_backend = openvpn`.
+    #[serde(default)]
+    pub openvpn: OpenVpnConfig,
 }
 
 #[derive(Debug)]
@@ -235,6 +278,11 @@ mod tests {
             vpn_name: "wg0".to_string(),
             vpn_hosts: vec!["example.com".to_string(), "internal.corp".to_string()],
             enabled: false,
+            vpn_backend: VpnBackend::OpenVpn,
+            openvpn: OpenVpnConfig {
+                management: "127.0.0.1:7505".to_string(),
+                management_password_file: Some("/etc/splitway/mgmt.pass".to_string()),
+            },
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -250,6 +298,32 @@ mod tests {
         let parsed: LocalConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.enabled);
         assert_eq!(parsed.vpn_name, "wg0");
+    }
+
+    #[test]
+    fn vpn_backend_defaults_to_network_manager_when_absent() {
+        // Pre-3c configs (no vpn_backend / openvpn fields) must still parse and
+        // keep selecting the NetworkManager detector — no behavior change.
+        let json = r#"{"vpn_name":"tun0","vpn_hosts":["a.com"],"enabled":true}"#;
+        let parsed: LocalConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.vpn_backend, VpnBackend::NetworkManager);
+        assert_eq!(parsed.openvpn, OpenVpnConfig::default());
+        assert!(parsed.openvpn.management.is_empty());
+        assert!(parsed.openvpn.management_password_file.is_none());
+    }
+
+    #[test]
+    fn vpn_backend_parses_kebab_case_values() {
+        // The serialized form uses kebab-case tokens.
+        let nm = r#"{"vpn_name":"","vpn_hosts":[],"vpn_backend":"network-manager"}"#;
+        assert_eq!(
+            serde_json::from_str::<LocalConfig>(nm).unwrap().vpn_backend,
+            VpnBackend::NetworkManager
+        );
+        let ovpn = r#"{"vpn_name":"tun0","vpn_hosts":[],"vpn_backend":"openvpn","openvpn":{"management":"127.0.0.1:7505"}}"#;
+        let parsed: LocalConfig = serde_json::from_str(ovpn).unwrap();
+        assert_eq!(parsed.vpn_backend, VpnBackend::OpenVpn);
+        assert_eq!(parsed.openvpn.management, "127.0.0.1:7505");
     }
 
     #[test]
@@ -277,6 +351,8 @@ mod tests {
             vpn_name: "tun0".to_string(),
             vpn_hosts: vec!["corp.example".to_string()],
             enabled: true,
+            vpn_backend: VpnBackend::default(),
+            openvpn: OpenVpnConfig::default(),
         };
         save_config_to(&path, &config).unwrap();
         let loaded = load_config_from(&path).unwrap();

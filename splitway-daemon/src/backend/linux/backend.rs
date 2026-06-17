@@ -6,12 +6,26 @@ use crate::backend::linux::LinuxBackend;
 
 impl DnsBackend for LinuxBackend {
     fn apply_rules(&self, vpn_info: &VpnInfo, domains: &[String]) -> Result<(), PlatformError> {
-        // Set DNS servers: resolvectl dns <interface> <servers...>
+        // No pushed DNS (e.g. a standalone OpenVPN whose PUSH_REPLY carried no
+        // `dhcp-option DNS`): there is nothing to route queries to, so calling
+        // `resolvectl dns <iface>` with zero servers — or applying routing
+        // domains that point at a link with no resolver — would leave a broken,
+        // half-configured rule. Treat it as a successful no-op and log instead.
+        //
+        // The state machine's `desired()` already gates this out (an Up with no
+        // DNS reverts/no-ops rather than applying), so this branch is normally
+        // unreached from the daemon; it stays as defense-in-depth for any direct
+        // caller so a zero-server apply can never half-configure the link.
         if vpn_info.dns_servers.is_empty() {
-            return Err(PlatformError::CommandFailed(
-                "no DNS servers in VpnInfo".to_string(),
-            ));
+            log::info!(
+                "{}: VPN up but no DNS servers were provided; leaving DNS unchanged \
+                 (no split-DNS to apply)",
+                vpn_info.interface_name
+            );
+            return Ok(());
         }
+
+        // Set DNS servers: resolvectl dns <interface> <servers...>
 
         let result = Command::new("resolvectl")
             .arg("dns")
@@ -121,5 +135,26 @@ impl DnsBackend for LinuxBackend {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_with_no_dns_is_a_noop_ok() {
+        // The no-pushed-DNS case must succeed without ever shelling out to
+        // resolvectl (the early return happens before any Command), so this
+        // passes regardless of whether resolvectl is installed.
+        let info = VpnInfo {
+            interface_name: "tun0".to_string(),
+            dns_servers: Vec::new(),
+        };
+        let result = LinuxBackend.apply_rules(&info, &["corp.example.com".to_string()]);
+        assert!(
+            result.is_ok(),
+            "empty DNS should be a logged no-op, not an error"
+        );
     }
 }

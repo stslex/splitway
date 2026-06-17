@@ -13,11 +13,11 @@ Splitway automates DNS-based traffic splitting: domains matching the rules are r
 ## Current state
 
 - Long-running daemon: auto-applies rules on VPN up, auto-reverts on down
-- Auto-detects the VPN DNS server: NetworkManager D-Bus on Linux, SCDynamicStore + `scutil` on macOS
+- Auto-detects the VPN DNS server: NetworkManager D-Bus on Linux, a standalone OpenVPN's management interface, or SCDynamicStore + `scutil` on macOS
 - Applies/reverts split-DNS rules through `resolvectl` (Linux) or `/etc/resolver` files (macOS)
 - Runtime control over a Unix socket: `splitway status/enable/disable/add/remove/list/reload`
 - Reverts DNS rules on `SIGTERM`/`SIGINT` so a stop never leaves the system half-configured
-- Linux (GlobalProtect via openconnect, and OpenVPN — both NetworkManager-managed) and macOS (any `utun*` VPN) supported. The official GlobalProtect client (not NM-managed) is not covered
+- Linux (GlobalProtect via openconnect, and OpenVPN — both NetworkManager-managed; plus standalone OpenVPN via its management interface, no NM) and macOS (any `utun*` VPN) supported. The official GlobalProtect client (not NM-managed) is not covered
 
 ## Workspace layout
 
@@ -54,6 +54,77 @@ connection name. Find it with `nmcli device status` / `ip link` (Linux) or
 - **macOS** VPNs appear as `utun*` devices. The macOS backend writes one
   `/etc/resolver/<domain>` file per host and needs root; install it as a
   LaunchDaemon — see [packaging/](packaging/README.md) ("macOS (launchd)").
+
+### Standalone OpenVPN (no NetworkManager)
+
+For an OpenVPN connection started directly by `openvpn` (or
+`openvpn-client@.service`) — *not* imported into NetworkManager — set
+`vpn_backend` to `openvpn` and point Splitway at OpenVPN's **management
+interface**. Unlike the NetworkManager case, nothing applies the pushed DNS onto
+the `tun*` link for Splitway to read back, so it learns the DNS from OpenVPN
+itself (the management `log` channel surfaces the `PUSH_REPLY`).
+
+Enable the management interface in your `openvpn.conf`, bound to localhost (TCP)
+or a unix socket:
+
+```ini
+# TCP on localhost:
+management 127.0.0.1 7505
+
+# ...or a unix socket (preferred — filesystem permissions gate access):
+management /run/openvpn/mgmt.sock unix
+```
+
+Then configure Splitway:
+
+```json
+{
+  "vpn_name": "tun0",
+  "vpn_hosts": ["corp.example.com"],
+  "vpn_backend": "openvpn",
+  "openvpn": {
+    "management": "127.0.0.1:7505",
+    "management_password_file": "/etc/openvpn/mgmt.pass"
+  }
+}
+```
+
+- `vpn_backend` defaults to `network-manager`; set it to `openvpn` for this mode.
+  Configs without the field keep selecting NetworkManager, so existing setups are
+  unaffected.
+- `openvpn.management` is either `host:port` (TCP) or a unix socket path — a value
+  containing `/` is treated as a socket path, otherwise as `host:port`.
+- `vpn_name` is still the `tun*` device the DNS rules are applied to (find it with
+  `ip link` while the VPN is up); the management interface only supplies VPN
+  state and the pushed DNS, not the device.
+- `openvpn.management_password_file` is optional — set it (to a file whose first
+  line is the password) only when the management interface is password-protected.
+- If OpenVPN pushes **no DNS servers** (a `PUSH_REPLY` with no `dhcp-option DNS`),
+  there is nowhere to route the selected domains, so Splitway leaves DNS unchanged
+  and applies nothing; any rules from a previous session are reverted.
+
+Splitway sends only **read-only** management commands (`state`, `log`); it never
+sends `signal`/`hold` or otherwise controls the tunnel. A management-socket drop
+is never itself treated as VPN-down: Splitway reconnects with backoff, then
+re-samples the tunnel and reconciles — keeping the rules unchanged when the
+pushed DNS is the same, re-applying when it changed, and reverting when the
+reconnected session pushes no DNS (as well as on a genuine OpenVPN
+`EXITING`/`RECONNECTING` state).
+
+> **Known limitation:** if OpenVPN pushes *different* DNS servers mid-session
+> (a TLS renegotiation that changes `dhcp-option DNS` without a reconnect),
+> Splitway does not re-apply them until the next down/up cycle. This is rare —
+> renegotiation normally re-pushes the same servers — and is a noted follow-up.
+
+**Security.** The management interface is OpenVPN's control channel: anything
+that can reach it can drive the VPN. Bind it to `127.0.0.1` or a unix socket with
+tight permissions (socket directory `0700`, owned by the OpenVPN user); **never**
+expose it over TCP to other hosts or on `0.0.0.0`. Prefer a unix socket so
+filesystem permissions gate access, and password-protect any TCP endpoint.
+
+No extra deployment artifact is needed for this mode: OpenVPN runs as its own
+service, and the existing `splitway-daemon` unit (see
+[packaging/](packaging/README.md)) drives it once `vpn_backend = openvpn`.
 
 ## Usage
 
