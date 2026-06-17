@@ -184,6 +184,18 @@ pub enum VpnBackend {
     OpenVpn,
 }
 
+impl VpnBackend {
+    /// The canonical token for this backend — the same kebab-case string used
+    /// on disk and on the wire (via serde). Use this for user-facing output
+    /// instead of `Debug`, so the displayed value matches the config/IPC form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VpnBackend::NetworkManager => "network-manager",
+            VpnBackend::OpenVpn => "openvpn",
+        }
+    }
+}
+
 /// Connection settings for a standalone OpenVPN's management interface. Used
 /// only when [`LocalConfig::vpn_backend`] is [`VpnBackend::OpenVpn`].
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -317,6 +329,16 @@ mod tests {
         assert_eq!(parsed.openvpn, OpenVpnConfig::default());
         assert!(parsed.openvpn.management.is_empty());
         assert!(parsed.openvpn.management_password_file.is_none());
+    }
+
+    #[test]
+    fn vpn_backend_as_str_matches_serde_token() {
+        // as_str() must stay in lockstep with the serde (kebab-case) form, so
+        // user-facing output matches the config/wire representation.
+        for backend in [VpnBackend::NetworkManager, VpnBackend::OpenVpn] {
+            let serde_token = serde_json::to_string(&backend).unwrap();
+            assert_eq!(serde_token, format!("\"{}\"", backend.as_str()));
+        }
     }
 
     #[test]

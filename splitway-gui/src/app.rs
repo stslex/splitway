@@ -655,8 +655,6 @@ impl SplitwayApp {
 }
 
 fn backend_label(backend: VpnBackend) -> &'static str {
-    match backend {
-        VpnBackend::NetworkManager => "network-manager",
-        VpnBackend::OpenVpn => "openvpn",
-    }
+    // The canonical kebab-case token, shared with the config/IPC representation.
+    backend.as_str()
 }

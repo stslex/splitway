@@ -357,6 +357,18 @@ impl StateMachine {
             management: view.openvpn_management,
             management_password_file: view.openvpn_management_password_file,
         };
+        // Reject a known-invalid combination at the IPC boundary rather than
+        // persisting a config that the OpenVPN detector will only fail on later:
+        // the openvpn backend has no usable target without a management endpoint.
+        if next.vpn_backend == config::VpnBackend::OpenVpn
+            && next.openvpn.management.trim().is_empty()
+        {
+            return Response::Error(
+                "invalid config: the openvpn backend requires a non-empty openvpn.management \
+                 (host:port or a unix socket path)"
+                    .to_string(),
+            );
+        }
         self.warn_on_restart_only_changes(&next);
         self.commit(next).await
     }
@@ -1043,5 +1055,30 @@ mod tests {
         assert_eq!(saved.vpn_hosts, vec!["a.com", "b.com"]);
         assert!(saved.enabled);
         assert_eq!(saved.openvpn.management, "/run/ovpn.sock");
+    }
+
+    #[tokio::test]
+    async fn set_config_rejects_openvpn_without_management() {
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "set-config-invalid",
+        );
+
+        let view = ConfigView {
+            vpn_name: "tun0".to_string(),
+            vpn_backend: config::VpnBackend::OpenVpn,
+            openvpn_management: "   ".to_string(), // empty/whitespace → unusable
+            openvpn_management_password_file: None,
+            config_path: String::new(),
+        };
+        let resp = sm.on_request(Request::SetConfig(view)).await;
+
+        // Rejected at the boundary before commit: nothing is adopted in memory
+        // (and nothing is persisted, since commit never runs).
+        assert!(matches!(resp, Response::Error(_)));
+        assert_eq!(sm.config.vpn_backend, config::VpnBackend::NetworkManager);
+        assert!(sm.config.openvpn.management.is_empty());
     }
 }
