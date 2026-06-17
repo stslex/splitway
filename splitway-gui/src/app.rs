@@ -230,20 +230,26 @@ impl SplitwayApp {
     /// `Response::Error`s (e.g. "domain already present") are left to the
     /// per-action message instead.
     fn note_connection_from(&mut self, result: &Result<Response, ClientResult>) {
-        match result {
-            Err(err) => {
-                self.connection = ConnectionState {
-                    health: classify_client_error(err),
-                    message: Some(err.to_string()),
-                };
-            }
-            Ok(Response::Error(msg)) if model::is_version_mismatch(msg) => {
-                self.connection = ConnectionState {
-                    health: Health::VersionMismatch,
-                    message: Some(msg.clone()),
-                };
-            }
-            _ => {}
+        let degraded = match result {
+            Err(err) => Some(ConnectionState {
+                health: classify_client_error(err),
+                message: Some(err.to_string()),
+            }),
+            Ok(Response::Error(msg)) if model::is_version_mismatch(msg) => Some(ConnectionState {
+                health: Health::VersionMismatch,
+                message: Some(msg.clone()),
+            }),
+            _ => None,
+        };
+        if let Some(state) = degraded {
+            // Also lower `last_health` so the reconnect-edge check in the Status
+            // arm fires on the next successful poll. Otherwise a daemon that
+            // goes down and recovers entirely within one poll interval — its
+            // outage seen only by a mutation/GetConfig, never by a Status poll —
+            // would leave `last_health == Connected`, skip the config re-fetch,
+            // and strand the editor on stale config / a stale active-file path.
+            self.last_health = state.health;
+            self.connection = state;
         }
     }
 

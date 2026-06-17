@@ -150,11 +150,13 @@ pub fn validate_config_fields(view: &ConfigView) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether a change to `vpn_name`/`vpn_backend` only takes effect after a
-/// daemon restart, given the daemon's currently-live interface. The detector
-/// watch is armed once at startup and is not restarted on a live config change,
-/// so editing the interface or backend needs a restart to auto-apply — a caveat
-/// the UI surfaces rather than implying the change took full effect.
+/// Whether the edited `vpn_name` differs from the daemon's currently-active
+/// interface — i.e. there is an unsaved interface change. The detector watch is
+/// armed once at startup and is not restarted on a live config change, so such a
+/// change needs a daemon restart to auto-apply on the new interface; the UI uses
+/// this to flag the pending change. (`vpn_backend` carries the same restart
+/// caveat, but the live backend is not exposed in `StatusInfo`, so the UI
+/// surfaces that part as an always-on note rather than a diff against live.)
 pub fn interface_change_needs_restart(edited_vpn_name: &str, live_interface: &str) -> bool {
     edited_vpn_name.trim() != live_interface
 }
