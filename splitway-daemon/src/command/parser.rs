@@ -43,22 +43,24 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Command, String
 fn parse_config_flag<I: Iterator<Item = String>>(args: &mut I) -> Result<Option<PathBuf>, String> {
     let mut config = None;
     while let Some(arg) = args.next() {
-        if arg == "--config" {
-            let path = args
-                .next()
-                .ok_or_else(|| format!("--config requires a path argument\n{USAGE}"))?;
-            if path.is_empty() {
-                return Err(format!("--config requires a non-empty path\n{USAGE}"));
-            }
-            config = Some(PathBuf::from(path));
+        let value = if arg == "--config" {
+            args.next()
+                .ok_or_else(|| format!("--config requires a path argument\n{USAGE}"))?
         } else if let Some(value) = arg.strip_prefix("--config=") {
-            if value.is_empty() {
-                return Err(format!("--config requires a non-empty path\n{USAGE}"));
-            }
-            config = Some(PathBuf::from(value));
+            value.to_string()
         } else {
             return Err(format!("unexpected argument: {arg}\n{USAGE}"));
+        };
+        if value.is_empty() {
+            return Err(format!("--config requires a non-empty path\n{USAGE}"));
         }
+        // Reject a repeated flag rather than silently letting the last win: a
+        // duplicate is almost always a typo or a wrapper-script bug, and a
+        // "looks right" invocation using a different file is hard to diagnose.
+        if config.is_some() {
+            return Err(format!("--config may only be given once\n{USAGE}"));
+        }
+        config = Some(PathBuf::from(value));
     }
     Ok(config)
 }
@@ -136,5 +138,13 @@ mod tests {
     #[test]
     fn unexpected_trailing_argument_is_error() {
         assert!(parse(&["splitway-daemon", "run", "extra"]).is_err());
+    }
+
+    #[test]
+    fn duplicate_config_is_error() {
+        // A repeated --config is almost always a mistake; reject it rather than
+        // silently letting the last occurrence win.
+        assert!(parse(&["splitway-daemon", "run", "--config", "/a", "--config", "/b"]).is_err());
+        assert!(parse(&["splitway-daemon", "run", "--config=/a", "--config=/b"]).is_err());
     }
 }
