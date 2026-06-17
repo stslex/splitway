@@ -50,6 +50,13 @@ pub struct StateMachine {
     last_info: Option<VpnInfo>,
     /// What is applied right now; `None` means reverted.
     applied: Option<Applied>,
+    /// Set when the last apply/revert failed and left the real system state
+    /// uncertain relative to `applied` (e.g. the Linux backend rolled the link
+    /// back to clean on a domain-step failure, or a `revert` failed because the
+    /// link had vanished). Forces the next reconcile to act even when the
+    /// desired target equals the — now possibly stale — `applied` snapshot, so a
+    /// post-failure "already converged" check can never skip a needed re-apply.
+    needs_resync: bool,
 }
 
 impl StateMachine {
@@ -61,6 +68,7 @@ impl StateMachine {
             vpn_up: false,
             last_info: None,
             applied: None,
+            needs_resync: false,
         }
     }
 
@@ -111,7 +119,11 @@ impl StateMachine {
                     domains,
                     dns_servers: info.dns_servers.clone(),
                 };
-                if self.applied.as_ref() == Some(&target) {
+                // A matching snapshot only means "already converged" when the
+                // last apply/revert actually succeeded; after a failure the
+                // snapshot may not reflect reality, so `needs_resync` forces the
+                // re-apply through instead of trusting the stale equality.
+                if !self.needs_resync && self.applied.as_ref() == Some(&target) {
                     return Ok(());
                 }
                 let backend = self.backend.clone();
@@ -129,6 +141,7 @@ impl StateMachine {
                             target.domains.len()
                         );
                         self.applied = Some(target);
+                        self.needs_resync = false;
                         Ok(())
                     }
                     Ok(Err(e)) => {
@@ -137,12 +150,18 @@ impl StateMachine {
                         // can return Err without reverting, e.g. when the DNS
                         // step itself fails). Keep `applied` so a later
                         // disable/down/shutdown still reverts it; clearing it
-                        // would skip that and leave stale DNS active.
+                        // would skip that and leave stale DNS active. But the
+                        // snapshot can no longer be trusted as "live" — the
+                        // backend may instead have rolled the link back to clean
+                        // — so mark `needs_resync` to force the next reconcile to
+                        // re-apply rather than treat an equal target as converged.
                         log::error!("apply_rules failed on {}: {e}", info.interface_name);
+                        self.needs_resync = true;
                         Err(e)
                     }
                     Err(e) => {
                         log::error!("apply task panicked: {e}");
+                        self.needs_resync = true;
                         Err(PlatformError::CommandFailed(format!(
                             "apply task panicked: {e}"
                         )))
@@ -157,6 +176,9 @@ impl StateMachine {
     /// `applied` is left set, so a later reconcile or shutdown retries it.
     async fn revert(&mut self) -> Result<(), PlatformError> {
         let Some(applied) = self.applied.clone() else {
+            // Nothing recorded as applied: the system already matches the
+            // "reverted" goal, so any prior uncertainty is resolved.
+            self.needs_resync = false;
             return Ok(());
         };
         let backend = self.backend.clone();
@@ -166,14 +188,22 @@ impl StateMachine {
             Ok(Ok(())) => {
                 log::info!("reverted rules on {}", applied.interface);
                 self.applied = None;
+                self.needs_resync = false;
                 Ok(())
             }
             Ok(Err(e)) => {
+                // The revert failed, so the link may still carry our rules (or
+                // may have vanished, taking them with it — we cannot tell).
+                // Keep `applied` so shutdown still retries, and mark
+                // `needs_resync` so a later matching `Up` re-applies on the new
+                // link instead of trusting the retained snapshot as converged.
                 log::error!("revert_rules failed on {}: {e}", applied.interface);
+                self.needs_resync = true;
                 Err(e)
             }
             Err(e) => {
                 log::error!("revert task panicked: {e}");
+                self.needs_resync = true;
                 Err(PlatformError::CommandFailed(format!(
                     "revert task panicked: {e}"
                 )))
@@ -813,5 +843,79 @@ mod tests {
         // ...but the config change is still persisted to disk.
         let saved = config::load_config_from(&sm.config_path).unwrap();
         assert_eq!(saved.vpn_hosts, vec!["a.com", "b.com"]);
+    }
+
+    #[tokio::test]
+    async fn reapply_after_failed_apply_even_when_target_matches_stale_snapshot() {
+        // Regression: a failed re-apply (which a real backend rolls back, so the
+        // link is left clean) must not strand the system. If a later change
+        // makes the desired target equal the pre-failure `applied` snapshot, the
+        // machine must still re-apply rather than treat it as already converged.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "resync-after-apply",
+        );
+
+        // First apply succeeds: applied = {wg0, [a.com], [10.0.0.1]}.
+        sm.on_event(vpn_up("wg0")).await;
+        assert_eq!(backend.applies.lock().unwrap().len(), 1);
+
+        // Add a domain; the re-apply fails (the backend would have rolled the
+        // link back to clean, but `applied` still names the old snapshot).
+        backend.set_fail_apply(true);
+        let resp = sm.on_request(Request::AddDomain("b.com".to_string())).await;
+        assert!(matches!(resp, Response::Error(_)));
+
+        // Remove the just-added domain so the desired target equals the OLD
+        // snapshot again. The prior failure must force a re-apply.
+        backend.set_fail_apply(false);
+        let resp = sm
+            .on_request(Request::RemoveDomain("b.com".to_string()))
+            .await;
+        assert_eq!(resp, Response::Ok);
+        assert_eq!(
+            backend.applies.lock().unwrap().len(),
+            2,
+            "a target equal to a stale post-failure snapshot must still re-apply"
+        );
+        assert!(sm.applied.is_some());
+    }
+
+    #[tokio::test]
+    async fn reapply_on_reconnect_after_a_failed_revert() {
+        // Regression: a `Down` whose `revert` fails (e.g. the link already
+        // vanished) keeps `applied` set so shutdown can retry. When the VPN
+        // reconnects with identical params, the new link carries none of our
+        // rules — so the matching snapshot must not be treated as converged; the
+        // machine must re-apply.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "resync-after-revert",
+        );
+
+        sm.on_event(vpn_up("wg0")).await;
+        assert_eq!(backend.applies.lock().unwrap().len(), 1);
+
+        // Down with a failing revert: the snapshot is retained.
+        backend.set_fail_revert(true);
+        sm.on_event(VpnEvent::Down {
+            interface_name: "wg0".to_string(),
+        })
+        .await;
+        assert!(sm.applied.is_some());
+
+        // Reconnect with the same interface, domains, and DNS servers.
+        backend.set_fail_revert(false);
+        sm.on_event(vpn_up("wg0")).await;
+        assert_eq!(
+            backend.applies.lock().unwrap().len(),
+            2,
+            "a reconnect after a failed revert must re-apply on the new link"
+        );
+        assert!(sm.applied.is_some());
     }
 }
