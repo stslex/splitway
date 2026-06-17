@@ -37,6 +37,13 @@ pub fn load_config_from(path: &Path) -> Result<LocalConfig, ConfigParseError> {
 }
 
 pub fn create_empty_config() -> Result<(), ConfigParseError> {
+    create_empty_config_at(&config_file_path())
+}
+
+/// Persist a fresh empty config at `path`. Separate from [`create_empty_config`]
+/// so the daemon can honor a `--config <PATH>` override (and so it is testable
+/// against a temp path).
+pub fn create_empty_config_at(path: &Path) -> Result<(), ConfigParseError> {
     let empty_config = LocalConfig {
         vpn_name: String::new(),
         vpn_hosts: Vec::new(),
@@ -44,7 +51,7 @@ pub fn create_empty_config() -> Result<(), ConfigParseError> {
         vpn_backend: VpnBackend::default(),
         openvpn: OpenVpnConfig::default(),
     };
-    save_config(&empty_config)
+    save_config_to(path, &empty_config)
 }
 
 /// Persist `config` to the real config location atomically.

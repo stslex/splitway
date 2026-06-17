@@ -15,7 +15,7 @@ Splitway automates DNS-based traffic splitting: domains matching the rules are r
 - Long-running daemon: auto-applies rules on VPN up, auto-reverts on down
 - Auto-detects the VPN DNS server: NetworkManager D-Bus on Linux, a standalone OpenVPN's management interface, or SCDynamicStore + `scutil` on macOS
 - Applies/reverts split-DNS rules through `resolvectl` (Linux) or `/etc/resolver` files (macOS)
-- Runtime control over a Unix socket: `splitway status/enable/disable/add/remove/list/reload`
+- Runtime control over a Unix socket: `splitway status/enable/disable/add/remove/list/reload`, or a primitive GUI (`splitway-gui`) over the same socket
 - Reverts DNS rules on `SIGTERM`/`SIGINT` so a stop never leaves the system half-configured
 - Linux (GlobalProtect via openconnect, and OpenVPN — both NetworkManager-managed; plus standalone OpenVPN via its management interface, no NM) and macOS (any `utun*` VPN) supported. The official GlobalProtect client (not NM-managed) is not covered
 
@@ -25,6 +25,7 @@ Splitway automates DNS-based traffic splitting: domains matching the rules are r
 splitway/
 ├── splitway-daemon/   # Core daemon — applies/reverts resolvectl rules
 ├── splitway-cli/      # CLI frontend (IPC client over the daemon socket)
+├── splitway-gui/      # Primitive GUI (egui; IPC client, no privileges)
 └── splitway-shared/   # Shared types and config parsing
 ```
 
@@ -138,10 +139,18 @@ as a service — see [packaging/](packaging/README.md) (systemd) or the flake's
 # Start the daemon (normally via systemd, not by hand)
 splitway-daemon run
 
+# Use a config file other than the default location:
+splitway-daemon run --config /etc/splitway/config.json
+
 # Daemon's own subcommands:
 splitway-daemon status   # query the running daemon over IPC
 splitway-daemon revert   # emergency direct revert; works even with no daemon
 ```
+
+`--config <PATH>` overrides the config file the daemon reads and writes for its
+whole lifetime (it also applies to `revert`, which reads `vpn_name` from the
+same file). Without it, the default `~/.config/splitway/config.json` is used.
+The chosen file is fixed at launch — there is no runtime switching.
 
 Control a running daemon with the `splitway` CLI over the socket:
 
@@ -158,6 +167,38 @@ splitway reload            # re-read config.json from disk
 `disable` tells the running daemon to stop applying and persists that choice;
 `splitway-daemon revert` is a one-shot escape hatch that talks straight to the
 DNS backend and works even when no daemon is running.
+
+### GUI
+
+`splitway-gui` is a small desktop window (egui) that drives the daemon over the
+**same IPC socket as the CLI**. It is a pure client: it holds **no privileges**,
+duplicates no daemon logic, and never touches `resolvectl`/`/etc/resolver` or
+writes the config file itself — every action is an IPC request, every config
+change goes through the daemon's single-writer state actor.
+
+It shows live status (`vpn_up`, `applied`, interface, domain count), an
+enable/disable toggle, the domain list with add/remove, and an editor for the
+remaining config fields (`vpn_name`, `vpn_backend`, `openvpn.management`,
+`openvpn.management_password_file`). Changing `vpn_name`/`vpn_backend` reverts
+the old interface but does not re-arm the VPN watch, so the GUI flags that a
+**daemon restart** is needed for auto-apply on the new interface.
+
+```sh
+splitway-gui
+```
+
+Reachability matches the CLI: it tries the per-user socket
+(`$XDG_RUNTIME_DIR/splitway.sock`) then the system socket (`/run/splitway` on
+Linux, `/var/run/splitway` on macOS), so a login-session GUI can reach a system
+daemon. If the daemon runs as root with its default `0600` socket, an
+unprivileged GUI sees "permission denied" and shows the daemon's own guidance
+(run as the daemon's user/group) — it never escalates. A daemon that is not
+running shows a non-fatal banner and the GUI recovers on the next poll once it
+is back.
+
+The config-file path is shown read-only; the "Choose a file…" picker produces a
+`splitway-daemon run --config <PATH>` launch hint rather than switching the
+daemon's active file at runtime (runtime switching is a planned follow-up).
 
 ## Build
 

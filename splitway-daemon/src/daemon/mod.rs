@@ -5,6 +5,7 @@
 mod ipc;
 mod state;
 
+use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::Arc;
 
@@ -19,9 +20,13 @@ use crate::backend::create_dns_backend;
 use crate::detector::create_vpn_detector;
 use state::{run_state, StateCommand, StateMachine};
 
-/// Entry point for `splitway-daemon run`.
-pub fn run() {
-    let config = load_or_init_config();
+/// Entry point for `splitway-daemon run`. `config_path` is the optional
+/// `--config <PATH>` override; `None` uses the default config location. The
+/// resolved path is the daemon's active config file for its whole lifetime —
+/// the file `GetConfig`/`SetConfig` read and write.
+pub fn run(config_path: Option<PathBuf>) {
+    let config_path = config_path.unwrap_or_else(config::config_file_path);
+    let config = load_or_init_config(&config_path);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -32,10 +37,10 @@ pub fn run() {
             exit(1);
         }
     };
-    runtime.block_on(run_async(config));
+    runtime.block_on(run_async(config, config_path));
 }
 
-async fn run_async(config: LocalConfig) {
+async fn run_async(config: LocalConfig, config_path: PathBuf) {
     let interface = config.vpn_name.clone();
     if interface.is_empty() {
         log::warn!(
@@ -97,7 +102,7 @@ async fn run_async(config: LocalConfig) {
     // channel so the revert preempts any queued commands.
     let (state_tx, state_rx) = mpsc::channel::<StateCommand>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<oneshot::Sender<bool>>();
-    let machine = StateMachine::new(backend, config, config::config_file_path());
+    let machine = StateMachine::new(backend, config, config_path);
     let state_handle = tokio::spawn(run_state(machine, state_rx, shutdown_rx));
 
     // Forward VPN events into the state task.
@@ -183,19 +188,19 @@ async fn wait_for_shutdown_signal(sigint: &mut Signal, sigterm: &mut Signal) {
     }
 }
 
-fn load_or_init_config() -> LocalConfig {
-    match config::get_config() {
+fn load_or_init_config(path: &Path) -> LocalConfig {
+    match config::load_config_from(path) {
         Ok(config) => config,
         Err(ConfigParseError::ConfigNotFound) => {
             log::warn!(
                 "config not found; creating an empty one at {}",
-                config::config_file_path().display()
+                path.display()
             );
-            if let Err(e) = config::create_empty_config() {
+            if let Err(e) = config::create_empty_config_at(path) {
                 log::error!("failed to create empty config: {e}");
                 exit(1);
             }
-            config::get_config().unwrap_or_else(|e| {
+            config::load_config_from(path).unwrap_or_else(|e| {
                 log::error!("failed to read freshly created config: {e}");
                 exit(1);
             })
