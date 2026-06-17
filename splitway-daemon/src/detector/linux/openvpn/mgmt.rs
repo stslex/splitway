@@ -367,17 +367,37 @@ async fn handle_line(
     let event = match transition {
         Transition::Up => {
             // A reconnect re-samples `CONNECTED` (the `Deduper` was reset in
-            // `run`). If this is a genuinely *new* tunnel — a different connect
-            // time than the one `last_dns` was captured for — and this session
-            // has not observed a fresh `PUSH_REPLY`, the cached DNS belongs to
-            // the previous tunnel: drop it so the `Up` reverts/no-ops instead of
-            // applying the old session's servers. A reconnect over the *same*
-            // tunnel (unchanged connect time) keeps the known-good DNS even when
-            // the bounded `log on all` replay no longer carries its PUSH_REPLY.
-            if *last_connected_at != Some(connected_at) && !*dns_seen_this_session {
+            // `run`). A *different* connect time than the one we last emitted an
+            // `Up` for means a genuinely new tunnel whose `Down` we missed while
+            // the management socket was down (`last_connected_at` is cleared on a
+            // real `Down`, so this is only the missed-Down case).
+            let restarted = matches!(*last_connected_at, Some(prev) if prev != connected_at);
+            // If this new tunnel produced no fresh `PUSH_REPLY` this session, the
+            // cached DNS belongs to the previous tunnel: drop it so the `Up`
+            // reverts/no-ops instead of applying the old session's servers. A
+            // reconnect over the *same* tunnel (unchanged connect time) keeps the
+            // known-good DNS even when the bounded `log on all` replay no longer
+            // carries its PUSH_REPLY.
+            if restarted && !*dns_seen_this_session {
                 last_dns.clear();
             }
             *last_connected_at = Some(connected_at);
+            if restarted {
+                // The recreated `tun` link lost its per-link DNS (systemd-resolved
+                // discards it when the link disappears), but the re-sampled `Up`
+                // may carry the same servers and look "already converged" to the
+                // state machine, which would then skip re-applying. Emit the
+                // `Down` we missed first, so the state machine reverts its stale
+                // snapshot and the `Up` below re-applies on the fresh link even
+                // when the pushed DNS is unchanged.
+                send_event(
+                    tx,
+                    VpnEvent::Down {
+                        interface_name: interface.to_string(),
+                    },
+                )
+                .await;
+            }
             VpnEvent::Up(VpnInfo {
                 interface_name: interface.to_string(),
                 dns_servers: last_dns.clone(),
@@ -393,7 +413,11 @@ async fn handle_line(
             // backend no-ops) instead of applying stale split-DNS rules. Only a
             // fresh `PUSH_REPLY` repopulates it. (A socket-level drop, by
             // contrast, emits no `Down` and keeps `last_dns` — see `run`.)
+            // Forget the connect time too: a real Down/Up pair is handled
+            // normally by the state machine, so the next `Up` must not be taken
+            // for a missed-Down restart.
             last_dns.clear();
+            *last_connected_at = None;
             VpnEvent::Down {
                 interface_name: interface.to_string(),
             }
@@ -661,12 +685,17 @@ mod tests {
         )
         .await;
 
+        // A genuine restart emits the missed Down first, then the Up.
+        match rx.try_recv().unwrap() {
+            VpnEvent::Down { interface_name } => assert_eq!(interface_name, "tun0"),
+            _ => panic!("expected a synthetic Down first"),
+        }
         match rx.try_recv().unwrap() {
             VpnEvent::Up(info) => assert!(
                 info.dns_servers.is_empty(),
                 "a new tunnel with no fresh PUSH_REPLY must not reuse the previous DNS"
             ),
-            _ => panic!("expected Up"),
+            _ => panic!("expected Up after the Down"),
         }
         assert_eq!(last_connected_at, Some(1700009999));
     }
@@ -738,13 +767,122 @@ mod tests {
         )
         .await;
 
+        // A genuine restart emits the missed Down first, then the Up with the
+        // fresh DNS.
+        match rx.try_recv().unwrap() {
+            VpnEvent::Down { interface_name } => assert_eq!(interface_name, "tun0"),
+            _ => panic!("expected a synthetic Down first"),
+        }
         match rx.try_recv().unwrap() {
             VpnEvent::Up(info) => assert_eq!(
                 info.dns_servers,
                 vec!["10.9.0.1".to_string()],
                 "a new tunnel's fresh PUSH_REPLY must replace the previous DNS"
             ),
-            _ => panic!("expected Up"),
+            _ => panic!("expected Up after the Down"),
         }
+    }
+
+    #[tokio::test]
+    async fn genuine_restart_with_unchanged_dns_forces_reapply_via_synthetic_down() {
+        // The P1 case: OpenVPN restarts and recreates the tun link (losing its
+        // per-link DNS) but pushes the *same* servers. Without the synthesized
+        // Down, the re-sampled Up would look already-converged to the state
+        // machine and split-DNS would stay off. The detector must emit Down then
+        // Up so the state machine reverts the stale snapshot and re-applies.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut dedup = Deduper::default();
+        let mut last_dns = vec!["10.8.0.1".to_string()];
+        let mut last_connected_at = Some(1700000000u64);
+        let mut dns_seen = false;
+
+        // The replay re-pushes the same DNS, then CONNECTED with a new connect time.
+        handle_line(
+            "1700009999,I,PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1,route 10.8.0.0'",
+            "tun0",
+            &mut dedup,
+            &mut last_dns,
+            &mut last_connected_at,
+            &mut dns_seen,
+            &tx,
+        )
+        .await;
+        handle_line(
+            "1700009999,CONNECTED,SUCCESS,10.8.0.2,192.0.2.10,1194,,",
+            "tun0",
+            &mut dedup,
+            &mut last_dns,
+            &mut last_connected_at,
+            &mut dns_seen,
+            &tx,
+        )
+        .await;
+
+        match rx.try_recv().unwrap() {
+            VpnEvent::Down { interface_name } => assert_eq!(interface_name, "tun0"),
+            _ => panic!("expected a synthetic Down to force a re-apply"),
+        }
+        match rx.try_recv().unwrap() {
+            VpnEvent::Up(info) => assert_eq!(
+                info.dns_servers,
+                vec!["10.8.0.1".to_string()],
+                "the Up after the synthetic Down re-applies the (unchanged) DNS"
+            ),
+            _ => panic!("expected Up after the Down"),
+        }
+    }
+
+    #[tokio::test]
+    async fn real_down_then_up_does_not_synthesize_a_duplicate_down() {
+        // A real OpenVPN Down clears `last_connected_at`, so the following Up is
+        // a normal fresh connect — handled by the real Down/Up pair, with no
+        // extra synthesized Down.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut dedup = Deduper::default();
+        let mut last_dns = vec!["10.8.0.1".to_string()];
+        let mut last_connected_at = Some(1700000000u64);
+        let mut dns_seen = false;
+
+        handle_line(
+            "1700000050,RECONNECTING,ping-restart,,,,,",
+            "tun0",
+            &mut dedup,
+            &mut last_dns,
+            &mut last_connected_at,
+            &mut dns_seen,
+            &tx,
+        )
+        .await;
+        // The real Down is forwarded; last_connected_at is cleared.
+        assert!(matches!(rx.try_recv().unwrap(), VpnEvent::Down { .. }));
+        assert_eq!(last_connected_at, None);
+
+        handle_line(
+            "1700009999,I,PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.9.0.1,route 10.9.0.0'",
+            "tun0",
+            &mut dedup,
+            &mut last_dns,
+            &mut last_connected_at,
+            &mut dns_seen,
+            &tx,
+        )
+        .await;
+        handle_line(
+            "1700009999,CONNECTED,SUCCESS,10.9.0.2,192.0.2.11,1194,,",
+            "tun0",
+            &mut dedup,
+            &mut last_dns,
+            &mut last_connected_at,
+            &mut dns_seen,
+            &tx,
+        )
+        .await;
+
+        // Only the Up — no synthesized Down (the real Down already happened).
+        match rx.try_recv().unwrap() {
+            VpnEvent::Up(info) => assert_eq!(info.dns_servers, vec!["10.9.0.1".to_string()]),
+            _ => panic!("expected a single Up with no extra Down"),
+        }
+        assert!(rx.try_recv().is_err(), "no second event expected");
     }
 }
