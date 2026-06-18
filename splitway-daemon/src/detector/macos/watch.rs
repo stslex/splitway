@@ -17,6 +17,15 @@
 //! thread stays parked in `CFRunLoop::run_current()` until the next event, and
 //! is otherwise reaped at process exit. That is acceptable for a daemon whose
 //! lifetime is the process's; it is not a leak that accumulates.
+//!
+//! The same laziness applies to a live watch **re-arm** (Phase 5): when the
+//! configured interface changes, the state machine drops this watch's receiver
+//! and arms a new one. This thread then stops on the next network/DNS change —
+//! which an interface switch reliably produces — so at most one superseded
+//! thread is parked at a time, and no stale event can reach the state machine
+//! (the receiver is gone, so `blocking_send` fails and the callback stops the
+//! run loop). NM / standalone-OpenVPN release promptly via `tx.closed()`; macOS
+//! trades that promptness for staying purely event-driven (no idle wakeups).
 
 use std::cell::RefCell;
 use std::rc::Rc;

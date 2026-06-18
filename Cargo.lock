@@ -2862,6 +2862,7 @@ version = "0.0.5"
 dependencies = [
  "core-foundation 0.9.4",
  "env_logger",
+ "libc",
  "log",
  "serde",
  "serde_json",

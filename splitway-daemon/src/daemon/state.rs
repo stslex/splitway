@@ -13,16 +13,41 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::AbortHandle;
 
 use splitway_shared::config::{self, LocalConfig, OpenVpnConfig};
-use splitway_shared::ipc::{ConfigView, Request, Response, StatusInfo};
-use splitway_shared::platform::{DnsBackend, PlatformError, VpnEvent, VpnInfo};
+use splitway_shared::ipc::{
+    AppliedInfo, ConfigView, DetectorHealth, Request, Response, RoutingState, StatusInfo,
+};
+use splitway_shared::platform::{DnsBackend, PlatformError, VpnDetector, VpnEvent, VpnInfo};
+
+use crate::interfaces::list_interfaces;
+
+/// Builds the platform VPN detector for a config. Injected into the
+/// [`StateMachine`] (like [`DnsBackend`]) so the re-arm lifecycle can be driven
+/// with a mock detector in tests instead of touching the real platform.
+pub trait DetectorFactory: Send + Sync {
+    fn create(&self, config: &LocalConfig) -> Box<dyn VpnDetector>;
+}
+
+/// Production factory: the real per-platform detector selected by `vpn_backend`.
+pub struct PlatformDetectorFactory;
+
+impl DetectorFactory for PlatformDetectorFactory {
+    fn create(&self, config: &LocalConfig) -> Box<dyn VpnDetector> {
+        crate::detector::create_vpn_detector(config)
+    }
+}
 
 /// Routine commands funneled into the state-owner task. Shutdown is delivered
 /// out-of-band (see [`run_state`]) so it can preempt a backlog of these.
 pub enum StateCommand {
-    /// A VPN up/down event from the detector.
-    Vpn(VpnEvent),
+    /// A VPN up/down event from the detector. `generation` identifies the watch
+    /// that produced it: [`StateMachine::arm_watch`] bumps the generation on
+    /// every (re-)arm, and a stale event from a torn-down watch is ignored (see
+    /// [`StateMachine::on_vpn_event`]), so an interface switch never lets the old
+    /// interface's last gasp move `vpn_up`.
+    Vpn { generation: u64, event: VpnEvent },
     /// An IPC request plus the channel to reply on.
     Ipc {
         request: Request,
@@ -43,6 +68,11 @@ struct Applied {
 
 pub struct StateMachine {
     backend: Arc<dyn DnsBackend>,
+    /// Builds the VPN detector on every (re-)arm. Injected for testability.
+    detector_factory: Arc<dyn DetectorFactory>,
+    /// A clone of the actor's own command sender, handed to each re-armed
+    /// forwarding task so it can feed `StateCommand::Vpn` back into the actor.
+    state_tx: mpsc::Sender<StateCommand>,
     config: LocalConfig,
     config_path: PathBuf,
     vpn_up: bool,
@@ -57,18 +87,117 @@ pub struct StateMachine {
     /// desired target equals the — now possibly stale — `applied` snapshot, so a
     /// post-failure "already converged" check can never skip a needed re-apply.
     needs_resync: bool,
+    /// Cancel handle for the current watch's forwarding task. Aborting it drops
+    /// the detector's `Receiver<VpnEvent>`, which closes the channel and lets the
+    /// detector release its resources (see [`Self::arm_watch`]).
+    watch_cancel: Option<AbortHandle>,
+    /// Monotonic id of the current watch, bumped on every (re-)arm. Events from a
+    /// superseded watch carry an old generation and are ignored.
+    watch_generation: u64,
+    /// Health of the current watch, set by [`Self::arm_watch`] and surfaced in
+    /// [`Self::status`].
+    detector_health: DetectorHealth,
 }
 
 impl StateMachine {
-    pub fn new(backend: Arc<dyn DnsBackend>, config: LocalConfig, config_path: PathBuf) -> Self {
+    pub fn new(
+        backend: Arc<dyn DnsBackend>,
+        detector_factory: Arc<dyn DetectorFactory>,
+        config: LocalConfig,
+        config_path: PathBuf,
+        state_tx: mpsc::Sender<StateCommand>,
+    ) -> Self {
         Self {
             backend,
+            detector_factory,
+            state_tx,
             config,
             config_path,
             vpn_up: false,
             last_info: None,
             applied: None,
             needs_resync: false,
+            watch_cancel: None,
+            watch_generation: 0,
+            // No watch is armed until `arm_watch` runs (in `run_state`, before
+            // the command loop). Inactive until then.
+            detector_health: DetectorHealth::Inactive,
+        }
+    }
+
+    /// (Re-)arm the VPN detector watch for the current config. Called once at
+    /// startup (from [`run_state`]) and again whenever a config change touches
+    /// the watch-affecting fields (see [`Self::adopt_config`]).
+    ///
+    /// In order: tear down the current watch (abort its forwarding task, which
+    /// drops the detector's `Receiver<VpnEvent>` and closes the channel), bump
+    /// the generation, then build and start the new watch.
+    ///
+    /// Teardown relies on each detector observing the closed channel:
+    /// - **NetworkManager** and **standalone OpenVPN** `select!` on `tx.closed()`
+    ///   at every await point, so the D-Bus connection / management socket is
+    ///   released promptly when the receiver drops.
+    /// - **macOS** (SCDynamicStore) is lazy by design — its CFRunLoop thread
+    ///   notices the dropped receiver on the next network/DNS change (which an
+    ///   interface switch reliably produces) and then stops; until then it sits
+    ///   parked. No stale events reach the actor (the receiver is gone), and the
+    ///   thread is reaped at process exit, so this is bounded, not a growing leak.
+    ///
+    /// There is **no separate post-arm `detect()` sample**: every detector emits
+    /// its current state as the first streamed event (NM samples the device
+    /// state on subscribe, OpenVPN issues `state`, macOS samples after arming),
+    /// so a one-shot `detect()` here would double-apply. We rely on that first
+    /// event to set `vpn_up` for the new interface.
+    fn arm_watch(&mut self) {
+        // Tear down the previous watch first. Aborting the forwarding task drops
+        // its receiver; the detector then releases its resources as documented.
+        if let Some(handle) = self.watch_cancel.take() {
+            handle.abort();
+        }
+        // Any event still in flight from the old forwarding task carries the old
+        // generation and is dropped by `on_vpn_event`.
+        self.watch_generation = self.watch_generation.wrapping_add(1);
+        let generation = self.watch_generation;
+
+        let interface = self.config.vpn_name.clone();
+        if interface.is_empty() {
+            // No interface to watch: auto-apply stays off until one is set. This
+            // is the intended startup-empty behaviour, not a failure.
+            log::info!("no vpn_name configured; VPN watch is inactive");
+            self.detector_health = DetectorHealth::Inactive;
+            return;
+        }
+
+        let detector = self.detector_factory.create(&self.config);
+        match detector.watch(&interface) {
+            Ok(mut events) => {
+                let state_tx = self.state_tx.clone();
+                let handle = tokio::spawn(async move {
+                    while let Some(event) = events.recv().await {
+                        if state_tx
+                            .send(StateCommand::Vpn { generation, event })
+                            .await
+                            .is_err()
+                        {
+                            break; // the state task is gone
+                        }
+                    }
+                    log::debug!("VPN event stream for generation {generation} ended");
+                });
+                self.watch_cancel = Some(handle.abort_handle());
+                self.detector_health = DetectorHealth::Active;
+                log::info!("armed VPN watch for {interface}");
+            }
+            Err(e) => {
+                // Auto-apply is off, but IPC stays up. The interface that was
+                // being watched before this arm was already reverted by the
+                // caller's reconcile, so nothing is stranded.
+                log::error!(
+                    "failed to start VPN watch for {interface}: {e}; \
+                     IPC is still available, auto-apply is not"
+                );
+                self.detector_health = DetectorHealth::Error(e.to_string());
+            }
         }
     }
 
@@ -217,6 +346,22 @@ impl StateMachine {
         }
     }
 
+    /// Entry point for a forwarded detector event. Drops events from a watch
+    /// generation we have since superseded (an interface switch may leave an
+    /// in-flight event from the old forwarding task), so the old interface's
+    /// last gasp can never move `vpn_up` after a re-arm. Live events flow on to
+    /// [`Self::on_event`].
+    pub async fn on_vpn_event(&mut self, generation: u64, event: VpnEvent) {
+        if generation != self.watch_generation {
+            log::debug!(
+                "ignoring VPN event from superseded watch (generation {generation}, current {})",
+                self.watch_generation
+            );
+            return;
+        }
+        self.on_event(event).await;
+    }
+
     pub async fn on_event(&mut self, event: VpnEvent) {
         match event {
             VpnEvent::Up(info) => {
@@ -249,6 +394,12 @@ impl StateMachine {
             Request::ReloadConfig => self.reload_config().await,
             Request::GetConfig => Response::Config(self.config_view()),
             Request::SetConfig(view) => self.set_config(view).await,
+            Request::ListInterfaces => match list_interfaces() {
+                Ok(interfaces) => Response::Interfaces(interfaces),
+                // Enumeration failure is a clean error to the client, never a
+                // panic — the GUI falls back to free-text entry.
+                Err(e) => Response::Error(format!("failed to list interfaces: {e}")),
+            },
         }
     }
 
@@ -276,8 +427,53 @@ impl StateMachine {
             enabled: self.config.enabled,
             interface: self.config.vpn_name.clone(),
             vpn_up: self.vpn_up,
-            applied: self.applied.is_some(),
+            // Map the private `Applied` snapshot to the wire projection: `None`
+            // recovers the old "applied?" bool, and `Some` exposes the live
+            // domain → DNS mapping for client-side verification.
+            applied: self.applied.as_ref().map(|a| AppliedInfo {
+                interface: a.interface.clone(),
+                domains: a.domains.clone(),
+                dns_servers: a.dns_servers.clone(),
+            }),
+            routing_state: self.routing_state(),
+            detector_health: self.detector_health.clone(),
             domains: self.config.vpn_hosts.clone(),
+        }
+    }
+
+    /// Summarize *why* routing is or is not active, mapped from the same inputs
+    /// [`Self::desired`] uses plus `needs_resync`. Belief, not reality: it
+    /// reports what the daemon intends, not a read-back of the live system.
+    ///
+    /// The branches mirror `desired()` in priority order (most fundamental
+    /// first). There is deliberately no `InterfaceMismatch` variant: live re-arm
+    /// resets `vpn_up`/`last_info` on a switch and only the configured
+    /// interface's watch repopulates them, so `last_info.interface_name` always
+    /// matches `config.vpn_name` while up; a stale mismatch (were it ever to
+    /// occur) is reported as `NoDnsFromVpn` rather than a near-unreachable state.
+    fn routing_state(&self) -> RoutingState {
+        if !self.config.enabled {
+            return RoutingState::Disabled;
+        }
+        if self.config.vpn_hosts.is_empty() {
+            return RoutingState::NoDomains;
+        }
+        if !self.vpn_up {
+            return RoutingState::VpnDown;
+        }
+        let has_vpn_dns = matches!(
+            &self.last_info,
+            Some(info)
+                if !info.dns_servers.is_empty() && info.interface_name == self.config.vpn_name
+        );
+        if !has_vpn_dns {
+            return RoutingState::NoDnsFromVpn;
+        }
+        // Up with usable DNS: rules should be applied. Distinguish a clean apply
+        // from a pending/failed one (a failed apply/revert sets `needs_resync`).
+        match (&self.applied, self.needs_resync) {
+            (Some(_), false) => RoutingState::Applied,
+            _ => RoutingState::ApplyFailed,
         }
     }
 
@@ -317,16 +513,10 @@ impl StateMachine {
 
     async fn reload_config(&mut self) -> Response {
         match config::load_config_from(&self.config_path) {
-            Ok(next) => {
-                self.warn_on_restart_only_changes(&next);
-                self.config = next;
-                match self.reconcile().await {
-                    Ok(()) => Response::Ok,
-                    Err(e) => {
-                        Response::Error(format!("config reloaded, but applying it failed: {e}"))
-                    }
-                }
-            }
+            Ok(next) => match self.adopt_config(next).await {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error(format!("config reloaded, but applying it failed: {e}")),
+            },
             Err(e) => Response::Error(format!("failed to reload config: {e}")),
         }
     }
@@ -369,46 +559,61 @@ impl StateMachine {
                     .to_string(),
             );
         }
-        self.warn_on_restart_only_changes(&next);
+        // A watch-affecting change (vpn_name / vpn_backend / openvpn) now takes
+        // effect live: `commit` -> `adopt_config` re-arms the watch, so there is
+        // no restart caveat to warn about anymore.
         self.commit(next).await
     }
 
-    /// Warn when a pending config change touches fields whose effect needs a
-    /// daemon restart: the interface watch and detector are set up once at
-    /// startup and are not re-armed on a live change. Must be called before
-    /// `self.config` is replaced, so it compares against the current config.
-    fn warn_on_restart_only_changes(&self, next: &LocalConfig) {
-        if next.vpn_name != self.config.vpn_name {
-            log::warn!(
-                "config change updated vpn_name {} -> {}; the interface change \
-                 takes effect after a daemon restart",
-                self.config.vpn_name,
-                next.vpn_name
-            );
-        }
-        if next.vpn_backend != self.config.vpn_backend || next.openvpn != self.config.openvpn {
-            log::warn!(
-                "config change updated the VPN detector settings (vpn_backend/openvpn); \
-                 the detector is selected and its watcher spawned once at startup and is not \
-                 restarted on a live change, so this takes effect only after a daemon restart"
-            );
-        }
-    }
-
     /// Persist `next` first; only adopt it in memory if the write succeeds,
-    /// then reconcile. This keeps the in-memory config and disk in lockstep.
-    /// A persisted change whose re-apply fails is reported as an error so the
-    /// caller is not told "ok" while DNS is out of sync.
+    /// then reconcile (re-arming the watch if the watch-affecting fields
+    /// changed — see [`Self::adopt_config`]). This keeps the in-memory config
+    /// and disk in lockstep. A persisted change whose re-apply fails is reported
+    /// as an error so the caller is not told "ok" while DNS is out of sync.
     async fn commit(&mut self, next: LocalConfig) -> Response {
         if let Err(e) = config::save_config_to(&self.config_path, &next) {
             return Response::Error(format!("failed to persist config: {e}"));
         }
-        self.config = next;
-        match self.reconcile().await {
+        match self.adopt_config(next).await {
             Ok(()) => Response::Ok,
             Err(e) => Response::Error(format!("config saved, but applying it failed: {e}")),
         }
     }
+
+    /// Adopt `next` as the live config and reconcile. When the watch-affecting
+    /// fields (`vpn_name` / `vpn_backend` / `openvpn`) changed, this performs the
+    /// live re-arm: reset the VPN state (`vpn_up` / `last_info`), reconcile —
+    /// which now reverts the old interface, because the reset makes `desired()`
+    /// return `None` — and only **then** arm the new watch. Reverting before
+    /// arming preserves the "no half-configured state" guarantee across a switch.
+    /// The new watch's first streamed event re-establishes `vpn_up` for the new
+    /// interface (no separate sample — see [`Self::arm_watch`]).
+    ///
+    /// Returns the reconcile outcome; the watch is (re-)armed regardless of it,
+    /// so a failed old-interface revert still does not block bringing the new
+    /// watch up.
+    async fn adopt_config(&mut self, next: LocalConfig) -> Result<(), PlatformError> {
+        let rearm = watch_settings_changed(&self.config, &next);
+        self.config = next;
+        if rearm {
+            // Forget the old interface's state so `desired()` -> `None` and the
+            // reconcile below reverts it; the new watch will resample.
+            self.vpn_up = false;
+            self.last_info = None;
+        }
+        let result = self.reconcile().await;
+        if rearm {
+            self.arm_watch();
+        }
+        result
+    }
+}
+
+/// Whether a config delta requires re-arming the detector watch — i.e. it
+/// touches a field the watch is keyed on. Domain/`enabled` edits do not (those
+/// only change `desired()`), so they reconcile without tearing the watch down.
+fn watch_settings_changed(old: &LocalConfig, new: &LocalConfig) -> bool {
+    old.vpn_name != new.vpn_name || old.vpn_backend != new.vpn_backend || old.openvpn != new.openvpn
 }
 
 /// The state-owner task loop. Owns the [`StateMachine`] outright.
@@ -422,6 +627,10 @@ pub async fn run_state(
     mut rx: mpsc::Receiver<StateCommand>,
     mut shutdown: oneshot::Receiver<oneshot::Sender<bool>>,
 ) {
+    // Arm the VPN watch once here, before the command loop, so all watch
+    // lifecycle (start at boot, re-arm on config change) lives in one owner —
+    // the actor — rather than being split with `run_async`.
+    machine.arm_watch();
     loop {
         tokio::select! {
             biased;
@@ -436,7 +645,9 @@ pub async fn run_state(
 
             command = rx.recv() => {
                 match command {
-                    Some(StateCommand::Vpn(event)) => machine.on_event(event).await,
+                    Some(StateCommand::Vpn { generation, event }) => {
+                        machine.on_vpn_event(generation, event).await
+                    }
                     Some(StateCommand::Ipc { request, reply }) => {
                         let response = machine.on_request(request).await;
                         // The client may have hung up; that is fine.
@@ -452,8 +663,10 @@ pub async fn run_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::time::Duration;
 
     /// Records what the state machine asks the backend to do. `fail_apply` /
     /// `fail_revert` are atomic so a test can flip them after a first call.
@@ -504,6 +717,143 @@ mod tests {
         }
     }
 
+    /// A detector factory that never arms a live watch — its `watch` returns an
+    /// already-closed stream. Used by the transition/IPC tests, which drive
+    /// `on_event`/`on_request` directly and only incidentally re-arm (a config
+    /// change), so they need an arming target that produces no events.
+    struct NoopDetectorFactory;
+
+    impl DetectorFactory for NoopDetectorFactory {
+        fn create(&self, _config: &LocalConfig) -> Box<dyn VpnDetector> {
+            Box::new(NoopDetector)
+        }
+    }
+
+    struct NoopDetector;
+
+    impl VpnDetector for NoopDetector {
+        fn detect(&self, interface: &str) -> Result<VpnInfo, PlatformError> {
+            Err(PlatformError::VpnNotFound(interface.to_string()))
+        }
+
+        fn watch(
+            &self,
+            _interface: &str,
+        ) -> Result<tokio::sync::mpsc::Receiver<VpnEvent>, PlatformError> {
+            // Drop the sender: an idle, immediately-closed stream.
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+    }
+
+    /// Shared state for [`MockDetectorFactory`]: which interfaces' `watch` should
+    /// fail, and a record of every watch armed (so a test can assert the old
+    /// watch was torn down on re-arm).
+    #[derive(Default)]
+    struct MockDetectorShared {
+        fail: Mutex<HashSet<String>>,
+        watches: Mutex<Vec<Arc<WatchRecord>>>,
+    }
+
+    /// One armed mock watch. `stopped` flips to `true` when the forwarding task
+    /// is aborted and the receiver drops — mirroring how a real detector
+    /// observes `tx.closed()` and releases its resources.
+    struct WatchRecord {
+        interface: String,
+        stopped: AtomicBool,
+    }
+
+    /// A scriptable detector for the re-arm tests. Each `watch` emits the current
+    /// state as its first event (an `Up` with DNS — like the real detectors'
+    /// post-arm sample), then idles until the receiver drops, recording the
+    /// teardown. A configured interface fails to arm.
+    struct MockDetectorFactory {
+        shared: Arc<MockDetectorShared>,
+    }
+
+    impl DetectorFactory for MockDetectorFactory {
+        fn create(&self, _config: &LocalConfig) -> Box<dyn VpnDetector> {
+            Box::new(MockDetector {
+                shared: self.shared.clone(),
+            })
+        }
+    }
+
+    struct MockDetector {
+        shared: Arc<MockDetectorShared>,
+    }
+
+    impl VpnDetector for MockDetector {
+        fn detect(&self, interface: &str) -> Result<VpnInfo, PlatformError> {
+            Ok(VpnInfo {
+                interface_name: interface.to_string(),
+                dns_servers: vec!["10.0.0.1".to_string()],
+            })
+        }
+
+        fn watch(
+            &self,
+            interface: &str,
+        ) -> Result<tokio::sync::mpsc::Receiver<VpnEvent>, PlatformError> {
+            if self.shared.fail.lock().unwrap().contains(interface) {
+                return Err(PlatformError::CommandFailed(format!(
+                    "mock watch failed for {interface}"
+                )));
+            }
+            let record = Arc::new(WatchRecord {
+                interface: interface.to_string(),
+                stopped: AtomicBool::new(false),
+            });
+            self.shared.watches.lock().unwrap().push(record.clone());
+
+            let (tx, rx) = mpsc::channel(8);
+            let iface = interface.to_string();
+            tokio::spawn(async move {
+                // Emit the current state as the first event (the post-arm sample
+                // the real detectors stream), so `vpn_up` tracks the new
+                // interface without a separate `detect()`.
+                let _ = tx
+                    .send(VpnEvent::Up(VpnInfo {
+                        interface_name: iface,
+                        dns_servers: vec!["10.0.0.1".to_string()],
+                    }))
+                    .await;
+                // Then release on receiver drop, like NM/OpenVPN's `tx.closed()`.
+                tx.closed().await;
+                record.stopped.store(true, Ordering::SeqCst);
+            });
+            Ok(rx)
+        }
+    }
+
+    /// Process the next forwarded VPN event (bounded wait), simulating the
+    /// `run_state` loop's `Vpn` arm so the re-arm tests can drive the watch's
+    /// streamed sample through `on_vpn_event` without spawning `run_state`.
+    async fn pump_one_vpn_event(
+        sm: &mut StateMachine,
+        rx: &mut mpsc::Receiver<StateCommand>,
+    ) -> bool {
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(StateCommand::Vpn { generation, event })) => {
+                sm.on_vpn_event(generation, event).await;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Poll `predicate` until true or a generous timeout elapses. Used to await
+    /// an asynchronous teardown (the old watch observing its closed channel).
+    async fn wait_until(predicate: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if predicate() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("condition was not met within the timeout");
+    }
+
     fn temp_config_path(tag: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
         dir.push(format!("splitway-state-test-{}-{tag}", std::process::id()));
@@ -529,7 +879,32 @@ mod tests {
     }
 
     fn machine(backend: Arc<MockBackend>, cfg: LocalConfig, tag: &str) -> StateMachine {
-        StateMachine::new(backend, cfg, temp_config_path(tag))
+        // A throwaway command sender: these tests drive `on_event`/`on_request`
+        // directly and never consume forwarded events, so the receiver is
+        // dropped. The Noop factory never produces events anyway.
+        let (state_tx, _state_rx) = mpsc::channel(16);
+        StateMachine::new(
+            backend,
+            Arc::new(NoopDetectorFactory),
+            cfg,
+            temp_config_path(tag),
+            state_tx,
+        )
+    }
+
+    /// Build a machine wired to a [`MockDetectorFactory`], keeping the command
+    /// receiver so the re-arm tests can pump the watch's forwarded events
+    /// (see [`pump_one_vpn_event`]).
+    fn rearm_machine(
+        backend: Arc<MockBackend>,
+        shared: Arc<MockDetectorShared>,
+        cfg: LocalConfig,
+        tag: &str,
+    ) -> (StateMachine, mpsc::Receiver<StateCommand>) {
+        let (state_tx, state_rx) = mpsc::channel(16);
+        let factory = Arc::new(MockDetectorFactory { shared });
+        let sm = StateMachine::new(backend, factory, cfg, temp_config_path(tag), state_tx);
+        (sm, state_rx)
     }
 
     #[tokio::test]
@@ -764,8 +1139,10 @@ mod tests {
         let resp = sm.on_request(Request::ReloadConfig).await;
 
         assert_eq!(resp, Response::Ok);
-        // The old interface's rules are reverted; nothing is applied to the new
-        // interface (its watch is not started until a restart).
+        // The old interface's rules are reverted before the new watch is armed.
+        // Nothing is applied to the new interface in this test because its watch
+        // produces no events here (the live-switch apply on the new interface is
+        // covered by the mock-detector re-arm tests below).
         assert_eq!(backend.reverts.lock().unwrap().as_slice(), &["wg0"]);
         assert!(sm.applied.is_none());
     }
@@ -798,7 +1175,13 @@ mod tests {
         };
         assert!(info.enabled);
         assert!(info.vpn_up);
-        assert!(info.applied);
+        // `applied` is now the wire mapping: Some when rules are applied, with
+        // the interface / domains / DNS the daemon believes it installed.
+        let applied = info.applied.expect("rules should be applied");
+        assert_eq!(applied.interface, "wg0");
+        assert_eq!(applied.domains, vec!["a.com"]);
+        assert_eq!(applied.dns_servers, vec!["10.0.0.1"]);
+        assert_eq!(info.routing_state, RoutingState::Applied);
         assert_eq!(info.interface, "wg0");
         assert_eq!(info.domains, vec!["a.com"]);
     }
@@ -1080,5 +1463,238 @@ mod tests {
         assert!(matches!(resp, Response::Error(_)));
         assert_eq!(sm.config.vpn_backend, config::VpnBackend::NetworkManager);
         assert!(sm.config.openvpn.management.is_empty());
+    }
+
+    // --- Phase 5: re-arm decision, routing-state mapping, generation guard ---
+
+    #[test]
+    fn watch_settings_changed_detects_only_watch_fields() {
+        let base = config(true, &["a.com"]);
+        assert!(!watch_settings_changed(&base, &base.clone()));
+
+        // Domain / `enabled` edits do NOT require a re-arm (the watch is not
+        // keyed on them — they only change `desired()`).
+        let mut more_domains = base.clone();
+        more_domains.vpn_hosts.push("b.com".to_string());
+        assert!(!watch_settings_changed(&base, &more_domains));
+        let mut disabled = base.clone();
+        disabled.enabled = false;
+        assert!(!watch_settings_changed(&base, &disabled));
+
+        // vpn_name / vpn_backend / openvpn changes DO.
+        let mut iface = base.clone();
+        iface.vpn_name = "wg1".to_string();
+        assert!(watch_settings_changed(&base, &iface));
+        let mut backend = base.clone();
+        backend.vpn_backend = config::VpnBackend::OpenVpn;
+        assert!(watch_settings_changed(&base, &backend));
+        let mut ovpn = base.clone();
+        ovpn.openvpn.management = "127.0.0.1:7505".to_string();
+        assert!(watch_settings_changed(&base, &ovpn));
+    }
+
+    #[tokio::test]
+    async fn routing_state_maps_each_branch() {
+        // Disabled.
+        let sm = machine(
+            Arc::new(MockBackend::default()),
+            config(false, &["a.com"]),
+            "rs-disabled",
+        );
+        assert_eq!(sm.routing_state(), RoutingState::Disabled);
+
+        // No domains configured.
+        let sm = machine(
+            Arc::new(MockBackend::default()),
+            config(true, &[]),
+            "rs-nodomains",
+        );
+        assert_eq!(sm.routing_state(), RoutingState::NoDomains);
+
+        // Enabled + domains but the VPN is not up.
+        let sm = machine(
+            Arc::new(MockBackend::default()),
+            config(true, &["a.com"]),
+            "rs-down",
+        );
+        assert_eq!(sm.routing_state(), RoutingState::VpnDown);
+
+        // Up, but the VPN pushed no DNS.
+        let mut sm = machine(
+            Arc::new(MockBackend::default()),
+            config(true, &["a.com"]),
+            "rs-nodns",
+        );
+        sm.on_event(VpnEvent::Up(VpnInfo {
+            interface_name: "wg0".to_string(),
+            dns_servers: Vec::new(),
+        }))
+        .await;
+        assert_eq!(sm.routing_state(), RoutingState::NoDnsFromVpn);
+
+        // Up with DNS and rules applied.
+        let mut sm = machine(
+            Arc::new(MockBackend::default()),
+            config(true, &["a.com"]),
+            "rs-applied",
+        );
+        sm.on_event(vpn_up("wg0")).await;
+        assert_eq!(sm.routing_state(), RoutingState::Applied);
+
+        // Up with DNS but the apply failed (needs_resync).
+        let backend = Arc::new(MockBackend {
+            fail_apply: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let mut sm = machine(backend, config(true, &["a.com"]), "rs-failed");
+        sm.on_event(vpn_up("wg0")).await;
+        assert_eq!(sm.routing_state(), RoutingState::ApplyFailed);
+    }
+
+    #[tokio::test]
+    async fn on_vpn_event_ignores_superseded_generation() {
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend.clone(), config(true, &["a.com"]), "gen-guard");
+
+        // `watch_generation` starts at 0 in this harness (no `arm_watch`). An
+        // event tagged with a different generation — a torn-down watch's last
+        // gasp — is dropped, so it can never move `vpn_up`.
+        sm.on_vpn_event(99, vpn_up("wg0")).await;
+        assert!(!sm.vpn_up);
+        assert!(backend.applies.lock().unwrap().is_empty());
+
+        // An event from the current generation is processed normally.
+        sm.on_vpn_event(0, vpn_up("wg0")).await;
+        assert!(sm.vpn_up);
+        assert_eq!(backend.applies.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rearm_switches_interface_reverts_old_and_applies_new() {
+        let backend = Arc::new(MockBackend::default());
+        let shared = Arc::new(MockDetectorShared::default());
+        let (mut sm, mut rx) = rearm_machine(
+            backend.clone(),
+            shared.clone(),
+            config(true, &["a.com"]),
+            "rearm-switch",
+        );
+
+        // Startup arm (generation 1) for wg0; its streamed sample applies on wg0.
+        sm.arm_watch();
+        assert!(
+            pump_one_vpn_event(&mut sm, &mut rx).await,
+            "wg0 sample expected"
+        );
+        {
+            let applies = backend.applies.lock().unwrap();
+            assert_eq!(applies.len(), 1);
+            assert_eq!(applies[0].0, "wg0");
+        }
+        assert!(sm.vpn_up);
+
+        // Switch the configured interface to wg1.
+        let view = ConfigView {
+            vpn_name: "wg1".to_string(),
+            vpn_backend: config::VpnBackend::default(),
+            openvpn_management: String::new(),
+            openvpn_management_password_file: None,
+            config_path: String::new(),
+        };
+        assert_eq!(sm.on_request(Request::SetConfig(view)).await, Response::Ok);
+
+        // The old interface was reverted before the new watch armed.
+        assert!(backend.reverts.lock().unwrap().contains(&"wg0".to_string()));
+
+        // The new watch (generation 2) streams its sample → applies on wg1.
+        assert!(
+            pump_one_vpn_event(&mut sm, &mut rx).await,
+            "wg1 sample expected"
+        );
+        assert!(backend
+            .applies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(iface, _)| iface == "wg1"));
+
+        // vpn_up + status now track the new interface.
+        let Response::Status(info) = sm.on_request(Request::Status).await else {
+            panic!("expected Status");
+        };
+        assert!(info.vpn_up);
+        assert_eq!(info.applied.as_ref().unwrap().interface, "wg1");
+        assert_eq!(info.detector_health, DetectorHealth::Active);
+        assert_eq!(info.routing_state, RoutingState::Applied);
+
+        // The old wg0 watch was torn down (it observed the closed channel).
+        let wg0 = shared
+            .watches
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|w| w.interface == "wg0")
+            .cloned()
+            .expect("wg0 watch recorded");
+        wait_until(|| wg0.stopped.load(Ordering::SeqCst)).await;
+    }
+
+    #[tokio::test]
+    async fn rearm_failure_sets_detector_error_keeps_ipc_and_reverts_old() {
+        let backend = Arc::new(MockBackend::default());
+        let shared = Arc::new(MockDetectorShared::default());
+        // The new interface's watch will fail to start.
+        shared.fail.lock().unwrap().insert("tun9".to_string());
+        let (mut sm, mut rx) = rearm_machine(
+            backend.clone(),
+            shared.clone(),
+            config(true, &["a.com"]),
+            "rearm-fail",
+        );
+
+        // Startup arm + sample on wg0.
+        sm.arm_watch();
+        assert!(pump_one_vpn_event(&mut sm, &mut rx).await);
+        assert_eq!(backend.applies.lock().unwrap().len(), 1);
+
+        // Switch to tun9, whose watch cannot start.
+        let view = ConfigView {
+            vpn_name: "tun9".to_string(),
+            vpn_backend: config::VpnBackend::default(),
+            openvpn_management: String::new(),
+            openvpn_management_password_file: None,
+            config_path: String::new(),
+        };
+        // The save + old-interface revert succeeded, so SetConfig returns Ok; the
+        // arm failure is surfaced via detector_health, not by failing the save.
+        assert_eq!(sm.on_request(Request::SetConfig(view)).await, Response::Ok);
+        assert!(backend.reverts.lock().unwrap().contains(&"wg0".to_string()));
+
+        // IPC still answers, reporting the failed detector and no apply on tun9.
+        let Response::Status(info) = sm.on_request(Request::Status).await else {
+            panic!("expected Status");
+        };
+        assert!(matches!(info.detector_health, DetectorHealth::Error(_)));
+        assert!(info.applied.is_none());
+        assert!(!info.vpn_up);
+        assert_eq!(info.routing_state, RoutingState::VpnDown);
+
+        // The old wg0 watch was still torn down on the failed re-arm, and no
+        // watch was ever recorded for tun9 (its `watch` errored first).
+        let wg0 = shared
+            .watches
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|w| w.interface == "wg0")
+            .cloned()
+            .expect("wg0 watch recorded");
+        wait_until(|| wg0.stopped.load(Ordering::SeqCst)).await;
+        assert!(shared
+            .watches
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|w| w.interface != "tun9"));
     }
 }

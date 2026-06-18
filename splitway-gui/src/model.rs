@@ -6,7 +6,9 @@
 
 use splitway_shared::config::VpnBackend;
 use splitway_shared::ipc::client::ClientError;
-use splitway_shared::ipc::{ConfigView, Response, VERSION_MISMATCH_PREFIX};
+use splitway_shared::ipc::{
+    AppliedInfo, ConfigView, InterfaceInfo, Request, Response, VERSION_MISMATCH_PREFIX,
+};
 
 /// Health of the link to the daemon, classified from the most recent
 /// round-trip. Drives the connection banner and whether the live status block
@@ -150,15 +152,81 @@ pub fn validate_config_fields(view: &ConfigView) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether the edited `vpn_name` differs from the daemon's currently-active
-/// interface — i.e. there is an unsaved interface change. The detector watch is
-/// armed once at startup and is not restarted on a live config change, so such a
-/// change needs a daemon restart to auto-apply on the new interface; the UI uses
-/// this to flag the pending change. (`vpn_backend` carries the same restart
-/// caveat, but the live backend is not exposed in `StatusInfo`, so the UI
-/// surfaces that part as an always-on note rather than a diff against live.)
-pub fn interface_change_needs_restart(edited_vpn_name: &str, live_interface: &str) -> bool {
-    edited_vpn_name.trim() != live_interface
+/// One entry in the GUI's interface picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceChoice {
+    /// The interface name to write into `vpn_name` if selected.
+    pub name: String,
+    /// The display label, e.g. `tun0 (up, vpn)` or `eth0 (down)`.
+    pub label: String,
+    /// True when this entry is the currently-configured interface that the
+    /// daemon did not enumerate (absent or down) — kept so the user's choice is
+    /// never dropped from the picker just because the VPN is not up right now.
+    pub configured_but_absent: bool,
+}
+
+/// Build the interface-picker entries from the daemon's enumerated interfaces
+/// plus the currently-configured `vpn_name`. The live interfaces come first
+/// (already sorted up-first / vpn-like-first by the daemon). If the configured
+/// name is non-empty and not among them — a VPN that is not up right now — it is
+/// appended so it stays visible and selectable; an empty configured name adds no
+/// synthetic entry. The free-text field in the editor remains the fallback when
+/// the list is empty (enumeration unavailable).
+pub fn interface_choices(interfaces: &[InterfaceInfo], configured: &str) -> Vec<InterfaceChoice> {
+    let mut choices: Vec<InterfaceChoice> = interfaces
+        .iter()
+        .map(|iface| InterfaceChoice {
+            name: iface.name.clone(),
+            label: interface_label(iface),
+            configured_but_absent: false,
+        })
+        .collect();
+
+    let configured = configured.trim();
+    if !configured.is_empty() && !interfaces.iter().any(|iface| iface.name == configured) {
+        choices.push(InterfaceChoice {
+            name: configured.to_string(),
+            label: format!("{configured} (configured, not present)"),
+            configured_but_absent: true,
+        });
+    }
+    choices
+}
+
+/// The display label for one enumerated interface: name plus up/down and a `vpn`
+/// hint when the daemon flagged it VPN-like.
+fn interface_label(iface: &InterfaceInfo) -> String {
+    let state = if iface.up { "up" } else { "down" };
+    if iface.vpn_like {
+        format!("{} ({state}, vpn)", iface.name)
+    } else {
+        format!("{} ({state})", iface.name)
+    }
+}
+
+/// The requests that refresh the view after a successful mutation or a resync:
+/// always `Status` + `GetConfig`, plus `ListInterfaces` when the interface set
+/// or selection may have changed (`include_interfaces` — a config save or a
+/// resync, but not enable/disable/add/remove, which never touch the interfaces).
+pub fn refresh_requests(include_interfaces: bool) -> Vec<Request> {
+    let mut requests = vec![Request::Status, Request::GetConfig];
+    if include_interfaces {
+        requests.push(Request::ListInterfaces);
+    }
+    requests
+}
+
+/// A one-line summary of [`StatusInfo::applied`][applied] for the status block:
+/// the interface → domains → DNS mapping when applied, else a plain note. The
+/// only decision here is `None` vs `Some`; the mapping itself reuses
+/// `AppliedInfo`'s shared `Display`.
+///
+/// [applied]: splitway_shared::ipc::StatusInfo::applied
+pub fn applied_summary(applied: &Option<AppliedInfo>) -> String {
+    match applied {
+        None => "(nothing applied)".to_string(),
+        Some(applied) => applied.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -204,12 +272,14 @@ mod tests {
 
     #[test]
     fn status_result_reduces_to_connected() {
-        use splitway_shared::ipc::StatusInfo;
+        use splitway_shared::ipc::{DetectorHealth, RoutingState, StatusInfo};
         let ok = Ok(Response::Status(StatusInfo {
             enabled: true,
             interface: "wg0".to_string(),
             vpn_up: true,
-            applied: true,
+            applied: None,
+            routing_state: RoutingState::VpnDown,
+            detector_health: DetectorHealth::Active,
             domains: vec![],
         }));
         let state = reduce_status_result(&ok);
@@ -303,10 +373,75 @@ mod tests {
         assert!(validate_config_fields(&view(VpnBackend::NetworkManager, "")).is_ok());
     }
 
+    fn iface(name: &str, up: bool, vpn_like: bool) -> InterfaceInfo {
+        InterfaceInfo {
+            name: name.to_string(),
+            up,
+            vpn_like,
+        }
+    }
+
     #[test]
-    fn restart_caveat_triggers_on_interface_change() {
-        assert!(interface_change_needs_restart("tun1", "tun0"));
-        assert!(!interface_change_needs_restart("tun0", "tun0"));
-        assert!(!interface_change_needs_restart("  tun0 ", "tun0"));
+    fn interface_choices_keep_daemon_order_and_label_state() {
+        let interfaces = [iface("tun0", true, true), iface("eth0", false, false)];
+        let choices = interface_choices(&interfaces, "tun0");
+        // The configured interface is present, so no synthetic entry is added.
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].name, "tun0");
+        assert_eq!(choices[0].label, "tun0 (up, vpn)");
+        assert!(!choices[0].configured_but_absent);
+        assert_eq!(choices[1].label, "eth0 (down)");
+    }
+
+    #[test]
+    fn interface_choices_keep_a_configured_but_absent_interface() {
+        // The configured VPN is not up right now, so the daemon did not list it.
+        let interfaces = [iface("eth0", true, false)];
+        let choices = interface_choices(&interfaces, "tun7");
+        assert_eq!(choices.len(), 2);
+        let configured = choices.last().unwrap();
+        assert_eq!(configured.name, "tun7");
+        assert!(configured.configured_but_absent);
+        assert!(configured.label.contains("not present"));
+    }
+
+    #[test]
+    fn interface_choices_add_nothing_for_an_empty_or_listed_name() {
+        // Empty configured name -> no synthetic entry.
+        assert_eq!(
+            interface_choices(&[iface("eth0", true, false)], "   ").len(),
+            1
+        );
+        // Whitespace-padded configured name that IS listed -> no duplicate.
+        assert_eq!(
+            interface_choices(&[iface("tun0", true, true)], " tun0 ").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn refresh_requests_include_interfaces_only_when_asked() {
+        assert_eq!(
+            refresh_requests(false),
+            vec![Request::Status, Request::GetConfig]
+        );
+        assert_eq!(
+            refresh_requests(true),
+            vec![Request::Status, Request::GetConfig, Request::ListInterfaces]
+        );
+    }
+
+    #[test]
+    fn applied_summary_reads_none_and_the_mapping() {
+        assert_eq!(applied_summary(&None), "(nothing applied)");
+        let applied = Some(AppliedInfo {
+            interface: "wg0".to_string(),
+            domains: vec!["a.com".to_string(), "b.com".to_string()],
+            dns_servers: vec!["10.0.0.1".to_string()],
+        });
+        assert_eq!(
+            applied_summary(&applied),
+            "wg0 -> [a.com, b.com] via [10.0.0.1]"
+        );
     }
 }

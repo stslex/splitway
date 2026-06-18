@@ -15,11 +15,11 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use splitway_shared::config::VpnBackend;
-use splitway_shared::ipc::{ConfigView, Request, Response, StatusInfo};
+use splitway_shared::ipc::{ConfigView, InterfaceInfo, Request, Response, StatusInfo};
 
 use crate::model::{
-    self, classify_client_error, interface_change_needs_restart, reduce_action_result,
-    reduce_status_result, ConnectionState, Health,
+    self, classify_client_error, reduce_action_result, reduce_status_result, ConnectionState,
+    Health,
 };
 use crate::worker::{self, Job, Reply};
 
@@ -72,6 +72,9 @@ struct SplitwayApp {
 
     // --- live status (from Status polls) ---
     status: Option<StatusInfo>,
+    /// The host's interfaces, from `ListInterfaces`, populating the picker.
+    /// Refreshed on connect, on the poll, after a save, and after a resync.
+    interfaces: Vec<InterfaceInfo>,
     connection: ConnectionState,
     /// Connection health at the previous poll, to detect a (re)connection edge
     /// and re-fetch the config then.
@@ -108,6 +111,7 @@ impl SplitwayApp {
             inflight: false,
             last_poll: Instant::now(),
             status: None,
+            interfaces: Vec::new(),
             connection: ConnectionState::default(),
             last_health: Health::Unknown,
             new_domain: String::new(),
@@ -132,6 +136,24 @@ impl SplitwayApp {
         self.pending.push_back(request);
     }
 
+    /// Queue a request only if an identical one is not already pending, so a
+    /// refresh (Status / GetConfig / ListInterfaces) triggered from several
+    /// places at once is not double-sent.
+    fn enqueue_unique(&mut self, request: Request) {
+        if !self.pending.contains(&request) {
+            self.pending.push_back(request);
+        }
+    }
+
+    /// Refresh the view after a mutation or a resync: re-fetch `Status` +
+    /// `GetConfig`, plus `ListInterfaces` when the interface set or selection may
+    /// have changed (a save or a resync). The periodic poll remains the backstop.
+    fn refresh_view(&mut self, include_interfaces: bool) {
+        for request in model::refresh_requests(include_interfaces) {
+            self.enqueue_unique(request);
+        }
+    }
+
     /// Send the next queued request if no request is in flight.
     fn pump(&mut self) {
         if self.inflight {
@@ -153,17 +175,16 @@ impl SplitwayApp {
                 Request::Status => {
                     self.connection = reduce_status_result(&reply.result);
                     let now = self.connection.health;
-                    // (Re)connection edge → (re)fetch the editable config, so the
-                    // editor and the read-only active-config path are never left
-                    // stale across a daemon restart (which may even re-point the
-                    // daemon at a different --config file). This also covers a GUI
-                    // that started while the daemon was down. `load_config_view`
-                    // preserves any unsaved edits. Guarded against re-queuing.
-                    if now == Health::Connected
-                        && self.last_health != Health::Connected
-                        && !self.pending.iter().any(|r| matches!(r, Request::GetConfig))
-                    {
-                        self.enqueue(Request::GetConfig);
+                    // (Re)connection edge → (re)fetch the editable config and the
+                    // interface list, so the editor, the read-only active-config
+                    // path, and the interface picker are never left stale across a
+                    // daemon restart (which may even re-point the daemon at a
+                    // different --config file). This also covers a GUI that started
+                    // while the daemon was down. `load_config_view` preserves any
+                    // unsaved edits. `enqueue_unique` guards against re-queuing.
+                    if now == Health::Connected && self.last_health != Health::Connected {
+                        self.enqueue_unique(Request::GetConfig);
+                        self.enqueue_unique(Request::ListInterfaces);
                     }
                     self.last_health = now;
                     self.status = match reply.result {
@@ -190,17 +211,21 @@ impl SplitwayApp {
                         }
                     }
                 },
-                Request::Enable => self.finish_action("enable", reply.result),
-                Request::Disable => self.finish_action("disable", reply.result),
+                // ListInterfaces never changes the interface set, so it never
+                // refreshes interfaces (`false`); the same for the domain/enable
+                // verbs.
+                Request::Enable => self.finish_action("enable", reply.result, false),
+                Request::Disable => self.finish_action("disable", reply.result, false),
                 Request::AddDomain(domain) => {
-                    self.finish_action(&format!("add {domain}"), reply.result)
+                    self.finish_action(&format!("add {domain}"), reply.result, false)
                 }
                 Request::RemoveDomain(domain) => {
-                    self.finish_action(&format!("remove {domain}"), reply.result)
+                    self.finish_action(&format!("remove {domain}"), reply.result, false)
                 }
                 Request::SetConfig(_) => {
                     let saved = matches!(reply.result, Ok(Response::Ok));
-                    self.finish_action("save config", reply.result);
+                    // A save may change `vpn_name`, so refresh the picker too.
+                    self.finish_action("save config", reply.result, true);
                     if saved {
                         // The save synced the buffers to the daemon; mark them
                         // clean so a later reconnect refresh can adopt any
@@ -208,21 +233,37 @@ impl SplitwayApp {
                         self.loaded = Some(self.current_snapshot());
                     }
                 }
-                // The GUI never issues these.
-                Request::ListDomains | Request::ReloadConfig => {}
+                // Resync: the daemon re-read its config and reconciled; refresh
+                // everything, including the picker.
+                Request::ReloadConfig => self.finish_action("resync", reply.result, true),
+                Request::ListInterfaces => match reply.result {
+                    Ok(Response::Interfaces(interfaces)) => self.interfaces = interfaces,
+                    // Enumeration failed or the daemon is unreachable: keep the
+                    // last list (the editor's free-text field is the fallback) and
+                    // reflect any transport/skew problem into the banner.
+                    other => self.note_connection_from(&other),
+                },
+                // The GUI never issues this.
+                Request::ListDomains => {}
             }
         }
     }
 
-    /// Finish a mutating action: record the outcome message, reflect any
-    /// connection-level error into the banner, and refresh `Status`.
-    fn finish_action(&mut self, action: &str, result: Result<Response, ClientResult>) {
+    /// Finish a mutating action (or a resync): record the outcome message,
+    /// reflect any connection-level error into the banner, and refresh the view.
+    /// `refresh_interfaces` re-fetches the interface list too (a save or resync).
+    fn finish_action(
+        &mut self,
+        action: &str,
+        result: Result<Response, ClientResult>,
+        refresh_interfaces: bool,
+    ) {
         match reduce_action_result(action, &result) {
             Ok(note) => self.message = Some((MessageKind::Info, note)),
             Err(note) => self.message = Some((MessageKind::Error, note)),
         }
         self.note_connection_from(&result);
-        self.enqueue(Request::Status);
+        self.refresh_view(refresh_interfaces);
     }
 
     /// Reflect a non-`Status` reply into the connection banner when it signals a
@@ -339,7 +380,8 @@ type ClientResult = splitway_shared::ipc::client::ClientError;
 
 impl eframe::App for SplitwayApp {
     // eframe 0.34 hands the root `Ui` directly (no margin/background) and
-    // deprecates the old `update(ctx, frame)`.
+    // deprecates the old `update(ctx, frame)`, so we keep `ui` and paint our own
+    // opaque background via a `CentralPanel` (see below).
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_replies();
 
@@ -347,6 +389,10 @@ impl eframe::App for SplitwayApp {
         // polls never stack behind a slow round-trip.
         if self.pending.is_empty() && !self.inflight && self.last_poll.elapsed() >= POLL_INTERVAL {
             self.enqueue(Request::Status);
+            // Refresh the interface list each poll so the picker's up/down flags
+            // track VPNs coming and going. It does not touch the editor buffers,
+            // so it is independent of the unsaved-edit guard below.
+            self.enqueue(Request::ListInterfaces);
             // Also refresh the editable config while the editor is clean, so an
             // external change made over the *same* connection — `splitway
             // reload` or another client's SetConfig — is picked up without a
@@ -359,17 +405,23 @@ impl eframe::App for SplitwayApp {
         }
         self.pump();
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            self.ui_header(ui);
-            ui.separator();
-            self.ui_status_and_toggle(ui);
-            ui.separator();
-            self.ui_domains(ui);
-            ui.separator();
-            self.ui_config_editor(ui);
-            ui.separator();
-            self.ui_config_file(ui);
-            self.ui_message(ui);
+        // Render inside an opaque `CentralPanel`: eframe 0.34's root `Ui` has no
+        // background and the default framebuffer clear is semi-transparent, so a
+        // bare layout renders as a broken-looking see-through window. The panel
+        // fills the whole client area with the theme's opaque panel colour.
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                self.ui_header(ui);
+                ui.separator();
+                self.ui_status_and_toggle(ui);
+                ui.separator();
+                self.ui_domains(ui);
+                ui.separator();
+                self.ui_config_editor(ui);
+                ui.separator();
+                self.ui_config_file(ui);
+                self.ui_message(ui);
+            });
         });
 
         // Keep the poll timer ticking even when the window is idle.
@@ -385,6 +437,17 @@ impl SplitwayApp {
                 ui.add(egui::Spinner::new());
                 ui.label("working…");
             }
+            // Resync: ask the daemon to re-read its config and reconcile, then
+            // refresh Status + GetConfig + ListInterfaces (see the ReloadConfig
+            // reply arm). Unsaved edits are kept, not discarded — the GetConfig
+            // refresh goes through the same dirty-guard as the poll/reconnect
+            // refresh, so an in-progress edit is never clobbered; the user saves
+            // explicitly. Only meaningful while connected.
+            ui.add_enabled_ui(self.connected(), |ui| {
+                if ui.button("Resync").clicked() {
+                    self.enqueue(Request::ReloadConfig);
+                }
+            });
         });
 
         let (color, text) = match self.connection.health {
@@ -437,8 +500,18 @@ impl SplitwayApp {
                         ui.label("vpn up");
                         ui.label(info.vpn_up.to_string());
                         ui.end_row();
-                        ui.label("rules applied");
-                        ui.label(info.applied.to_string());
+                        // The daemon's own belief, surfaced for verification:
+                        // why routing is/ isn't active, what is applied (the
+                        // interface → domains → DNS mapping), and the watch's
+                        // health. Phrasings are the shared `Display` impls.
+                        ui.label("routing");
+                        ui.label(info.routing_state.to_string());
+                        ui.end_row();
+                        ui.label("applied");
+                        ui.label(model::applied_summary(&info.applied));
+                        ui.end_row();
+                        ui.label("detector");
+                        ui.label(info.detector_health.to_string());
                         ui.end_row();
                         ui.label("domains");
                         ui.label(info.domains.len().to_string());
@@ -516,18 +589,41 @@ impl SplitwayApp {
             return;
         }
 
-        let live_interface = self
-            .status
-            .as_ref()
-            .map(|s| s.interface.clone())
-            .unwrap_or_default();
+        // The picker entries: the live interfaces plus the configured value when
+        // it is not currently present (so a VPN that is down right now is still
+        // shown and selectable). Computed before the grid so it does not borrow
+        // `self` while the grid mutates the editable buffers.
+        let interface_choices = model::interface_choices(&self.interfaces, &self.cfg_vpn_name);
 
         egui::Grid::new("config_grid")
             .num_columns(2)
             .spacing([12.0, 6.0])
             .show(ui, |ui| {
                 ui.label("vpn_name");
-                ui.text_edit_singleline(&mut self.cfg_vpn_name);
+                ui.vertical(|ui| {
+                    let selected = if self.cfg_vpn_name.trim().is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        self.cfg_vpn_name.clone()
+                    };
+                    egui::ComboBox::from_id_salt("vpn_name_combo")
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            for choice in &interface_choices {
+                                ui.selectable_value(
+                                    &mut self.cfg_vpn_name,
+                                    choice.name.clone(),
+                                    &choice.label,
+                                );
+                            }
+                        });
+                    // Free-text fallback: type a VPN interface that is not present
+                    // yet, or edit when enumeration is unavailable.
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.cfg_vpn_name)
+                            .hint_text("or type an interface name"),
+                    );
+                });
                 ui.end_row();
 
                 ui.label("vpn_backend");
@@ -564,27 +660,10 @@ impl SplitwayApp {
                 ui.end_row();
             });
 
-        // Always surface the restart caveat rather than letting a save imply it
-        // took full effect: the detector watch is armed once at startup and is
-        // not restarted on a live config change. (`StatusInfo.interface` is the
-        // *configured* name, which a save updates immediately, so this is shown
-        // unconditionally — a save alone never re-arms the watch.)
-        ui.colored_label(
-            egui::Color32::from_rgb(150, 150, 150),
-            "Note: changing vpn_name or vpn_backend takes effect for auto-apply only after a \
-             daemon restart (the interface watch is armed once at startup).",
-        );
-        // While there is an unsaved interface change, call it out more strongly.
-        let interface_changed = !live_interface.is_empty()
-            && interface_change_needs_restart(&self.cfg_vpn_name, &live_interface);
-        if interface_changed {
-            ui.colored_label(
-                egui::Color32::from_rgb(200, 140, 0),
-                "Unsaved change: vpn_name differs from the daemon's active interface — save, \
-                 then restart the daemon to auto-apply on the new interface.",
-            );
-        }
-
+        // A save now takes effect live — changing vpn_name / vpn_backend /
+        // openvpn re-arms the daemon's watch with no restart — so the former
+        // restart caveats are gone. The status block above shows the result
+        // (routing state / applied mapping / detector health) after the save.
         ui.add_enabled_ui(self.connected(), |ui| {
             if ui.button("Save configuration").clicked() {
                 self.submit_set_config();

@@ -16,13 +16,16 @@ use crate::config::VpnBackend;
 /// daemon rejects envelopes whose version it does not speak.
 ///
 /// Bumped to `2` in Phase 4 for the additive `GetConfig`/`SetConfig` verbs and
-/// the [`Response::Config`] reply. The daemon enforces *strict equality* (see
-/// `daemon::ipc::process_line`): a v2 daemon rejects a v1 client and vice
+/// the [`Response::Config`] reply. Bumped to `3` in Phase 5 for the additive
+/// `ListInterfaces` verb / [`Response::Interfaces`] reply and the richer
+/// [`StatusInfo`] (the `applied` mapping, [`RoutingState`] and
+/// [`DetectorHealth`] — all additive). The daemon enforces *strict equality*
+/// (see `daemon::ipc::process_line`): a v3 daemon rejects a v2 client and vice
 /// versa, so there is no silent mixed-version operation. The daemon, CLI and
 /// GUI all build from this one workspace, so they upgrade in lockstep; a
 /// mismatch only happens across separately-updated installs and is surfaced as
 /// actionable "update splitway" guidance, never a raw decode error.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Stable prefix the daemon uses to introduce a protocol-version-mismatch
 /// error reply. Shared so a client (CLI/GUI) can recognize skew and render
@@ -70,6 +73,10 @@ pub enum Request {
     /// this in its single-writer state actor via the same `commit()` path as
     /// the other mutating verbs, so it stays the sole config writer.
     SetConfig(ConfigView),
+    /// Enumerate the host's network interfaces so a client can offer an
+    /// interface picker without itself touching the platform or holding
+    /// privileges. Read-only; replied to with [`Response::Interfaces`].
+    ListInterfaces,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +89,8 @@ pub enum Response {
     Domains(Vec<String>),
     /// Reply to [`Request::GetConfig`].
     Config(ConfigView),
+    /// Reply to [`Request::ListInterfaces`].
+    Interfaces(Vec<InterfaceInfo>),
     /// The request failed; the string is a human-readable reason.
     Error(String),
 }
@@ -123,14 +132,130 @@ pub struct ConfigView {
 pub struct StatusInfo {
     /// Whether rule application is enabled.
     pub enabled: bool,
-    /// The configured VPN interface name.
+    /// The *configured* VPN interface name (`vpn_name`), not necessarily the one
+    /// rules are applied to right now — see [`AppliedInfo::interface`]. Kept
+    /// named `interface` for wire continuity; it is the configured device name.
     pub interface: String,
     /// Whether the VPN interface is currently up.
     pub vpn_up: bool,
-    /// Whether DNS rules are currently applied to the system.
-    pub applied: bool,
+    /// The DNS mapping currently applied to the system, or `None` when nothing
+    /// is applied. `is_some()` recovers the old boolean "applied?" meaning while
+    /// also answering "which domains route through which DNS, on which link".
+    pub applied: Option<AppliedInfo>,
+    /// A self-explaining summary of why routing is (or is not) active right now,
+    /// mapped from the daemon's own reconcile decision — see [`RoutingState`].
+    pub routing_state: RoutingState,
+    /// Whether the VPN-detector watch is running, idle, or failed to start.
+    pub detector_health: DetectorHealth,
     /// The configured domains.
     pub domains: Vec<String>,
+}
+
+/// A snapshot of the DNS rules currently applied to the system — the wire
+/// projection of the daemon's internal applied state. Carried in
+/// [`StatusInfo::applied`] so a client can *verify* what the daemon believes it
+/// has installed (which domains route through which DNS, on which interface),
+/// not just that *something* is applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedInfo {
+    /// The interface the rules are applied to (may differ from the configured
+    /// [`StatusInfo::interface`] during a live interface switch).
+    pub interface: String,
+    /// The domains routed through the VPN DNS.
+    pub domains: Vec<String>,
+    /// The VPN DNS servers the domains are routed to.
+    pub dns_servers: Vec<String>,
+}
+
+/// Why DNS routing is — or is not — active right now, mapped from the daemon's
+/// reconcile decision. This is *belief*: what the daemon intends given its
+/// config and the observed VPN state, not a read-back of the live system
+/// (reality / drift detection is a later phase).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoutingState {
+    /// Rule application is disabled (`enabled = false`).
+    Disabled,
+    /// No domains are configured, so there is nothing to route.
+    NoDomains,
+    /// The configured VPN interface is not up.
+    VpnDown,
+    /// The VPN is up but exposes no DNS servers to route the domains to.
+    NoDnsFromVpn,
+    /// Rules are applied and the system matches the intended mapping.
+    Applied,
+    /// The last apply (or revert) failed, so the system may be out of sync and
+    /// a re-apply is pending.
+    ApplyFailed,
+}
+
+/// Health of the VPN-detector watch, set by the daemon when it (re-)arms the
+/// watch and reported in [`StatusInfo::detector_health`]. Lets a client say
+/// "the watch is up / idle / failed to start" instead of inferring it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetectorHealth {
+    /// A detector watch is running for the configured interface.
+    Active,
+    /// No watch is running because no interface is configured (`vpn_name` is
+    /// empty). Auto-apply is intentionally off, not broken.
+    Inactive,
+    /// The watch failed to start (e.g. NetworkManager absent, or a bad OpenVPN
+    /// management endpoint). Auto-apply is off; the string is the reason.
+    Error(String),
+}
+
+/// One enumerated network interface, for the client's interface picker. A small
+/// dedicated wire type (like [`ConfigView`]) so the picker need not touch the
+/// platform or hold privileges.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterfaceInfo {
+    /// The interface (device) name, e.g. `tun0`, `eth0`, `lo`.
+    pub name: String,
+    /// Whether the interface is currently up.
+    pub up: bool,
+    /// A name-prefix heuristic flag (`tun*` / `utun*` / `wg*` / `tap*` / `ppp*`
+    /// / `gpd*`) hinting this is VPN-like. Advisory only — a client may use it
+    /// to sort or highlight, never to filter the list.
+    pub vpn_like: bool,
+}
+
+/// Concise human phrasing for [`StatusInfo::applied`], shared by the CLI and the
+/// daemon's own `status` subcommand: `wg0 -> [a.com, b.com] via [10.0.0.1]`.
+impl std::fmt::Display for AppliedInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} -> [{}] via [{}]",
+            self.interface,
+            self.domains.join(", "),
+            self.dns_servers.join(", ")
+        )
+    }
+}
+
+/// Human phrasing for [`StatusInfo::routing_state`], shared across clients.
+impl std::fmt::Display for RoutingState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            RoutingState::Disabled => "disabled",
+            RoutingState::NoDomains => "no domains configured",
+            RoutingState::VpnDown => "VPN down",
+            RoutingState::NoDnsFromVpn => "VPN up, but it pushes no DNS",
+            RoutingState::Applied => "applied",
+            RoutingState::ApplyFailed => "apply failed (out of sync)",
+        };
+        f.write_str(text)
+    }
+}
+
+/// Human phrasing for [`StatusInfo::detector_health`], shared across clients.
+impl std::fmt::Display for DetectorHealth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DetectorHealth::Active => f.write_str("active"),
+            DetectorHealth::Inactive => f.write_str("inactive (no interface configured)"),
+            DetectorHealth::Error(reason) => write!(f, "error: {reason}"),
+        }
+    }
 }
 
 /// System-service socket directory, used when `XDG_RUNTIME_DIR` is unset (a
@@ -310,26 +435,112 @@ mod tests {
         }
     }
 
+    fn sample_status() -> StatusInfo {
+        StatusInfo {
+            enabled: true,
+            interface: "wg0".to_string(),
+            vpn_up: true,
+            applied: Some(AppliedInfo {
+                interface: "wg0".to_string(),
+                domains: vec!["a.com".to_string(), "b.com".to_string()],
+                dns_servers: vec!["10.0.0.1".to_string()],
+            }),
+            routing_state: RoutingState::Applied,
+            detector_health: DetectorHealth::Active,
+            domains: vec!["a.com".to_string(), "b.com".to_string()],
+        }
+    }
+
     #[test]
     fn response_round_trip() {
         let responses = [
             Response::Ok,
             Response::Domains(vec!["a.com".to_string(), "b.com".to_string()]),
             Response::Error("nope".to_string()),
+            Response::Status(sample_status()),
+            // Not-applied status: `applied` is None, with a non-Applied state and
+            // a failed detector (exercises every new field's other shape).
             Response::Status(StatusInfo {
                 enabled: true,
-                interface: "wg0".to_string(),
+                interface: "tun0".to_string(),
                 vpn_up: false,
-                applied: false,
-                domains: vec!["a.com".to_string()],
+                applied: None,
+                routing_state: RoutingState::VpnDown,
+                detector_health: DetectorHealth::Error("nm absent".to_string()),
+                domains: vec![],
             }),
             Response::Config(sample_config_view()),
+            Response::Interfaces(vec![
+                InterfaceInfo {
+                    name: "tun0".to_string(),
+                    up: true,
+                    vpn_like: true,
+                },
+                InterfaceInfo {
+                    name: "lo".to_string(),
+                    up: true,
+                    vpn_like: false,
+                },
+            ]),
         ];
         for response in responses {
             let json = serde_json::to_string(&response).unwrap();
             let parsed: Response = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, response);
         }
+    }
+
+    #[test]
+    fn list_interfaces_verb_round_trips_in_envelope() {
+        let env = RequestEnvelope::new(Request::ListInterfaces);
+        let json = serde_json::to_string(&env).unwrap();
+        let parsed: RequestEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.version, PROTOCOL_VERSION);
+        assert_eq!(parsed.request, Request::ListInterfaces);
+    }
+
+    #[test]
+    fn new_status_wire_types_round_trip() {
+        // Each new type round-trips on its own, like ConfigView does.
+        let applied = AppliedInfo {
+            interface: "utun4".to_string(),
+            domains: vec!["corp.example".to_string()],
+            dns_servers: vec!["10.8.0.1".to_string(), "10.8.0.2".to_string()],
+        };
+        let json = serde_json::to_string(&applied).unwrap();
+        assert_eq!(serde_json::from_str::<AppliedInfo>(&json).unwrap(), applied);
+
+        for state in [
+            RoutingState::Disabled,
+            RoutingState::NoDomains,
+            RoutingState::VpnDown,
+            RoutingState::NoDnsFromVpn,
+            RoutingState::Applied,
+            RoutingState::ApplyFailed,
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(serde_json::from_str::<RoutingState>(&json).unwrap(), state);
+        }
+
+        for health in [
+            DetectorHealth::Active,
+            DetectorHealth::Inactive,
+            DetectorHealth::Error("bad management endpoint".to_string()),
+        ] {
+            let json = serde_json::to_string(&health).unwrap();
+            assert_eq!(
+                serde_json::from_str::<DetectorHealth>(&json).unwrap(),
+                health
+            );
+        }
+
+        let iface = InterfaceInfo {
+            name: "wg0".to_string(),
+            up: false,
+            vpn_like: true,
+        };
+        let json = serde_json::to_string(&iface).unwrap();
+        assert_eq!(serde_json::from_str::<InterfaceInfo>(&json).unwrap(), iface);
     }
 
     #[test]
