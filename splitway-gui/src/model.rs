@@ -168,10 +168,16 @@ pub struct InterfaceChoice {
 /// Build the interface-picker entries from the daemon's enumerated interfaces
 /// plus the currently-configured `vpn_name`. The live interfaces come first
 /// (already sorted up-first / vpn-like-first by the daemon). If the configured
-/// name is non-empty and not among them — a VPN that is not up right now — it is
-/// appended so it stays visible and selectable; an empty configured name adds no
-/// synthetic entry. The free-text field in the editor remains the fallback when
-/// the list is empty (enumeration unavailable).
+/// name is non-empty and not among them it is appended so it stays visible and
+/// selectable; an empty configured name adds no synthetic entry.
+///
+/// "Not among them" is split two ways, so an enumeration failure is never
+/// reported as a missing interface:
+/// - the daemon returned interfaces but not this one → it is genuinely *not
+///   present* (a VPN that is down right now), flagged `configured_but_absent`;
+/// - the list is **empty** (enumeration unavailable / not yet fetched) → we have
+///   no inventory to judge presence, so it is labelled just "(configured)" and
+///   not flagged absent. The editor's free-text field remains the fallback.
 pub fn interface_choices(interfaces: &[InterfaceInfo], configured: &str) -> Vec<InterfaceChoice> {
     let mut choices: Vec<InterfaceChoice> = interfaces
         .iter()
@@ -184,10 +190,17 @@ pub fn interface_choices(interfaces: &[InterfaceInfo], configured: &str) -> Vec<
 
     let configured = configured.trim();
     if !configured.is_empty() && !interfaces.iter().any(|iface| iface.name == configured) {
+        // Only claim "not present" when we actually have an inventory to check
+        // against; an empty list means we have no data, not that it is absent.
+        let (label, configured_but_absent) = if interfaces.is_empty() {
+            (format!("{configured} (configured)"), false)
+        } else {
+            (format!("{configured} (configured, not present)"), true)
+        };
         choices.push(InterfaceChoice {
             name: configured.to_string(),
-            label: format!("{configured} (configured, not present)"),
-            configured_but_absent: true,
+            label,
+            configured_but_absent,
         });
     }
     choices
@@ -417,6 +430,19 @@ mod tests {
             interface_choices(&[iface("tun0", true, true)], " tun0 ").len(),
             1
         );
+    }
+
+    #[test]
+    fn interface_choices_does_not_claim_absent_when_inventory_is_empty() {
+        // Enumeration unavailable (empty list): the configured value is still
+        // shown so it stays selectable, but it must NOT be labelled "not present"
+        // or flagged absent — we have no inventory to judge it against.
+        let choices = interface_choices(&[], "tun0");
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].name, "tun0");
+        assert_eq!(choices[0].label, "tun0 (configured)");
+        assert!(!choices[0].configured_but_absent);
+        assert!(!choices[0].label.contains("not present"));
     }
 
     #[test]
