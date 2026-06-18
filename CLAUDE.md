@@ -7,8 +7,9 @@ Splitway — domain-based split-DNS tool for Linux/macOS desktops. Routes select
 Cargo workspace:
 
 - `splitway-daemon` — core: detects VPN, applies/reverts DNS rules
-- `splitway-cli` — IPC client (stub until Phase 2)
-- `splitway-shared` — config parsing, platform traits (`DnsBackend`)
+- `splitway-cli` — IPC client over the daemon socket
+- `splitway-gui` — interim egui GUI; a pure IPC client with no privileges (native Tauri GUI planned — see `ROADMAP.md`)
+- `splitway-shared` — config parsing, platform traits (`DnsBackend`, `VpnDetector`)
 
 ## Commands
 

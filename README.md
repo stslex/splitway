@@ -218,12 +218,19 @@ nix develop    # dev shell with cargo, rustc, rustfmt, clippy, rust-analyzer
 ```
 
 The flake also exposes `nixosModules.default`. On a NixOS host, import it and
-set `services.splitway.enable = true;` to install the package system-wide. The
-systemd service is a commented-out stub until the real daemon lands in Phase 2.
+set `services.splitway.enable = true;` to install the package and run the daemon
+as a systemd service (`splitway-daemon run`). The service runs as root
+(privileged `resolvectl` changes), gets a `RuntimeDirectory` for its `0600`
+control socket, restarts on failure, and reverts DNS rules on `SIGTERM` so a
+stop never leaves the system half-configured.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) — phased plan with done-criteria: testable foundation → abstraction split → real daemon + IPC → OpenVPN/macOS backends → primitive GUI. Near-term priorities: NixOS packaging, macOS, OpenVPN, minimal GUI.
+See [ROADMAP.md](ROADMAP.md) for the phased plan and done-criteria. Shipped so
+far: testable foundation → abstraction split (`VpnDetector`/`DnsBackend`) → real
+daemon + IPC → OpenVPN and macOS backends → an interim egui GUI. Next: finish
+the verification / business-logic work, then Linux + macOS packaging, a native
+Tauri GUI, and a hardening pass.
 
 ## Development
 

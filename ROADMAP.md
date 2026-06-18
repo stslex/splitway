@@ -1,104 +1,145 @@
 # Roadmap
 
-Reflects code state as of 2026-06-12.
+Reflects code state as of 2026-06-18.
 
-Process: one phase = one branch = one PR into `dev` (workflow rules in `CLAUDE.md`); per-phase implementation prompts live in `docs/prompts/`.
+Goal: finish the DNS-split solution to a shippable **v1 for Linux + macOS** —
+complete the verification / business-logic work, package it, and replace the
+interim GUI with a native one. Anything past that (other VPN backends, proxy
+route targets) is deliberately deferred; see [Later](#later).
 
-Target features, wanted as early as possible: **NixOS support, macOS support, OpenVPN support, primitive GUI** (enable/disable + config selection). Hard constraint: no shortcuts at the expense of code quality.
+Process: one phase = one branch = one PR into `dev` (workflow rules in
+`CLAUDE.md`); per-phase implementation prompts live in `docs/prompts/`. Hard
+constraint: **no shortcuts at the expense of code quality** — no phase trades
+correctness, tests, or a clean abstraction for speed.
 
-Ordering principle: macOS + OpenVPN multiply *platform × VPN* implementations. Adding them on the current `DnsBackend` trait (which mixes VPN detection with rule application) would bake the mixed design into three implementations and force a triple rewrite later. So: split the abstractions **before** multiplying backends. Likewise, a GUI that shells out with sudo per click is a quality shortcut — the GUI waits for IPC and never holds privileges itself.
+## Ordering rationale
 
-The macOS requirement also resolves the old open decision: a one-shot binary driven by systemd dispatcher units cannot port to macOS (no systemd). The daemon gets **built-in monitoring** with a per-platform event source; systemd unit and launchd plist become thin deployment artifacts.
+macOS + OpenVPN multiply *platform × VPN* implementations. Adding them on the
+original `DnsBackend` trait (which mixed VPN detection with rule application)
+would have baked the mixed design into three implementations and forced a triple
+rewrite later — so the abstractions were split (Phase 1) **before** the backends
+multiplied (Phase 3). Likewise, a GUI that shelled out with sudo per click would
+be a quality shortcut, so the GUI is a pure IPC client that never holds
+privileges. And because macOS has no systemd, a one-shot binary driven by
+systemd dispatcher units could not port to it: the daemon got **built-in
+monitoring** with a per-platform event source, leaving the systemd unit and
+launchd plist as thin deployment artifacts.
 
-## Phase 0 — Foundation + CI
+## Done (shipped to `dev`)
 
-Goal: make the core testable and failure-safe. Cheap, unblocks everything.
+The four target features — NixOS, macOS, OpenVPN, a primitive GUI — have all
+landed, on the abstraction split that keeps each one a small isolated impl.
 
-- Extract DNS parsing from `detect_vpn` into a pure function, cover with unit tests
-- Rollback in `apply_rules`: if the domain step fails after DNS is set, revert to pre-apply state
-- Resolve binaries via PATH or config instead of hardcoded `/usr/bin/resolvectl` (this is also the NixOS runtime blocker; `nmcli` is already PATH-based — inconsistent)
-- Backend logging through `log` instead of `println!`
-- Cleanup: unused `ConfigParseError::Unresolve`, `parse_command(self)` ignoring `self`, `vpn_ip` in README config example
-- CI: fmt + clippy + test on `ubuntu-latest` and `macos-latest` runners (macOS compiles from day one, `todo!()` stubs stay honest)
+- **Phase 0 — Foundation + CI.** Pure DNS-parsing function with unit tests;
+  rollback-on-failure in `apply_rules`; PATH/config binary resolution; `log`
+  instead of `println!`; fmt + clippy + test CI on Linux and macOS runners.
+- **Phase 0.5 — NixOS packaging.** `flake.nix` package + devShell, and the
+  `nixosModules.default` systemd service.
+- **Phase 1 — Abstraction split.** `VpnDetector` (detect + event stream) and
+  `DnsBackend` (apply/revert/status) traits in `splitway-shared`; first impls
+  NetworkManager (D-Bus via `zbus`) and systemd-resolved; `tokio` introduced.
+- **Phase 2 — Real daemon + IPC.** Event-loop daemon (auto-apply on VPN up,
+  auto-revert on down); Unix socket + JSON-lines protocol; `splitway-cli` as a
+  real IPC client; systemd unit + launchd plist.
+- **Phase 3 — Backend breadth.** 3a OpenVPN via NetworkManager; 3b macOS
+  (`scutil` detector + `/etc/resolver` backend); 3c standalone OpenVPN over its
+  management interface.
+- **Phase 4 — Primitive GUI.** `splitway-gui` (egui): status, enable/disable,
+  domain add/remove, and config editing — all over the CLI's IPC socket, zero
+  privileges, behind the get/set-config `PROTOCOL_VERSION` bump.
 
-**Done when:** `cargo test` green in CI on both runners; a failed apply leaves the system in its pre-apply state.
+## Frontend: egui is interim, Tauri is the target
 
-## Phase 0.5 — NixOS packaging
+The Phase 4 egui GUI is an **interim** frontend. The real one is **Tauri** (web
+UI + Rust backend), built in Phase 7. Rationale: a native-feeling result, the
+full web design ecosystem for the UI, and a clean fit with the existing model —
+the GUI is just another zero-privilege IPC client over the control socket, so
+the daemon needs no change to gain it. GTK4 stays dropped (poor macOS story) and
+iced is no longer the planned path. The egui GUI gets only minimal upkeep until
+Tauri replaces it.
 
-Small, independent, can land in parallel with Phase 0 (after the PATH fix).
+## Upcoming
 
-- `flake.nix`: package + devShell
-- NixOS module skeleton (service definition; fleshed out when the daemon becomes real in Phase 2)
+The sequence to v1, in order. Each is one phase = one branch = one PR.
 
-**Done when:** `nix build` produces working binaries; `nix develop` gives a dev shell.
+### Phase 5 — live config, interface selection, verification (belief)
 
-## Phase 1 — Abstraction split
+The original Phase 5 usability scope **plus** exposing state the daemon already
+computes internally but does not surface. All of it rides **one**
+`PROTOCOL_VERSION` bump (to 3); egui stays functional, not redesigned.
 
-Goal: separate VPN *detection* from DNS *rule application*, so every later platform/VPN addition is one small testable unit.
+- Daemon: re-arm the VPN watch live when `vpn_name`/`vpn_backend`/`openvpn`
+  change, so the restart-on-`vpn_name` caveat disappears and `vpn_up` reflects
+  the configured interface immediately. The detectors are reused unchanged — only
+  their lifecycle (start/stop/restart) becomes dynamic, with the old interface
+  reverted on switch and no half-configured state.
+- Daemon: a `ListInterfaces` verb enumerating local interfaces (name + up/down,
+  VPN-like flagged) so the GUI can offer an interface picker without itself
+  touching the platform or holding privileges.
+- Daemon: surface what reconciliation already knows — an applied snapshot in
+  `StatusInfo` (interface + domains + DNS servers, from the existing `Applied`
+  struct), a `RoutingState` enum mirroring the existing `desired()` branches
+  (disabled / no domains / VPN down / no DNS from VPN / applied / apply-failed),
+  and `detector_health`. This is *belief*: what the daemon intends, not yet a
+  read-back of what the system actually shows.
+- GUI: `vpn_name` becomes a picker over the live interface list (free-text
+  fallback kept); a Resync button (re-read config + reconcile + refresh);
+  immediate refresh after every change; and an opaque, grouped visual pass (the
+  current build renders with a transparent background).
 
-- `VpnDetector` trait: detect VPN + expose an event stream (interface up/down). First impl: NetworkManager (Linux), event source = NM D-Bus signals via `zbus`
-- `DnsBackend` trait shrinks to apply/revert/status. First impl: systemd-resolved (`resolvectl`)
-- `tokio` introduced here (event stream + later IPC share the runtime)
+### Phase 5b — verification (reality) + domain normalization
 
-**Done when:** existing one-shot behavior works unchanged on the new traits; detector unit-testable without live `nmcli`.
+- Extend `DnsBackend::status()` to **return** the live mapping (resolvectl on
+  Linux, `/etc/resolver` on macOS) instead of only printing it, so the daemon can
+  diff intended-vs-actual and surface drift — *reality* alongside Phase 5's
+  *belief*.
+- Domain normalization + case-insensitive dedup in `splitway-shared`, shared by
+  the daemon and every client, so the daemon no longer trusts raw IPC input.
 
-## Phase 2 — Real daemon + IPC
+### Phase 6 — packaging (pulled forward)
 
-Goal: the headline feature — auto-apply on VPN up, auto-revert on down — plus runtime control.
+The gate that deferred packaging — no real daemon before Phase 2 — has expired,
+so this comes ahead of the native GUI: a dev channel is needed to iterate on the
+later phases.
 
-- Daemon event loop over `VpnDetector` stream; privileged operations live only here
-- Unix socket, JSON-lines protocol
-- `splitway-cli` (currently a stub): enable/disable, add/remove domain, status, reload config
-- Deployment artifacts: systemd unit (Linux), launchd plist (macOS, activated in Phase 3)
+- **One package** `splitway` containing daemon + cli + gui + the service unit, at
+  a single version. This sidesteps the GUI↔daemon version matrix entirely: there
+  are no separately-versioned packages to mismatch. `postinst` restarts
+  `splitway.service` on upgrade so the running daemon always matches the new
+  binaries; the existing version-peek (`VERSION_MISMATCH_PREFIX`) covers the brief
+  upgrade window.
+- **Linux first:** apt / dnf / pacman / nix repos on GitHub Pages, with **dev and
+  release channels** as separate Pages subtrees. Pattern reusable from
+  `stslex/claude-desktop-linux` — take the packaging/publishing half, drop the
+  repackage half, and source artifacts from `cargo build --release`. Watch the
+  Pages "full-site replace" trap that makes concurrent dev + stable deploys
+  clobber each other.
+- **Then macOS:** Homebrew tap / `.pkg` + launchd, with the Gatekeeper /
+  notarization tail (unsigned vs Apple-Developer-signed) called out as a
+  sub-decision.
+- The dev channel is for iteration now; the public `v0.1.0` tag waits for Tauri.
 
-**Done when:** connecting the VPN applies rules with no manual command; disconnecting reverts; CLI controls a running daemon.
+### Phase 7 — native Tauri GUI
 
-## Phase 3 — Backend breadth (OpenVPN, macOS)
+Build the Tauri frontend over the now-rich IPC and retire the egui GUI.
 
-Each item is now a small isolated impl thanks to Phase 1.
+### Phase 8 — feature freeze + hardening
 
-- **3a. OpenVPN via NetworkManager** — cheapest: reuse the NM detector, handle `tun*` interfaces and OpenVPN-specific DNS fields
-- **3b. macOS** — `VpnDetector` via `scutil` (utun interfaces, DNS from `scutil --dns`); `DnsBackend` via `/etc/resolver/<domain>` files + mDNSResponder cache flush. Live-tested on real hardware (available)
-- **3c. OpenVPN standalone** — separate detector: OpenVPN management interface (preferred) or pushed-DNS parsing; more work, scheduled after 3a/3b prove the abstraction
+Fix issues surfaced while designing the earlier phases and correct decisions that
+proved wrong. Explicit candidate: revisit the protocol's strict-equality
+versioning now that packaging exists — the one-package model keeps daemon and
+clients in lockstep for v1, so record whether to later relax to additive /
+negotiated compatibility.
 
-**Done when:** GlobalProtect + OpenVPN(NM) work on Linux; at least GlobalProtect or OpenVPN works on macOS end-to-end.
+## Later
 
-## Phase 4 — Primitive GUI
+Explicitly deferred — out of the v1 scope above.
 
-Goal: enable/disable toggle, read-only status, config-file selection, and config editing. Still deliberately minimal — no tray icon, notifications, or per-domain status.
-
-- Talks to the daemon over the same IPC socket as the CLI — zero duplicated logic, zero privileges in the GUI process. This rules out the GUI writing the config file itself (a second writer racing the daemon's own writes, and impossible against a root daemon)
-- Editing the config over IPC needs a small, additive protocol extension: get/set-config verbs handled by the daemon's single-writer state actor, plus a `PROTOCOL_VERSION` bump. The toggle, status, and domain editing already fit the existing verbs
-- Stack: `egui` (pure Rust, trivially cross-platform Linux/macOS, fastest to ship). Alternative if more native feel is wanted later: `iced`. GTK4/libadwaita dropped — poor macOS story
-- Depends on Phase 2 (IPC) only; can start in parallel with Phase 3
-
-**Done when:** toggle, status, config picker, and config editing work on Linux and macOS against a live daemon — all over IPC, with no privileges in the GUI.
-
-## Phase 5 — GUI usability: live config, interface selection, polish
-
-Goal: make the Phase 4 GUI correct and presentable — config changes take effect live, the VPN interface is picked from a list, and the window looks decent.
-
-- Daemon: re-arm the VPN watch live when `vpn_name`/`vpn_backend`/`openvpn` change (via `SetConfig`/`ReloadConfig`), so the restart-on-`vpn_name` caveat disappears and `vpn_up` reflects the configured interface immediately. The existing detectors are reused unchanged — only their lifecycle (start/stop/restart) becomes dynamic, with the old interface reverted on switch and no half-configured state
-- Daemon: a `ListInterfaces` IPC verb enumerating local interfaces (name + up/down, VPN-like flagged) so the GUI can offer an interface picker without itself touching the platform or holding privileges. Additive `PROTOCOL_VERSION` bump
-- GUI: `vpn_name` becomes a picker over the live interface list (free-text fallback kept); a Resync button (re-read config + reconcile + refresh the view); immediate refresh after every change; and a real visual pass (opaque panel, grouped sections, aligned fields — the current build renders with a transparent background)
-- Still a pure IPC client: zero privileges, zero duplicated logic. Builds directly on Phase 4
-
-**Done when:** changing `vpn_name` in the GUI re-points auto-apply with no daemon restart and `vpn_up` tracks it; the interface picker lists present interfaces; Resync works; the GUI looks presentable on Linux and macOS against a live daemon.
-
-## Phase 6 — Packaging & release
-
-Goal: distributable packages + a release pipeline. Deliberately deferred until here: releasing before the daemon is real (Phase 2) would ship a one-shot CLI that misses the headline feature and burns first impressions.
-
-- Tag-triggered release CI: `cargo build --release` for x86_64/aarch64, attach binaries to a GitHub Release
-- Packages: deb / rpm / pacman / AppImage / nix (pattern reusable from `stslex/claude-desktop-linux`)
-- apt/dnf repositories hosted on GitHub Pages for `apt install` / `dnf install`
-- First public tag `v0.1.0` only after Phase 2 (working daemon)
-
-A lightweight tag→build→artifacts workflow may land earlier as a small standalone PR (build only, no public announcement) if useful, but the full distribution story stays in this phase.
-
-## Later (explicitly out of near-term scope)
-
-- Windows support (stub remains)
-- Proxy route targets (SOCKS5/VLESS) — requires a `RouteTarget` abstraction, not DNS-only
-- Automatic discovery of related domains
-- Richer GUI (rule editing, per-domain status)
+- **More VPN backends** beyond the current set (WireGuard, …).
+- **Proxy / `RouteTarget` route targets** (VLESS / Xray over SOCKS5). This is its
+  own deliberate track, not a side-feature: split-DNS routes by *resolving* a
+  domain through the VPN's DNS, whereas sending a domain through a SOCKS5 proxy
+  needs a second data-path (transparent proxy / per-app SOCKS / a TUN into the
+  upstream), not a new enum variant.
+- **Automatic discovery** of related domains.
+- **Windows.**
