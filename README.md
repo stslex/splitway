@@ -12,7 +12,8 @@ Splitway automates DNS-based traffic splitting: domains matching the rules are r
 
 ## Current state
 
-- Long-running daemon: auto-applies rules on VPN up, auto-reverts on down
+- Long-running daemon: auto-applies rules on VPN up, auto-reverts on down, and re-points its watch live when the configured interface/backend changes (no restart)
+- Reports its own belief over IPC for verification: a self-explaining routing state, the applied DNS mapping (interface → domains → DNS servers), and detector health
 - Auto-detects the VPN DNS server: NetworkManager D-Bus on Linux, a standalone OpenVPN's management interface, or SCDynamicStore + `scutil` on macOS
 - Applies/reverts split-DNS rules through `resolvectl` (Linux) or `/etc/resolver` files (macOS)
 - Runtime control over a Unix socket: `splitway status/enable/disable/add/remove/list/reload`, or a primitive GUI (`splitway-gui`) over the same socket
@@ -155,7 +156,7 @@ The chosen file is fixed at launch — there is no runtime switching.
 Control a running daemon with the `splitway` CLI over the socket:
 
 ```sh
-splitway status            # show enabled / vpn_up / applied / domains
+splitway status            # enabled / vpn_up / routing state / applied mapping / detector / domains
 splitway enable            # start applying rules (persisted)
 splitway disable           # stop applying and revert (persisted)
 splitway add corp.example  # route a domain through the VPN (persisted)
@@ -176,12 +177,21 @@ duplicates no daemon logic, and never touches `resolvectl`/`/etc/resolver` or
 writes the config file itself — every action is an IPC request, every config
 change goes through the daemon's single-writer state actor.
 
-It shows live status (`vpn_up`, `applied`, interface, domain count), an
+It shows live status — the routing state, the applied DNS mapping (interface →
+domains → DNS servers), `vpn_up`, detector health, and the domain count — an
 enable/disable toggle, the domain list with add/remove, and an editor for the
 remaining config fields (`vpn_name`, `vpn_backend`, `openvpn.management`,
-`openvpn.management_password_file`). Changing `vpn_name`/`vpn_backend` reverts
-the old interface but does not re-arm the VPN watch, so the GUI flags that a
-**daemon restart** is needed for auto-apply on the new interface.
+`openvpn.management_password_file`).
+
+`vpn_name` is an **interface picker** populated from the daemon's live interface
+list (up interfaces and VPN-like devices flagged), with a free-text fallback
+that always preserves the configured value even when that interface is down.
+Config changes take effect **live**: saving a new
+`vpn_name`/`vpn_backend`/`openvpn` re-arms the daemon's VPN watch with no
+restart — the old interface is reverted and the new one is watched immediately,
+so `vpn_up` and the applied mapping track the configured interface right away. A
+**Resync** button re-reads the config, reconciles, and refreshes the view; every
+change refreshes the status immediately.
 
 ```sh
 splitway-gui
