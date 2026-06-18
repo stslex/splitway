@@ -181,7 +181,9 @@ pub enum RoutingState {
     VpnDown,
     /// The VPN is up but exposes no DNS servers to route the domains to.
     NoDnsFromVpn,
-    /// Rules are applied and the system matches the intended mapping.
+    /// Rules are applied — the daemon has installed its intended mapping. This
+    /// is belief, not a read-back: it means the apply call succeeded, not that
+    /// the live system has been re-verified (drift detection is a later phase).
     Applied,
     /// The last apply (or revert) failed, so the system may be out of sync and
     /// a re-apply is pending.

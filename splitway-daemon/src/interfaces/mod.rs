@@ -203,7 +203,7 @@ mod tests {
     fn parse_iff_up_reads_bit_zero() {
         assert_eq!(parse_iff_up("0x1003\n"), Some(true)); // IFF_UP set
         assert_eq!(parse_iff_up("0x1002"), Some(false)); // IFF_UP clear
-        assert_eq!(parse_iff_up("4099"), Some(true)); // bare hex (no 0x) = 0x1003
+        assert_eq!(parse_iff_up("1003"), Some(true)); // bare hex (no 0x prefix) = 0x1003
         assert_eq!(parse_iff_up("nothex"), None);
     }
 }
