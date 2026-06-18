@@ -48,6 +48,11 @@ pub enum StateCommand {
     /// [`StateMachine::on_vpn_event`]), so an interface switch never lets the old
     /// interface's last gasp move `vpn_up`.
     Vpn { generation: u64, event: VpnEvent },
+    /// The forwarding task observed its detector's event stream end on its own
+    /// (the watch task terminated — e.g. NetworkManager/D-Bus absent, so the
+    /// async `watch()` succeeded but its spawned loop returned at once). Carries
+    /// the watch generation so a stream torn down by a re-arm is ignored.
+    WatchEnded { generation: u64 },
     /// An IPC request plus the channel to reply on.
     Ipc {
         request: Request,
@@ -80,6 +85,11 @@ pub struct StateMachine {
     last_info: Option<VpnInfo>,
     /// What is applied right now; `None` means reverted.
     applied: Option<Applied>,
+    /// Interfaces whose rules a live switch could not revert, and which are no
+    /// longer the configured interface — so the new interface's apply (which
+    /// overwrites `applied`) would otherwise forget them. A later reconcile or
+    /// shutdown keeps retrying their cleanup. Almost always empty.
+    orphaned: Vec<String>,
     /// Set when the last apply/revert failed and left the real system state
     /// uncertain relative to `applied` (e.g. the Linux backend rolled the link
     /// back to clean on a domain-step failure, or a `revert` failed because the
@@ -116,6 +126,7 @@ impl StateMachine {
             vpn_up: false,
             last_info: None,
             applied: None,
+            orphaned: Vec::new(),
             needs_resync: false,
             watch_cancel: None,
             watch_generation: 0,
@@ -179,10 +190,15 @@ impl StateMachine {
                             .await
                             .is_err()
                         {
-                            break; // the state task is gone
+                            return; // the state task is gone; nothing to report to
                         }
                     }
+                    // The stream ended on its own (the detector's watch task
+                    // terminated). On a re-arm this task is aborted mid-await and
+                    // never reaches here, so reaching it means an unexpected end —
+                    // tell the actor so `detector_health` stops claiming Active.
                     log::debug!("VPN event stream for generation {generation} ended");
+                    let _ = state_tx.send(StateCommand::WatchEnded { generation }).await;
                 });
                 self.watch_cancel = Some(handle.abort_handle());
                 self.detector_health = DetectorHealth::Active;
@@ -218,10 +234,10 @@ impl StateMachine {
     /// had DNS and the new one does not, this reverts that prior session's rules.
     ///
     /// The last event's interface must also match the configured `vpn_name`.
-    /// After a `ReloadConfig` that changes `vpn_name`, the previous event
-    /// refers to the old interface, so this returns `None` and the old
-    /// interface is reverted. (Auto-apply for the new interface needs a
-    /// restart — the detector watch is not restarted on reload.)
+    /// A config change that switches `vpn_name` resets `last_info`/`vpn_up` and
+    /// re-arms the watch (see [`Self::adopt_config`]), so the old interface is
+    /// reverted and the new watch resamples; `last_info.interface_name` therefore
+    /// matches `vpn_name` whenever the configured interface is up.
     fn desired(&self) -> Option<(VpnInfo, Vec<String>)> {
         let active = self.config.enabled && self.vpn_up && !self.config.vpn_hosts.is_empty();
         match &self.last_info {
@@ -236,11 +252,51 @@ impl StateMachine {
         }
     }
 
+    /// Drive the system toward [`Self::desired`], then opportunistically retry
+    /// cleanup of any interface orphaned by an earlier failed switch-revert. The
+    /// primary reconcile outcome is what callers surface; the orphan cleanup is
+    /// best-effort (and almost always a no-op — the list is empty).
+    async fn reconcile(&mut self) -> Result<(), PlatformError> {
+        let result = self.reconcile_primary().await;
+        self.revert_orphaned().await;
+        result
+    }
+
+    /// Best-effort cleanup of interfaces orphaned by a failed revert during a
+    /// live switch (see [`Self::adopt_config`]): the new interface's successful
+    /// apply overwrites `applied`, so a stale old interface is tracked in
+    /// `orphaned` instead and reverted here whenever the backend recovers.
+    /// Successes drop from the list; failures stay for the next attempt.
+    async fn revert_orphaned(&mut self) {
+        if self.orphaned.is_empty() {
+            return;
+        }
+        for interface in std::mem::take(&mut self.orphaned) {
+            let backend = self.backend.clone();
+            let interface_for_revert = interface.clone();
+            match tokio::task::spawn_blocking(move || backend.revert_rules(&interface_for_revert))
+                .await
+            {
+                Ok(Ok(())) => {
+                    log::info!("cleaned up orphaned interface {interface} after a switch")
+                }
+                Ok(Err(e)) => {
+                    log::warn!("orphaned interface {interface} still needs cleanup: {e}");
+                    self.orphaned.push(interface);
+                }
+                Err(e) => {
+                    log::error!("orphan revert task panicked for {interface}: {e}");
+                    self.orphaned.push(interface);
+                }
+            }
+        }
+    }
+
     /// Drive the system toward [`Self::desired`], applying or reverting only
     /// when reality differs from the goal (so it is idempotent and a no-op
     /// when already converged). Returns the backend outcome so callers can
     /// surface a failure instead of silently swallowing it.
-    async fn reconcile(&mut self) -> Result<(), PlatformError> {
+    async fn reconcile_primary(&mut self) -> Result<(), PlatformError> {
         match self.desired() {
             Some((info, domains)) => {
                 let target = Applied {
@@ -362,6 +418,22 @@ impl StateMachine {
         self.on_event(event).await;
     }
 
+    /// Handle a forwarded [`StateCommand::WatchEnded`]. If it is for the *current*
+    /// watch — not one already superseded by a re-arm — the detector terminated
+    /// on its own, so no further VPN events can arrive and auto-apply is off;
+    /// mark the detector unhealthy. A superseded generation is the expected
+    /// teardown of a re-arm and is ignored.
+    pub fn on_watch_ended(&mut self, generation: u64) {
+        if generation != self.watch_generation {
+            return;
+        }
+        log::warn!(
+            "VPN watch for {} ended on its own; auto-apply is off until re-armed",
+            self.config.vpn_name
+        );
+        self.detector_health = DetectorHealth::Error("watch stream ended".to_string());
+    }
+
     pub async fn on_event(&mut self, event: VpnEvent) {
         match event {
             VpnEvent::Up(info) => {
@@ -404,21 +476,37 @@ impl StateMachine {
     }
 
     /// Revert active rules on shutdown so the system never stays
-    /// half-configured after the daemon exits. Returns `true` if the system
-    /// is left clean (revert succeeded or nothing was applied), `false` if a
-    /// revert failed and rules may still be in place.
+    /// half-configured after the daemon exits — both the currently-applied
+    /// interface and any orphaned by a failed live switch. Returns `true` if the
+    /// system is left clean, `false` if a revert failed and rules may remain.
     pub async fn shutdown(&mut self) -> bool {
-        if self.applied.is_none() {
-            log::info!("shutdown: nothing applied, nothing to revert");
-            return true;
-        }
-        log::info!("shutdown: reverting active rules");
-        match self.revert().await {
-            Ok(()) => true,
-            Err(e) => {
-                log::error!("shutdown: revert failed: {e}; system may be left half-configured");
-                false
+        // Retry any orphaned-interface cleanup first, so a switch whose old
+        // revert failed does not strand rules past shutdown.
+        self.revert_orphaned().await;
+        let applied_clean = if self.applied.is_none() {
+            true
+        } else {
+            log::info!("shutdown: reverting active rules");
+            match self.revert().await {
+                Ok(()) => true,
+                Err(e) => {
+                    log::error!("shutdown: revert failed: {e}; system may be left half-configured");
+                    false
+                }
             }
+        };
+        if applied_clean && self.orphaned.is_empty() {
+            log::info!("shutdown: system left clean");
+            true
+        } else {
+            if !self.orphaned.is_empty() {
+                log::error!(
+                    "shutdown: {} interface(s) orphaned by a failed switch still need cleanup; \
+                     system may be left half-configured",
+                    self.orphaned.len()
+                );
+            }
+            false
         }
     }
 
@@ -603,6 +691,31 @@ impl StateMachine {
         }
         let result = self.reconcile().await;
         if rearm {
+            // If reverting the old interface just failed, it is no longer the
+            // interface we are about to watch/apply, so the new interface's
+            // (successful) apply would overwrite `applied` and forget it. Hand it
+            // to the orphaned list, which a later reconcile or shutdown retries —
+            // otherwise a switch where old cleanup fails but new apply succeeds
+            // would strand the old interface's split-DNS rules.
+            let stale = match &self.applied {
+                Some(applied) if applied.interface != self.config.vpn_name => {
+                    Some(applied.interface.clone())
+                }
+                _ => None,
+            };
+            if let Some(interface) = stale {
+                log::warn!(
+                    "could not revert {} while switching to {}; tracking it for later cleanup",
+                    interface,
+                    self.config.vpn_name
+                );
+                if !self.orphaned.contains(&interface) {
+                    self.orphaned.push(interface);
+                }
+                // Let the new interface own `applied`/`needs_resync` from here.
+                self.applied = None;
+                self.needs_resync = false;
+            }
             self.arm_watch();
         }
         result
@@ -647,6 +760,9 @@ pub async fn run_state(
                 match command {
                     Some(StateCommand::Vpn { generation, event }) => {
                         machine.on_vpn_event(generation, event).await
+                    }
+                    Some(StateCommand::WatchEnded { generation }) => {
+                        machine.on_watch_ended(generation)
                     }
                     Some(StateCommand::Ipc { request, reply }) => {
                         let response = machine.on_request(request).await;
@@ -747,11 +863,14 @@ mod tests {
     }
 
     /// Shared state for [`MockDetectorFactory`]: which interfaces' `watch` should
-    /// fail, and a record of every watch armed (so a test can assert the old
-    /// watch was torn down on re-arm).
+    /// fail (return `Err`), which should arm but have their stream end at once
+    /// (return `Ok` then close — like NM returning the receiver before a failed
+    /// D-Bus connect), and a record of every watch armed (so a test can assert
+    /// the old watch was torn down on re-arm).
     #[derive(Default)]
     struct MockDetectorShared {
         fail: Mutex<HashSet<String>>,
+        die: Mutex<HashSet<String>>,
         watches: Mutex<Vec<Arc<WatchRecord>>>,
     }
 
@@ -800,6 +919,12 @@ mod tests {
                     "mock watch failed for {interface}"
                 )));
             }
+            if self.shared.die.lock().unwrap().contains(interface) {
+                // Arm successfully, then immediately close the stream (drop the
+                // sender): the async watch "succeeded" but produces no events.
+                let (_tx, rx) = mpsc::channel(1);
+                return Ok(rx);
+            }
             let record = Arc::new(WatchRecord {
                 interface: interface.to_string(),
                 stopped: AtomicBool::new(false),
@@ -826,16 +951,21 @@ mod tests {
         }
     }
 
-    /// Process the next forwarded VPN event (bounded wait), simulating the
-    /// `run_state` loop's `Vpn` arm so the re-arm tests can drive the watch's
-    /// streamed sample through `on_vpn_event` without spawning `run_state`.
-    async fn pump_one_vpn_event(
+    /// Process the next forwarded command (bounded wait), simulating the
+    /// `run_state` loop's `Vpn`/`WatchEnded` arms so the re-arm tests can drive
+    /// the watch's streamed sample and stream-end signal through the machine
+    /// without spawning `run_state`. Returns `false` on timeout/closed.
+    async fn pump_one_command(
         sm: &mut StateMachine,
         rx: &mut mpsc::Receiver<StateCommand>,
     ) -> bool {
         match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
             Ok(Some(StateCommand::Vpn { generation, event })) => {
                 sm.on_vpn_event(generation, event).await;
+                true
+            }
+            Ok(Some(StateCommand::WatchEnded { generation })) => {
+                sm.on_watch_ended(generation);
                 true
             }
             _ => false,
@@ -894,7 +1024,7 @@ mod tests {
 
     /// Build a machine wired to a [`MockDetectorFactory`], keeping the command
     /// receiver so the re-arm tests can pump the watch's forwarded events
-    /// (see [`pump_one_vpn_event`]).
+    /// (see [`pump_one_command`]).
     fn rearm_machine(
         backend: Arc<MockBackend>,
         shared: Arc<MockDetectorShared>,
@@ -1583,7 +1713,7 @@ mod tests {
         // Startup arm (generation 1) for wg0; its streamed sample applies on wg0.
         sm.arm_watch();
         assert!(
-            pump_one_vpn_event(&mut sm, &mut rx).await,
+            pump_one_command(&mut sm, &mut rx).await,
             "wg0 sample expected"
         );
         {
@@ -1608,7 +1738,7 @@ mod tests {
 
         // The new watch (generation 2) streams its sample → applies on wg1.
         assert!(
-            pump_one_vpn_event(&mut sm, &mut rx).await,
+            pump_one_command(&mut sm, &mut rx).await,
             "wg1 sample expected"
         );
         assert!(backend
@@ -1654,7 +1784,7 @@ mod tests {
 
         // Startup arm + sample on wg0.
         sm.arm_watch();
-        assert!(pump_one_vpn_event(&mut sm, &mut rx).await);
+        assert!(pump_one_command(&mut sm, &mut rx).await);
         assert_eq!(backend.applies.lock().unwrap().len(), 1);
 
         // Switch to tun9, whose watch cannot start.
@@ -1696,5 +1826,108 @@ mod tests {
             .unwrap()
             .iter()
             .all(|w| w.interface != "tun9"));
+    }
+
+    #[tokio::test]
+    async fn switch_where_old_revert_fails_orphans_then_cleans_up_the_old_interface() {
+        // Regression for the review: if the old interface's revert fails during a
+        // switch, the new interface's successful apply overwrites `applied` and
+        // would forget the old one. It must instead be tracked as orphaned and
+        // cleaned up once the backend recovers.
+        let backend = Arc::new(MockBackend::default());
+        let shared = Arc::new(MockDetectorShared::default());
+        let (mut sm, mut rx) = rearm_machine(
+            backend.clone(),
+            shared.clone(),
+            config(true, &["a.com"]),
+            "rearm-orphan",
+        );
+
+        // Apply on wg0.
+        sm.arm_watch();
+        assert!(pump_one_command(&mut sm, &mut rx).await);
+        assert_eq!(backend.applies.lock().unwrap()[0].0, "wg0");
+
+        // Switch to wg1, but the wg0 revert fails: wg0 is orphaned, not forgotten.
+        backend.set_fail_revert(true);
+        let view = ConfigView {
+            vpn_name: "wg1".to_string(),
+            vpn_backend: config::VpnBackend::default(),
+            openvpn_management: String::new(),
+            openvpn_management_password_file: None,
+            config_path: String::new(),
+        };
+        let resp = sm.on_request(Request::SetConfig(view)).await;
+        assert!(matches!(resp, Response::Error(_)), "old revert failed");
+        assert_eq!(sm.orphaned, vec!["wg0".to_string()]);
+        assert!(sm.applied.is_none(), "applied handed off to orphaned");
+
+        // The backend recovers; the new watch's apply on wg1 then drives a
+        // reconcile that also retries the orphaned wg0 cleanup.
+        backend.set_fail_revert(false);
+        assert!(pump_one_command(&mut sm, &mut rx).await);
+        assert!(
+            backend
+                .applies
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(iface, _)| iface == "wg1"),
+            "new interface applied"
+        );
+        assert!(
+            sm.orphaned.is_empty(),
+            "the orphaned old interface was cleaned up"
+        );
+        assert_eq!(
+            sm.applied.as_ref().unwrap().interface,
+            "wg1",
+            "applied now tracks the new interface"
+        );
+        // wg0 was reverted twice: the failed switch attempt, then the cleanup.
+        assert_eq!(
+            backend
+                .reverts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|i| *i == "wg0")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_stream_ending_on_its_own_marks_detector_error() {
+        // Regression for the review: `watch()` returning Ok does not mean the
+        // watch is alive — some detectors open their connection asynchronously
+        // and the stream can close at once (e.g. NM/D-Bus absent). The forwarding
+        // task reports that, and detector_health must stop showing Active.
+        let backend = Arc::new(MockBackend::default());
+        let shared = Arc::new(MockDetectorShared::default());
+        shared.die.lock().unwrap().insert("wg0".to_string());
+        let (mut sm, mut rx) = rearm_machine(
+            backend.clone(),
+            shared.clone(),
+            config(true, &["a.com"]),
+            "watch-dies",
+        );
+
+        // arm_watch optimistically set Active...
+        sm.arm_watch();
+        assert_eq!(sm.detector_health, DetectorHealth::Active);
+        // ...then the forwarding task signals the stream ended on its own.
+        assert!(
+            pump_one_command(&mut sm, &mut rx).await,
+            "a WatchEnded signal is expected"
+        );
+        let Response::Status(info) = sm.on_request(Request::Status).await else {
+            panic!("expected Status");
+        };
+        assert!(
+            matches!(info.detector_health, DetectorHealth::Error(_)),
+            "a watch that ends on its own must report an unhealthy detector, got {:?}",
+            info.detector_health
+        );
     }
 }
