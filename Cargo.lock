@@ -2858,7 +2858,7 @@ dependencies = [
 
 [[package]]
 name = "splitway-daemon"
-version = "0.0.1"
+version = "0.0.5"
 dependencies = [
  "core-foundation 0.9.4",
  "env_logger",
