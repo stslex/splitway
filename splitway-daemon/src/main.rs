@@ -5,6 +5,8 @@
 #[cfg(unix)]
 use std::env;
 #[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::exit;
 
 #[cfg(unix)]
@@ -28,9 +30,9 @@ mod detector;
 fn main() {
     env_logger::init();
     match env::args().parse_command() {
-        Ok(Command::Run) => daemon::run(),
+        Ok(Command::Run { config }) => daemon::run(config),
         Ok(Command::Status) => status(),
-        Ok(Command::Revert) => revert(),
+        Ok(Command::Revert { config }) => revert(config),
         Err(message) => {
             eprintln!("{message}");
             exit(2);
@@ -78,8 +80,9 @@ fn status() {
 /// daemon running — an escape hatch. Distinct from `splitway-cli disable`,
 /// which tells a *running* daemon to stop applying and persists that choice.
 #[cfg(unix)]
-fn revert() {
-    let interface = match config::get_config() {
+fn revert(config_path: Option<PathBuf>) {
+    let config_path = config_path.unwrap_or_else(config::config_file_path);
+    let interface = match config::load_config_from(&config_path) {
         Ok(config) => config.vpn_name,
         Err(e) => {
             eprintln!("failed to read config: {e}");

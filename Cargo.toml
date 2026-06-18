@@ -4,4 +4,5 @@ members = [
     "splitway-daemon",
     "splitway-cli",
     "splitway-shared",
+    "splitway-gui",
 ]

@@ -37,6 +37,13 @@ pub fn load_config_from(path: &Path) -> Result<LocalConfig, ConfigParseError> {
 }
 
 pub fn create_empty_config() -> Result<(), ConfigParseError> {
+    create_empty_config_at(&config_file_path())
+}
+
+/// Persist a fresh empty config at `path`. Separate from [`create_empty_config`]
+/// so the daemon can honor a `--config <PATH>` override (and so it is testable
+/// against a temp path).
+pub fn create_empty_config_at(path: &Path) -> Result<(), ConfigParseError> {
     let empty_config = LocalConfig {
         vpn_name: String::new(),
         vpn_hosts: Vec::new(),
@@ -44,7 +51,7 @@ pub fn create_empty_config() -> Result<(), ConfigParseError> {
         vpn_backend: VpnBackend::default(),
         openvpn: OpenVpnConfig::default(),
     };
-    save_config(&empty_config)
+    save_config_to(path, &empty_config)
 }
 
 /// Persist `config` to the real config location atomically.
@@ -175,6 +182,18 @@ pub enum VpnBackend {
     /// `OpenVpnDetector` for consistent casing across the codebase.
     #[serde(rename = "openvpn")]
     OpenVpn,
+}
+
+impl VpnBackend {
+    /// The canonical token for this backend — the same kebab-case string used
+    /// on disk and on the wire (via serde). Use this for user-facing output
+    /// instead of `Debug`, so the displayed value matches the config/IPC form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VpnBackend::NetworkManager => "network-manager",
+            VpnBackend::OpenVpn => "openvpn",
+        }
+    }
 }
 
 /// Connection settings for a standalone OpenVPN's management interface. Used
@@ -310,6 +329,16 @@ mod tests {
         assert_eq!(parsed.openvpn, OpenVpnConfig::default());
         assert!(parsed.openvpn.management.is_empty());
         assert!(parsed.openvpn.management_password_file.is_none());
+    }
+
+    #[test]
+    fn vpn_backend_as_str_matches_serde_token() {
+        // as_str() must stay in lockstep with the serde (kebab-case) form, so
+        // user-facing output matches the config/wire representation.
+        for backend in [VpnBackend::NetworkManager, VpnBackend::OpenVpn] {
+            let serde_token = serde_json::to_string(&backend).unwrap();
+            assert_eq!(serde_token, format!("\"{}\"", backend.as_str()));
+        }
     }
 
     #[test]

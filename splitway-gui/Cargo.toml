@@ -1,0 +1,27 @@
+[package]
+name = "splitway-gui"
+version = "0.0.1"
+edition = "2021"
+
+[[bin]]
+name = "splitway-gui"
+path = "src/main.rs"
+
+# The GUI is Unix-only, like the CLI's IPC (a Unix domain socket). Gate the
+# heavy egui/rfd stack behind `cfg(unix)` so the Windows release target never
+# pulls egui into a platform we do not ship; `main` has a non-Unix stub that
+# matches how `splitway-cli` / `splitway-daemon` guard their Unix-only paths.
+[target.'cfg(unix)'.dependencies]
+splitway-shared = { path = "../splitway-shared" }
+# Pin the lighter glow (OpenGL) renderer instead of the default wgpu/Vulkan
+# backend: fewer native deps to install in CI (just GL + windowing) and it
+# matches the roadmap's "fastest to ship" intent.
+eframe = { version = "0.34", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "wayland",
+    "x11",
+] }
+rfd = "0.15"
+log = "0.4.20"
+env_logger = "0.11"

@@ -29,6 +29,18 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # splitway-gui (eframe/egui, glow renderer) links a windowing/GL stack on
+      # Linux; install the dev libraries so clippy/test/build compile it. macOS
+      # uses system frameworks (Cocoa/Metal) and needs none. rfd uses the XDG
+      # desktop portal (pure-Rust zbus), so no GTK dev package is required.
+      - name: Install Linux GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev
+
       - name: Format
         run: cargo fmt --all -- --check
 
