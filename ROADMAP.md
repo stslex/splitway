@@ -65,15 +65,27 @@ Each item is now a small isolated impl thanks to Phase 1.
 
 ## Phase 4 — Primitive GUI
 
-Goal: enable/disable toggle + config file selection. Nothing more in v1.
+Goal: enable/disable toggle, read-only status, config-file selection, and config editing. Still deliberately minimal — no tray icon, notifications, or per-domain status.
 
-- Talks to the daemon over the same IPC socket as the CLI — zero duplicated logic, zero privileges in the GUI process
+- Talks to the daemon over the same IPC socket as the CLI — zero duplicated logic, zero privileges in the GUI process. This rules out the GUI writing the config file itself (a second writer racing the daemon's own writes, and impossible against a root daemon)
+- Editing the config over IPC needs a small, additive protocol extension: get/set-config verbs handled by the daemon's single-writer state actor, plus a `PROTOCOL_VERSION` bump. The toggle, status, and domain editing already fit the existing verbs
 - Stack: `egui` (pure Rust, trivially cross-platform Linux/macOS, fastest to ship). Alternative if more native feel is wanted later: `iced`. GTK4/libadwaita dropped — poor macOS story
 - Depends on Phase 2 (IPC) only; can start in parallel with Phase 3
 
-**Done when:** toggle + config picker work on Linux and macOS against a live daemon.
+**Done when:** toggle, status, config picker, and config editing work on Linux and macOS against a live daemon — all over IPC, with no privileges in the GUI.
 
-## Phase 5 — Packaging & release
+## Phase 5 — GUI usability: live config, interface selection, polish
+
+Goal: make the Phase 4 GUI correct and presentable — config changes take effect live, the VPN interface is picked from a list, and the window looks decent.
+
+- Daemon: re-arm the VPN watch live when `vpn_name`/`vpn_backend`/`openvpn` change (via `SetConfig`/`ReloadConfig`), so the restart-on-`vpn_name` caveat disappears and `vpn_up` reflects the configured interface immediately. The existing detectors are reused unchanged — only their lifecycle (start/stop/restart) becomes dynamic, with the old interface reverted on switch and no half-configured state
+- Daemon: a `ListInterfaces` IPC verb enumerating local interfaces (name + up/down, VPN-like flagged) so the GUI can offer an interface picker without itself touching the platform or holding privileges. Additive `PROTOCOL_VERSION` bump
+- GUI: `vpn_name` becomes a picker over the live interface list (free-text fallback kept); a Resync button (re-read config + reconcile + refresh the view); immediate refresh after every change; and a real visual pass (opaque panel, grouped sections, aligned fields — the current build renders with a transparent background)
+- Still a pure IPC client: zero privileges, zero duplicated logic. Builds directly on Phase 4
+
+**Done when:** changing `vpn_name` in the GUI re-points auto-apply with no daemon restart and `vpn_up` tracks it; the interface picker lists present interfaces; Resync works; the GUI looks presentable on Linux and macOS against a live daemon.
+
+## Phase 6 — Packaging & release
 
 Goal: distributable packages + a release pipeline. Deliberately deferred until here: releasing before the daemon is real (Phase 2) would ship a one-shot CLI that misses the headline feature and burns first impressions.
 
