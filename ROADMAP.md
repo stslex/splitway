@@ -74,7 +74,18 @@ Goal: enable/disable toggle, read-only status, config-file selection, and config
 
 **Done when:** toggle, status, config picker, and config editing work on Linux and macOS against a live daemon — all over IPC, with no privileges in the GUI.
 
-## Phase 5 — Packaging & release
+## Phase 5 — GUI usability: live config, interface selection, polish
+
+Goal: make the Phase 4 GUI correct and presentable — config changes take effect live, the VPN interface is picked from a list, and the window looks decent.
+
+- Daemon: re-arm the VPN watch live when `vpn_name`/`vpn_backend`/`openvpn` change (via `SetConfig`/`ReloadConfig`), so the restart-on-`vpn_name` caveat disappears and `vpn_up` reflects the configured interface immediately. The existing detectors are reused unchanged — only their lifecycle (start/stop/restart) becomes dynamic, with the old interface reverted on switch and no half-configured state
+- Daemon: a `ListInterfaces` IPC verb enumerating local interfaces (name + up/down, VPN-like flagged) so the GUI can offer an interface picker without itself touching the platform or holding privileges. Additive `PROTOCOL_VERSION` bump
+- GUI: `vpn_name` becomes a picker over the live interface list (free-text fallback kept); a Resync button (re-read config + reconcile + refresh the view); immediate refresh after every change; and a real visual pass (opaque panel, grouped sections, aligned fields — the current build renders with a transparent background)
+- Still a pure IPC client: zero privileges, zero duplicated logic. Builds directly on Phase 4
+
+**Done when:** changing `vpn_name` in the GUI re-points auto-apply with no daemon restart and `vpn_up` tracks it; the interface picker lists present interfaces; Resync works; the GUI looks presentable on Linux and macOS against a live daemon.
+
+## Phase 6 — Packaging & release
 
 Goal: distributable packages + a release pipeline. Deliberately deferred until here: releasing before the daemon is real (Phase 2) would ship a one-shot CLI that misses the headline feature and burns first impressions.
 
