@@ -358,8 +358,8 @@ mod tests {
             Ok("corp.example.com".to_string())
         );
         assert_eq!(
-            validate_domain("internal-host.corp"),
-            Ok("internal-host.corp".to_string())
+            validate_domain("internal-host.example"),
+            Ok("internal-host.example".to_string())
         );
         assert_eq!(validate_domain("localhost"), Ok("localhost".to_string()));
     }
