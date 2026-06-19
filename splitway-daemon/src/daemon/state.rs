@@ -595,7 +595,20 @@ impl StateMachine {
     /// interface's watch repopulates them, so `last_info.interface_name` always
     /// matches `config.vpn_name` while up; a stale mismatch (were it ever to
     /// occur) is reported as `NoDnsFromVpn` rather than a near-unreachable state.
+    ///
+    /// A known out-of-sync condition takes precedence over every "inactive"
+    /// reason: a failed apply/revert (`needs_resync`) or an interface orphaned by
+    /// a failed switch (`orphaned` non-empty) means stale split-DNS rules may
+    /// still be installed somewhere, so reporting `Disabled`/`Applied`/etc. would
+    /// claim a clean state the daemon does not believe in. Both surface as
+    /// `ApplyFailed` ("out of sync") until cleanup succeeds — e.g. a `Disable`
+    /// whose revert failed reads `ApplyFailed`, not `Disabled`.
     fn routing_state(&self) -> RoutingState {
+        // Out-of-sync (a failed apply/revert, or a lingering orphaned interface)
+        // overrides the inactive-reason branches below — see the doc above.
+        if self.needs_resync || !self.orphaned.is_empty() {
+            return RoutingState::ApplyFailed;
+        }
         if !self.config.enabled {
             return RoutingState::Disabled;
         }
@@ -1734,6 +1747,40 @@ mod tests {
         });
         let mut sm = machine(backend, config(true, &["a.com"]), "rs-failed");
         sm.on_event(vpn_up("wg0")).await;
+        assert_eq!(sm.routing_state(), RoutingState::ApplyFailed);
+
+        // Disabled, but the disable's revert failed (applied still set,
+        // needs_resync): stale DNS may linger, so this must read ApplyFailed
+        // rather than a clean Disabled.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend.clone(), config(true, &["a.com"]), "rs-disable-fail");
+        sm.on_event(vpn_up("wg0")).await;
+        backend.set_fail_revert(true);
+        let _ = sm.on_request(Request::Disable).await;
+        assert!(!sm.config.enabled);
+        assert!(sm.applied.is_some() && sm.needs_resync);
+        assert_eq!(sm.routing_state(), RoutingState::ApplyFailed);
+
+        // A switch whose old-interface revert failed leaves it orphaned while the
+        // new interface applies cleanly (applied set, needs_resync false): stale
+        // rules linger on the old link, so this must read ApplyFailed rather than
+        // a clean Applied.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend.clone(), config(true, &["a.com"]), "rs-orphan");
+        sm.on_event(vpn_up("wg0")).await;
+        backend.set_fail_revert(true);
+        let to_wg1 = ConfigView {
+            vpn_name: "wg1".to_string(),
+            vpn_backend: config::VpnBackend::default(),
+            openvpn_management: String::new(),
+            openvpn_management_password_file: None,
+            config_path: String::new(),
+        };
+        let _ = sm.on_request(Request::SetConfig(to_wg1)).await;
+        sm.on_event(vpn_up("wg1")).await;
+        assert_eq!(sm.applied.as_ref().unwrap().interface, "wg1");
+        assert_eq!(sm.orphaned, vec!["wg0".to_string()]);
+        assert!(!sm.needs_resync);
         assert_eq!(sm.routing_state(), RoutingState::ApplyFailed);
     }
 
