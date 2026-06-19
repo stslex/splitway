@@ -29,7 +29,7 @@ Stand up a real standalone OpenVPN (the user will provide one) and capture, from
 
 Add a standalone-OpenVPN detector under `splitway-daemon/src/detector/linux/openvpn/` (mirror the existing thin-plumbing / pure-logic split — see `detector/linux/dbus.rs` vs `state.rs`, and the macOS `watch.rs` vs `state.rs`):
 
-- **`parser.rs` (pure, unit-tested).** Parse a management `>STATE` line to a state token; parse a `PUSH_REPLY` line to `Vec<String>` of DNS servers (`dhcp-option DNS <ip>`, v4 + v6; ignore non-DNS options). No I/O. Cover with fixtures from the investigation.
+- **`parser.rs` (pure, unit-tested).** Parse a management `>STATE` line to a state token; parse a `PUSH_REPLY` line to `Vec<String>` of DNS servers (`dhcp-option DNS <ip>`, v4 + v6; ignore non-DNS options). No I/O. Cover with fixtures from the investigation (**redacted: placeholder IPs/domains only, never real captured values**).
 - **`state.rs` (pure, unit-tested).** Map OpenVPN state tokens to a transition: `CONNECTED` → `Up`; `EXITING` → `Down`; `RECONNECTING` → `Down`; intermediate/unknown (`CONNECTING`, `WAIT`, `AUTH`, `GET_CONFIG`, `ASSIGN_IP`, `ADD_ROUTES`, `RESOLVE`, ...) → ignored. Reuse the `Deduper`/`Transition` pattern from `detector/linux/state.rs` (lift it to a shared spot if cleaner than duplicating; do not regress the NM tests).
 - **`mgmt.rs` (thin, not unit-tested).** Connect to the management socket (`tokio::net::TcpStream` / `UnixStream`), authenticate if a password is configured, send `state on` + `log on`, and read lines with `BufReader::lines()`. Feed parsed transitions + DNS into the same `tokio::sync::mpsc::Sender<VpnEvent>` contract the other detectors use; honor `tx.closed()` to stop (mirror `watch_loop`'s `tokio::select!`). Keep client commands **read-only** (`state`, `log`); never send `signal`/`hold`.
 - **`OpenVpnDetector` implementing `VpnDetector`.** `watch()` spawns the `mgmt` task on the ambient tokio runtime (mirror `LinuxDetector::watch`). `detect()` does a one-shot connect → `state` (+ replayed `log` if Q3 supports it) → `VpnInfo`.
@@ -65,8 +65,8 @@ Add a standalone-OpenVPN detector under `splitway-daemon/src/detector/linux/open
 ## Done criteria
 
 - fmt, clippy, tests green on CI (ubuntu + macos compile).
-- On a real standalone OpenVPN (no NM) on Linux: connecting auto-applies rules and the configured domains resolve through the VPN; disconnecting reverts — through the running daemon. Manual log with `resolvectl status <tun>` before/after in the PR.
-- `>STATE` parsing, `PUSH_REPLY` DNS parsing, state→transition mapping, and dedup unit-tested as pure functions with real-capture fixtures.
+- On a real standalone OpenVPN (no NM) on Linux: connecting auto-applies rules and the configured domains resolve through the VPN; disconnecting reverts — through the running daemon. Manual log with `resolvectl status <tun>` before/after in the PR (**redacted to placeholder IPs/domains**).
+- `>STATE` parsing, `PUSH_REPLY` DNS parsing, state→transition mapping, and dedup unit-tested as pure functions with synthetic fixtures (placeholder IPs/domains only).
 - Verified: a management-socket drop while the VPN stays up does **not** revert rules; reconnect resumes watching after an OpenVPN restart.
 - No-pushed-DNS behavior implemented and verified.
 - Pre-3c configs still load and still select the NM detector (back-compat test).
