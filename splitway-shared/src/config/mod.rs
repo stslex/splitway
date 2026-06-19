@@ -295,7 +295,7 @@ mod tests {
     fn local_config_serde_round_trip() {
         let config = LocalConfig {
             vpn_name: "wg0".to_string(),
-            vpn_hosts: vec!["example.com".to_string(), "internal.corp".to_string()],
+            vpn_hosts: vec!["example.com".to_string(), "internal.example".to_string()],
             enabled: false,
             vpn_backend: VpnBackend::OpenVpn,
             openvpn: OpenVpnConfig {
