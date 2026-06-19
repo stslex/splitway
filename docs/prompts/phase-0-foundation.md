@@ -19,7 +19,7 @@ fn parse_dns_from_nmcli(output: &str) -> Result<Vec<String>, PlatformError>
 
 - Collect all `IP4.DNS[n]` entries (and `IP6.DNS[n]` if present) instead of the current first-line-containing-"DNS" heuristic, which is fragile and silently drops secondary servers
 - `detect_vpn` keeps running `nmcli` and delegates parsing to this function
-- Unit tests: realistic `nmcli device show` output with one DNS entry, multiple entries, IPv6 entries, no DNS entries (must return `ParseError`), empty input
+- Unit tests: realistic but **synthetic** `nmcli device show` output (placeholder IPs/domains only — RFC 5737 / `example.com`, never real captured values) with one DNS entry, multiple entries, IPv6 entries, no DNS entries (must return `ParseError`), empty input
 
 ### 2. Rollback in apply_rules
 
