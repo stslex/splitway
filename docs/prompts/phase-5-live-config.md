@@ -226,7 +226,8 @@ polish, no theming pass beyond the one fix below.
 - **Live switch (Linux), no restart:** changing `vpn_name` between two interfaces
   in the GUI re-points auto-apply, `vpn_up` tracks the configured interface, and
   the old interface is reverted on switch (no half-configured state). Manual log +
-  before/after `resolvectl status` in the PR.
+  before/after `resolvectl status` in the PR (**redacted to placeholder IPs/domains —
+  never paste real resolver IPs or internal domain names; see CLAUDE.md**).
 - The interface picker lists current interfaces (up flagged) and selecting one
   saves via `SetConfig`; a down/absent configured interface is still shown.
 - `StatusInfo` exposes the applied mapping, `routing_state`, and
@@ -254,5 +255,6 @@ Description: the re-arm lifecycle design (actor-owned watch + the
 cancellation/teardown you relied on per detector + the sample approach you chose),
 the `ListInterfaces` design, the `StatusInfo` additions, the Resync + unsaved-edit
 decision, the `PROTOCOL_VERSION` bump, before/after screenshots, the manual
-live-switch verification log (with `resolvectl status`), and the done-criteria
-checklist.
+live-switch verification log (with `resolvectl status`) — **all redacted to
+placeholder IPs/domains (RFC 5737 / `example.com`); never paste real resolver IPs
+or internal domain names (see CLAUDE.md)** — and the done-criteria checklist.
