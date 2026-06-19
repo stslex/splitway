@@ -63,3 +63,15 @@ jobs:
 
       - name: Build
         run: nix build --print-build-logs
+
+  scrub-guard:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Guards against committing real infrastructure data (real resolver IPs /
+      # internal domains from pasted resolvectl/nmcli/scutil output). See the
+      # "Redaction" section in CLAUDE.md.
+      - name: Check for leaked infrastructure data
+        run: bash scripts/check-no-leaked-infra.sh

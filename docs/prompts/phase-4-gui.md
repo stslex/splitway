@@ -229,6 +229,6 @@ PR into `dev` titled `Phase 4: Primitive GUI`. Description: the
 config-editing/selection-over-IPC design decision with rationale (and the
 rejected direct-file-write alternative), the `PROTOCOL_VERSION` bump and
 compatibility rule, the threading model, the privilege/reachability notes per
-`ClientError` variant, screenshots of the GUI on Linux and macOS, the manual
+`ClientError` variant, screenshots of the GUI on Linux and macOS (**with any real domains/IPs redacted**), the manual
 verification log, the done-criteria checklist, and any deferred follow-ups
 (runtime config-file switching, etc.).

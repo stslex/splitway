@@ -42,7 +42,7 @@ Replace the `detector/macos.rs` stub:
 ## Done criteria
 
 - fmt, clippy, tests green on CI (ubuntu + macos)
-- On real macOS hardware: connecting the VPN auto-applies `/etc/resolver` entries and DNS for the configured domains resolves through the VPN; disconnecting reverts and removes only daemon-owned files — manual verification log (with `scutil --dns` before/after) in the PR
+- On real macOS hardware: connecting the VPN auto-applies `/etc/resolver` entries and DNS for the configured domains resolves through the VPN; disconnecting reverts and removes only daemon-owned files — manual verification log (with `scutil --dns` before/after, **redacted to placeholder IPs/domains**) in the PR
 - `splitway-cli status/enable/disable/add/remove` drive the daemon on macOS over the same socket
 - DNS/interface parsing and event mapping unit-tested as pure functions
 - Revert never touches resolver files the daemon didn't create (verified)
