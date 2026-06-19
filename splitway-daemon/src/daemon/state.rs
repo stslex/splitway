@@ -266,8 +266,21 @@ impl StateMachine {
     /// live switch (see [`Self::adopt_config`]): the new interface's successful
     /// apply overwrites `applied`, so a stale old interface is tracked in
     /// `orphaned` instead and reverted here whenever the backend recovers.
-    /// Successes drop from the list; failures stay for the next attempt.
+    /// Successes drop from the list; failures stay for the next attempt. The
+    /// currently-applied interface is never reverted here — a switch back to a
+    /// still-orphaned interface re-applies its rules, and `applied` (not this
+    /// list) then owns them.
     async fn revert_orphaned(&mut self) {
+        // The currently-applied interface is owned by `applied`, never orphaned:
+        // if the user switched back to an interface still awaiting orphan cleanup
+        // and a fresh `Up` just re-applied its rules in `reconcile_primary`,
+        // reverting it here would tear those live rules down while `applied` still
+        // reports them installed. Drop it from the list — `applied` owns its
+        // lifecycle now (a later down/disable/switch reverts it through `revert`).
+        if let Some(applied) = &self.applied {
+            self.orphaned
+                .retain(|interface| interface != &applied.interface);
+        }
         if self.orphaned.is_empty() {
             return;
         }
@@ -466,12 +479,20 @@ impl StateMachine {
             Request::ReloadConfig => self.reload_config().await,
             Request::GetConfig => Response::Config(self.config_view()),
             Request::SetConfig(view) => self.set_config(view).await,
-            Request::ListInterfaces => match list_interfaces() {
-                Ok(interfaces) => Response::Interfaces(interfaces),
-                // Enumeration failure is a clean error to the client, never a
-                // panic — the GUI falls back to free-text entry.
-                Err(e) => Response::Error(format!("failed to list interfaces: {e}")),
-            },
+            Request::ListInterfaces => {
+                // Enumeration is blocking platform I/O (reads `/sys/class/net` on
+                // Linux, `getifaddrs` on macOS) and the GUI re-polls it on every
+                // refresh, so run it on the blocking pool — like apply/revert —
+                // rather than on the actor task, where it would stall VPN-event
+                // and IPC handling while the syscalls run.
+                match tokio::task::spawn_blocking(list_interfaces).await {
+                    Ok(Ok(interfaces)) => Response::Interfaces(interfaces),
+                    // Enumeration failure is a clean error to the client, never a
+                    // panic — the GUI falls back to free-text entry.
+                    Ok(Err(e)) => Response::Error(format!("failed to list interfaces: {e}")),
+                    Err(e) => Response::Error(format!("interface enumeration task panicked: {e}")),
+                }
+            }
         }
     }
 
@@ -1895,6 +1916,93 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn switching_back_to_an_orphaned_interface_does_not_revert_freshly_applied_rules() {
+        // Regression for the review: an interface can be orphaned (its
+        // switch-away revert failed) and then become the active interface again
+        // (the user switches back) before its cleanup succeeds. Once a fresh `Up`
+        // re-applies its rules, the opportunistic orphan cleanup must NOT revert
+        // them — that would strip live DNS while `applied` still reports them
+        // installed.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "orphan-switchback",
+        );
+
+        // Apply on wg0.
+        sm.on_event(vpn_up("wg0")).await;
+        assert_eq!(sm.applied.as_ref().unwrap().interface, "wg0");
+
+        // Switch to wg1 with reverts failing: wg0's revert fails, so it is
+        // orphaned (not forgotten) and `applied` is handed off to the new target.
+        backend.set_fail_revert(true);
+        let to_wg1 = ConfigView {
+            vpn_name: "wg1".to_string(),
+            vpn_backend: config::VpnBackend::default(),
+            openvpn_management: String::new(),
+            openvpn_management_password_file: None,
+            config_path: String::new(),
+        };
+        assert!(matches!(
+            sm.on_request(Request::SetConfig(to_wg1)).await,
+            Response::Error(_)
+        ));
+        assert_eq!(sm.orphaned, vec!["wg0".to_string()]);
+        assert!(sm.applied.is_none());
+
+        // Switch back to wg0 while cleanup is still failing: wg0 stays orphaned
+        // and is once again the configured interface.
+        let to_wg0 = ConfigView {
+            vpn_name: "wg0".to_string(),
+            vpn_backend: config::VpnBackend::default(),
+            openvpn_management: String::new(),
+            openvpn_management_password_file: None,
+            config_path: String::new(),
+        };
+        assert_eq!(
+            sm.on_request(Request::SetConfig(to_wg0)).await,
+            Response::Ok
+        );
+        assert_eq!(sm.orphaned, vec!["wg0".to_string()]);
+
+        // The backend recovers and wg0 comes back up: the fresh apply owns wg0,
+        // and orphan cleanup must skip it rather than revert what was just applied.
+        backend.set_fail_revert(false);
+        sm.on_event(vpn_up("wg0")).await;
+
+        assert_eq!(
+            sm.applied.as_ref().unwrap().interface,
+            "wg0",
+            "the re-applied interface is tracked as applied"
+        );
+        assert!(
+            sm.orphaned.is_empty(),
+            "wg0 is no longer orphaned — `applied` owns it now"
+        );
+        // wg0 was reverted exactly twice (the failed switch-away, then the failed
+        // orphan retry on switch-back) and NOT a third time after the re-apply.
+        assert_eq!(
+            backend
+                .reverts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|i| *i == "wg0")
+                .count(),
+            2,
+            "orphan cleanup must not revert the freshly re-applied interface"
+        );
+        // The final re-apply on wg0 did happen.
+        assert!(backend
+            .applies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(iface, _)| iface == "wg0"));
     }
 
     #[tokio::test]
