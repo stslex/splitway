@@ -238,9 +238,13 @@ impl SplitwayApp {
                 Request::ReloadConfig => self.finish_action("resync", reply.result, true),
                 Request::ListInterfaces => match reply.result {
                     Ok(Response::Interfaces(interfaces)) => self.interfaces = interfaces,
-                    // Enumeration failed or the daemon is unreachable: keep the
-                    // last list (the editor's free-text field is the fallback) and
-                    // reflect any transport/skew problem into the banner.
+                    // Keep the last list — the editor's free-text field is the
+                    // fallback. `note_connection_from` reflects a transport error
+                    // or version skew into the banner; a daemon-side enumeration
+                    // failure (`Ok(Response::Error(..))`) is deliberately tolerated
+                    // in silence rather than surfaced, because this verb is
+                    // re-polled every interval and a per-poll banner/message would
+                    // flap. The picker keeps working off the free-text field.
                     other => self.note_connection_from(&other),
                 },
                 // The GUI never issues this.
