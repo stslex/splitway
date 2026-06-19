@@ -53,6 +53,12 @@ impl DnsBackend for MacosBackend {
         }
         Ok(())
     }
+
+    fn reverts_globally(&self) -> bool {
+        // revert_rules removes every managed resolver file, not just one
+        // interface's — resolver files are keyed by domain (see revert_rules).
+        true
+    }
 }
 
 /// Prior on-disk state of a resolver file before this apply touched it, used to

@@ -47,4 +47,19 @@ pub trait DnsBackend: Send + Sync {
 
     /// Show DNS status for the given interface.
     fn status(&self, interface: &str) -> Result<(), PlatformError>;
+
+    /// Whether [`Self::revert_rules`] ignores its `interface` argument and
+    /// reverts *all* managed DNS state at once, rather than only the named
+    /// interface's. macOS is global (it removes every managed `/etc/resolver`
+    /// file, which are keyed by domain, not interface); Linux reverts per link.
+    ///
+    /// The state machine uses this to decide whether it may track and later
+    /// clean a single interface orphaned by a failed live switch: on a
+    /// global-revert backend that cleanup would also tear down the
+    /// currently-applied interface's rules, so orphan tracking is suppressed —
+    /// the next apply overwrites the shared state and any later revert is global
+    /// anyway.
+    fn reverts_globally(&self) -> bool {
+        false
+    }
 }

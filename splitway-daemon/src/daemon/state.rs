@@ -88,7 +88,10 @@ pub struct StateMachine {
     /// Interfaces whose rules a live switch could not revert, and which are no
     /// longer the configured interface — so the new interface's apply (which
     /// overwrites `applied`) would otherwise forget them. A later reconcile or
-    /// shutdown keeps retrying their cleanup. Almost always empty.
+    /// shutdown keeps retrying their cleanup. Almost always empty. Only populated
+    /// for per-interface-revert backends: a global-revert backend (macOS) never
+    /// orphans, because its revert would also wipe the active interface (see
+    /// [`Self::adopt_config`] and [`DnsBackend::reverts_globally`]).
     orphaned: Vec<String>,
     /// Set when the last apply/revert failed and left the real system state
     /// uncertain relative to `applied` (e.g. the Linux backend rolled the link
@@ -762,12 +765,24 @@ impl StateMachine {
         if rearm {
             // If reverting the old interface just failed, it is no longer the
             // interface we are about to watch/apply, so the new interface's
-            // (successful) apply would overwrite `applied` and forget it. Hand it
-            // to the orphaned list, which a later reconcile or shutdown retries —
-            // otherwise a switch where old cleanup fails but new apply succeeds
-            // would strand the old interface's split-DNS rules.
+            // (successful) apply would overwrite `applied` and forget it. On a
+            // per-interface backend (Linux/resolvectl) we hand it to the orphaned
+            // list, which a later reconcile or shutdown retries — otherwise a
+            // switch where old cleanup fails but new apply succeeds would strand
+            // the old interface's split-DNS rules.
+            //
+            // On a GLOBAL-revert backend (macOS removes every managed resolver
+            // file regardless of interface) we must NOT track it: the orphan
+            // cleanup's `revert_rules` would also wipe the freshly-applied
+            // interface's rules while `applied` still records them. There the new
+            // apply overwrites the same shared (per-domain) state and any future
+            // revert is global, so leaving `applied`/`needs_resync` as the
+            // failed-revert snapshot is correct and self-healing.
             let stale = match &self.applied {
-                Some(applied) if applied.interface != self.config.vpn_name => {
+                Some(applied)
+                    if applied.interface != self.config.vpn_name
+                        && !self.backend.reverts_globally() =>
+                {
                     Some(applied.interface.clone())
                 }
                 _ => None,
@@ -861,6 +876,7 @@ mod tests {
         reverts: Mutex<Vec<String>>,
         fail_apply: AtomicBool,
         fail_revert: AtomicBool,
+        global_revert: AtomicBool,
     }
 
     impl MockBackend {
@@ -870,6 +886,10 @@ mod tests {
 
         fn set_fail_revert(&self, fail: bool) {
             self.fail_revert.store(fail, Ordering::Relaxed);
+        }
+
+        fn set_reverts_globally(&self, global: bool) {
+            self.global_revert.store(global, Ordering::Relaxed);
         }
     }
 
@@ -899,6 +919,10 @@ mod tests {
 
         fn status(&self, _interface: &str) -> Result<(), PlatformError> {
             Ok(())
+        }
+
+        fn reverts_globally(&self) -> bool {
+            self.global_revert.load(Ordering::Relaxed)
         }
     }
 
@@ -2147,6 +2171,50 @@ mod tests {
         assert!(
             sm.orphaned.is_empty(),
             "the orphan is cleaned once the backend recovers"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_revert_backend_does_not_track_orphans_on_a_failed_switch() {
+        // Regression for the review: on a backend whose revert is global (macOS
+        // removes every managed resolver file regardless of interface), tracking a
+        // single orphaned interface is unsafe — the orphan cleanup's revert would
+        // also wipe the freshly-applied interface's rules while `applied` still
+        // records them. Such a backend must not orphan; the new apply overwrites
+        // the shared state instead.
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        let mut sm = machine(backend.clone(), config(true, &["a.com"]), "global-revert");
+
+        // Apply on wg0.
+        sm.on_event(vpn_up("wg0")).await;
+        assert_eq!(sm.applied.as_ref().unwrap().interface, "wg0");
+
+        // Switch to wg1 with reverts failing: a per-interface backend would orphan
+        // wg0, but a global-revert backend must not.
+        backend.set_fail_revert(true);
+        let to_wg1 = ConfigView {
+            vpn_name: "wg1".to_string(),
+            vpn_backend: config::VpnBackend::default(),
+            openvpn_management: String::new(),
+            openvpn_management_password_file: None,
+            config_path: String::new(),
+        };
+        let _ = sm.on_request(Request::SetConfig(to_wg1)).await;
+        assert!(
+            sm.orphaned.is_empty(),
+            "a global-revert backend must not track an orphaned interface"
+        );
+
+        // wg1 comes up and applies cleanly. Because nothing was orphaned, orphan
+        // cleanup never runs a (global) revert that would wipe wg1's fresh rules.
+        backend.set_fail_revert(false);
+        sm.on_event(vpn_up("wg1")).await;
+        assert_eq!(sm.applied.as_ref().unwrap().interface, "wg1");
+        assert!(sm.orphaned.is_empty());
+        assert!(
+            !backend.reverts.lock().unwrap().iter().any(|i| i == "wg1"),
+            "the freshly-applied interface must never be reverted by orphan cleanup"
         );
     }
 
