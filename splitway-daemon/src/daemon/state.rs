@@ -149,10 +149,16 @@ impl StateMachine {
     ///   at every await point, so the D-Bus connection / management socket is
     ///   released promptly when the receiver drops.
     /// - **macOS** (SCDynamicStore) is lazy by design — its CFRunLoop thread
-    ///   notices the dropped receiver on the next network/DNS change (which an
-    ///   interface switch reliably produces) and then stops; until then it sits
-    ///   parked. No stale events reach the actor (the receiver is gone), and the
-    ///   thread is reaped at process exit, so this is bounded, not a growing leak.
+    ///   notices the dropped receiver only inside its change callback, i.e. on
+    ///   the next network/DNS change, and then stops; until then it sits parked.
+    ///   A config-driven re-arm (e.g. editing `vpn_name` in the GUI) need not
+    ///   coincide with any network change, so on a quiet network each such re-arm
+    ///   leaves the previous thread parked until the next network/DNS event or
+    ///   process exit — i.e. transiently more than one can park. They hold no live
+    ///   resources and deliver no events (the receiver is gone), and all are
+    ///   reaped at process exit, so this is a bounded, self-healing backlog rather
+    ///   than a growing leak. Deterministic teardown (stopping the run loop from
+    ///   the actor on re-arm) is a macOS follow-up — see `detector/macos/watch.rs`.
     ///
     /// There is **no separate post-arm `detect()` sample**: every detector emits
     /// its current state as the first streamed event (NM samples the device
@@ -252,14 +258,19 @@ impl StateMachine {
         }
     }
 
-    /// Drive the system toward [`Self::desired`], then opportunistically retry
-    /// cleanup of any interface orphaned by an earlier failed switch-revert. The
-    /// primary reconcile outcome is what callers surface; the orphan cleanup is
-    /// best-effort (and almost always a no-op — the list is empty).
+    /// Drive the system toward [`Self::desired`], then retry cleanup of any
+    /// interface orphaned by an earlier failed switch-revert (almost always a
+    /// no-op — the list is empty).
+    ///
+    /// The primary reconcile is the caller's main action, so its failure takes
+    /// precedence. But when the primary succeeds while a known orphan still
+    /// carries stale rules, surface *that* failure rather than a clean `Ok`:
+    /// otherwise Disable/Resync/etc. would report success while split-DNS still
+    /// lingers on the orphaned link until shutdown or a later retry.
     async fn reconcile(&mut self) -> Result<(), PlatformError> {
-        let result = self.reconcile_primary().await;
-        self.revert_orphaned().await;
-        result
+        let primary = self.reconcile_primary().await;
+        let orphan = self.revert_orphaned().await;
+        primary.and(orphan)
     }
 
     /// Best-effort cleanup of interfaces orphaned by a failed revert during a
@@ -270,7 +281,11 @@ impl StateMachine {
     /// currently-applied interface is never reverted here — a switch back to a
     /// still-orphaned interface re-applies its rules, and `applied` (not this
     /// list) then owns them.
-    async fn revert_orphaned(&mut self) {
+    ///
+    /// Returns `Err` if any interface still needs cleanup after this attempt, so
+    /// [`Self::reconcile`] can surface the lingering half-configured state to
+    /// callers instead of masking it behind a successful primary reconcile.
+    async fn revert_orphaned(&mut self) -> Result<(), PlatformError> {
         // The currently-applied interface is owned by `applied`, never orphaned:
         // if the user switched back to an interface still awaiting orphan cleanup
         // and a fresh `Up` just re-applied its rules in `reconcile_primary`,
@@ -282,8 +297,9 @@ impl StateMachine {
                 .retain(|interface| interface != &applied.interface);
         }
         if self.orphaned.is_empty() {
-            return;
+            return Ok(());
         }
+        let mut last_err: Option<PlatformError> = None;
         for interface in std::mem::take(&mut self.orphaned) {
             let backend = self.backend.clone();
             let interface_for_revert = interface.clone();
@@ -296,12 +312,29 @@ impl StateMachine {
                 Ok(Err(e)) => {
                     log::warn!("orphaned interface {interface} still needs cleanup: {e}");
                     self.orphaned.push(interface);
+                    last_err = Some(e);
                 }
                 Err(e) => {
                     log::error!("orphan revert task panicked for {interface}: {e}");
+                    last_err = Some(PlatformError::CommandFailed(format!(
+                        "orphan revert task panicked for {interface}: {e}"
+                    )));
                     self.orphaned.push(interface);
                 }
             }
+        }
+        if self.orphaned.is_empty() {
+            Ok(())
+        } else {
+            // Name the lingering interface(s) so the surfaced message is not
+            // mistaken for the caller's primary action failing — these stale
+            // rules are a leftover from an earlier failed switch.
+            Err(PlatformError::CommandFailed(format!(
+                "stale split-DNS rules remain on {} (orphaned by an earlier failed switch) \
+                 and could not be cleaned up{}",
+                self.orphaned.join(", "),
+                last_err.map(|e| format!(": {e}")).unwrap_or_default()
+            )))
         }
     }
 
@@ -502,8 +535,10 @@ impl StateMachine {
     /// system is left clean, `false` if a revert failed and rules may remain.
     pub async fn shutdown(&mut self) -> bool {
         // Retry any orphaned-interface cleanup first, so a switch whose old
-        // revert failed does not strand rules past shutdown.
-        self.revert_orphaned().await;
+        // revert failed does not strand rules past shutdown. Its Result is
+        // intentionally ignored: shutdown reports cleanliness from the
+        // `self.orphaned` check below, which covers the same lingering set.
+        let _ = self.revert_orphaned().await;
         let applied_clean = if self.applied.is_none() {
             true
         } else {
@@ -1955,7 +1990,10 @@ mod tests {
         assert!(sm.applied.is_none());
 
         // Switch back to wg0 while cleanup is still failing: wg0 stays orphaned
-        // and is once again the configured interface.
+        // and is once again the configured interface. The switch's primary
+        // reconcile is a clean no-op (nothing is applied yet), but the orphan
+        // revert still fails, so the reply surfaces that lingering cleanup rather
+        // than a bare Ok (see `reconcile`).
         let to_wg0 = ConfigView {
             vpn_name: "wg0".to_string(),
             vpn_backend: config::VpnBackend::default(),
@@ -1963,10 +2001,13 @@ mod tests {
             openvpn_management_password_file: None,
             config_path: String::new(),
         };
-        assert_eq!(
-            sm.on_request(Request::SetConfig(to_wg0)).await,
-            Response::Ok
-        );
+        match sm.on_request(Request::SetConfig(to_wg0)).await {
+            Response::Error(msg) => assert!(
+                msg.contains("wg0"),
+                "the error should name the still-orphaned interface, got: {msg}"
+            ),
+            other => panic!("expected Error surfacing the orphan cleanup failure, got {other:?}"),
+        }
         assert_eq!(sm.orphaned, vec!["wg0".to_string()]);
 
         // The backend recovers and wg0 comes back up: the fresh apply owns wg0,
@@ -2003,6 +2044,63 @@ mod tests {
             .unwrap()
             .iter()
             .any(|(iface, _)| iface == "wg0"));
+    }
+
+    #[tokio::test]
+    async fn disable_surfaces_an_orphan_cleanup_failure_instead_of_reporting_ok() {
+        // Regression for the review: when an interface is orphaned by a failed
+        // switch, a later action whose own primary reconcile succeeds must not
+        // report Ok while the orphan's stale rules still cannot be cleaned. Here
+        // Disable's primary reconcile is a clean no-op (nothing is applied), yet
+        // the orphan revert keeps failing — `reconcile` folds that failure into
+        // its result so the caller is not told the system is clean.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend.clone(), config(true, &["a.com"]), "orphan-disable");
+
+        // Apply on wg0.
+        sm.on_event(vpn_up("wg0")).await;
+        assert_eq!(sm.applied.as_ref().unwrap().interface, "wg0");
+
+        // Switch to wg1 with reverts failing: wg0 is orphaned, applied handed off.
+        backend.set_fail_revert(true);
+        let to_wg1 = ConfigView {
+            vpn_name: "wg1".to_string(),
+            vpn_backend: config::VpnBackend::default(),
+            openvpn_management: String::new(),
+            openvpn_management_password_file: None,
+            config_path: String::new(),
+        };
+        assert!(matches!(
+            sm.on_request(Request::SetConfig(to_wg1)).await,
+            Response::Error(_)
+        ));
+        assert_eq!(sm.orphaned, vec!["wg0".to_string()]);
+        assert!(sm.applied.is_none());
+
+        // Disable: the primary reconcile reverts nothing (applied is None) and
+        // succeeds, but the orphaned wg0 still cannot be reverted — so the reply
+        // must be an Error that names wg0, not Ok.
+        match sm.on_request(Request::Disable).await {
+            Response::Error(msg) => assert!(
+                msg.contains("wg0"),
+                "Disable should surface the orphan cleanup failure, got: {msg}"
+            ),
+            other => panic!("expected Error surfacing the orphan cleanup failure, got {other:?}"),
+        }
+        assert_eq!(
+            sm.orphaned,
+            vec!["wg0".to_string()],
+            "the orphan stays tracked for a later retry"
+        );
+
+        // Once the backend recovers, the next reconcile (here via re-enable)
+        // cleans the orphan and the operation reports Ok again.
+        backend.set_fail_revert(false);
+        assert_eq!(sm.on_request(Request::Enable).await, Response::Ok);
+        assert!(
+            sm.orphaned.is_empty(),
+            "the orphan is cleaned once the backend recovers"
+        );
     }
 
     #[tokio::test]

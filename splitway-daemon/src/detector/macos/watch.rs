@@ -20,12 +20,19 @@
 //!
 //! The same laziness applies to a live watch **re-arm** (Phase 5): when the
 //! configured interface changes, the state machine drops this watch's receiver
-//! and arms a new one. This thread then stops on the next network/DNS change —
-//! which an interface switch reliably produces — so at most one superseded
-//! thread is parked at a time, and no stale event can reach the state machine
-//! (the receiver is gone, so `blocking_send` fails and the callback stops the
-//! run loop). NM / standalone-OpenVPN release promptly via `tx.closed()`; macOS
-//! trades that promptness for staying purely event-driven (no idle wakeups).
+//! and arms a new one. This thread then stops only on the next network/DNS
+//! change, when its callback observes the dropped receiver (`blocking_send`
+//! fails) and stops the run loop. A re-arm triggered purely by a config edit
+//! (e.g. changing `vpn_name` in the GUI) need not coincide with a network
+//! change, so on a quiet network each such re-arm leaves the previous thread
+//! parked until the next network/DNS event or process exit; several can be
+//! parked transiently. No stale event can reach the state machine (the receiver
+//! is gone), the parked threads hold no live resources, and all are reaped at
+//! process exit — a bounded, self-healing backlog, not a growing leak. NM /
+//! standalone-OpenVPN release promptly via `tx.closed()`; macOS trades that
+//! promptness for staying purely event-driven (no idle wakeups). Deterministic
+//! teardown (stopping this run loop from the actor on re-arm, rather than
+//! waiting for the next event) is a possible macOS follow-up.
 
 use std::cell::RefCell;
 use std::rc::Rc;
