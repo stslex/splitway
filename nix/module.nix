@@ -56,6 +56,28 @@ in
       ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
+
+      # `cp` for the one-time config migration in preStart below.
+      path = [ pkgs.coreutils ];
+
+      # One-time upgrade migration. The pre-5c module ran the daemon with no
+      # `--config`, so it used the daemon's default path — which, for this root
+      # service, resolves to /root/.config/splitway/config.json (whether or not
+      # systemd set $HOME, the daemon's own fallback is that path). Now the config
+      # lives in the StateDirectory. Seed the new path from the old one on the
+      # first start after an upgrade so an existing vpn_name/domains are not
+      # silently dropped (the daemon would otherwise create an empty config). The
+      # guard makes this a no-op on fresh installs and every later start, and it
+      # never overwrites an existing new-path config.
+      preStart = ''
+        old=/root/.config/splitway/config.json
+        new=/var/lib/splitway/config.json
+        if [ ! -e "$new" ] && [ -e "$old" ]; then
+          echo "splitway: migrating config from $old to $new"
+          cp -p "$old" "$new"
+        fi
+      '';
+
       serviceConfig = {
         # The writable config lives in the StateDirectory (below). On first run
         # the daemon creates an empty config there if absent.
