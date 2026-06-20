@@ -19,13 +19,15 @@ use crate::config::VpnBackend;
 /// the [`Response::Config`] reply. Bumped to `3` in Phase 5 for the additive
 /// `ListInterfaces` verb / [`Response::Interfaces`] reply and the richer
 /// [`StatusInfo`] (the `applied` mapping, [`RoutingState`] and
-/// [`DetectorHealth`] — all additive). The daemon enforces *strict equality*
-/// (see `daemon::ipc::process_line`): a v3 daemon rejects a v2 client and vice
-/// versa, so there is no silent mixed-version operation. The daemon, CLI and
-/// GUI all build from this one workspace, so they upgrade in lockstep; a
+/// [`DetectorHealth`] — all additive). Bumped to `4` in Phase 5c for the
+/// additive [`RoutingState::ConfigInvalid`] variant (the malformed-config freeze
+/// surfaced over IPC). The daemon enforces *strict equality* (see
+/// `daemon::ipc::process_line`): a daemon rejects a client whose version differs,
+/// and vice versa, so there is no silent mixed-version operation. The daemon, CLI
+/// and GUI all build from this one workspace, so they upgrade in lockstep; a
 /// mismatch only happens across separately-updated installs and is surfaced as
 /// actionable "update splitway" guidance, never a raw decode error.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Stable prefix the daemon uses to introduce a protocol-version-mismatch
 /// error reply. Shared so a client (CLI/GUI) can recognize skew and render
@@ -188,6 +190,11 @@ pub enum RoutingState {
     /// The last apply (or revert) failed, so the system may be out of sync and
     /// a re-apply is pending.
     ApplyFailed,
+    /// The config file on disk does not parse (a malformed hand-edit). Routing
+    /// reflects the last-good config the daemon froze on; this is the
+    /// highest-precedence state, and it clears automatically once the file
+    /// parses again. See the daemon's `on_config_changed`.
+    ConfigInvalid,
 }
 
 /// Health of the VPN-detector watch, set by the daemon when it (re-)arms the
@@ -244,6 +251,7 @@ impl std::fmt::Display for RoutingState {
             RoutingState::NoDnsFromVpn => "VPN up, but it pushes no DNS",
             RoutingState::Applied => "applied",
             RoutingState::ApplyFailed => "apply failed (out of sync)",
+            RoutingState::ConfigInvalid => "config file invalid (using last-good)",
         };
         f.write_str(text)
     }
@@ -519,6 +527,7 @@ mod tests {
             RoutingState::NoDnsFromVpn,
             RoutingState::Applied,
             RoutingState::ApplyFailed,
+            RoutingState::ConfigInvalid,
         ] {
             let json = serde_json::to_string(&state).unwrap();
             assert_eq!(serde_json::from_str::<RoutingState>(&json).unwrap(), state);
