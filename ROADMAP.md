@@ -80,20 +80,26 @@ Tauri replaces it.
 
 The sequence to v1, in order. Each is one phase = one branch = one PR.
 
-### Phase 5b — verification (reality) + domain normalization + route-check
+### Phase 5b — domain normalization + route-check (`CheckDomain`)
 
-- Extend `DnsBackend::status()` to **return** the live mapping (resolvectl on
-  Linux, `/etc/resolver` on macOS) instead of only printing it, so the daemon can
-  diff intended-vs-actual and surface drift — *reality* alongside Phase 5's
-  *belief*.
+Read-back / drift detection (extending `DnsBackend::status()` to *return* the
+live mapping) was originally bundled here but is **split into its own later
+phase** — it is a separate, lower-priority change to the status model. It shares
+the live-read backend seam this phase adds (`DnsBackend::resolve`), so it is
+de-risked, not blocked, by the split.
+
 - Domain normalization + case-insensitive dedup in `splitway-shared`, shared by
-  the daemon and every client, so the daemon no longer trusts raw IPC input.
+  the daemon and every client, so the daemon no longer trusts raw IPC input. The
+  daemon normalizes on `add_domain` and `CheckDomain` (forward-only — existing
+  config entries are not rewritten on load).
 - A **`CheckDomain(host)`** verb answering two questions:
   - **Coverage** (pure, suffix-aware): resolvectl routes a domain *and its
     subdomains*, so `vault.example.com` is already covered by a configured
     `example.com`. Not-covered → offer to add it.
-  - **Live resolution**: Linux-strong via systemd-resolved's resolving `ifindex`;
-    macOS best-effort.
+  - **Live resolution** via a new `DnsBackend::resolve`: Linux-strong (parsed
+    `resolvectl query`, which attributes the answering link); macOS best-effort
+    (no link/resolver attribution); unsupported-clean elsewhere. A resolution
+    failure is never an error — the check still returns coverage.
   - Input is a pasted **URL** → parse host → normalize; CLI `splitway check <url>`.
   - **Boundary:** coverage + resolution are in scope; **reachability is not** —
     Splitway governs DNS, not IP routing (see `docs/architecture.md`).
@@ -122,6 +128,16 @@ The config file becomes the authoritative state and the daemon stops caching it.
   `nixosModule` provisions the state dir and passes `--config`; the model is
   **imperative** (the daemon owns the writable file, the GUI mutates at runtime),
   not declarative — options may *seed* an initial config but must not *lock* it.
+
+### Phase 5d — verification (reality): live read-back + drift
+
+Lower-priority; deferred out of 5b. Builds on the `DnsBackend::resolve` live-read
+seam added in 5b.
+
+- Extend `DnsBackend::status()` to **return** the live mapping (resolvectl on
+  Linux, `/etc/resolver` on macOS) instead of only printing it — a sibling
+  `read_link_state` reusing 5b's parsing approach — so the daemon can diff
+  intended-vs-actual and surface drift: *reality* alongside Phase 5's *belief*.
 
 ### Phase 6 — packaging (distribution to other users)
 

@@ -16,12 +16,22 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
 use splitway_shared::config::{self, ConfigParseError, LocalConfig, OpenVpnConfig};
+use splitway_shared::domain::{self, normalize_host};
 use splitway_shared::ipc::{
-    AppliedInfo, ConfigView, DetectorHealth, Request, Response, RoutingState, StatusInfo,
+    AppliedInfo, ConfigView, DetectorHealth, DomainCheckInfo, Request, Response, RoutingState,
+    StatusInfo,
 };
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnDetector, VpnEvent, VpnInfo};
 
 use crate::interfaces::list_interfaces;
+
+/// Caps how many `CheckDomain` resolutions run concurrently. The detached
+/// route-check path is the one client-driven path not serialized by the actor
+/// (every other blocking call is `spawn_blocking` awaited by the actor, so at
+/// most one runs at a time), so without a bound a burst of `check` requests could
+/// fan out to many concurrent `resolvectl query` subprocesses. 8 is ample for
+/// interactive use while keeping a flood bounded.
+static CHECK_RESOLVE_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
 /// Builds the platform VPN detector for a config. Injected into the
 /// [`StateMachine`] (like [`DnsBackend`]) so the re-arm lifecycle can be driven
@@ -593,6 +603,12 @@ impl StateMachine {
                     Err(e) => Response::Error(format!("interface enumeration task panicked: {e}")),
                 }
             }
+            // `CheckDomain` is handled out-of-band in `run_state` (resolved on a
+            // detached task via `spawn_check_domain`, so a slow resolver cannot
+            // stall the actor); it never reaches this inline dispatch.
+            Request::CheckDomain(_) => {
+                Response::Error("internal error: CheckDomain is handled out-of-band".to_string())
+            }
         }
     }
 
@@ -756,11 +772,20 @@ impl StateMachine {
     /// preserved for the normal duplicate-add contract; a caller must not read it
     /// as "nothing happened".
     async fn add_domain(&mut self, domain: String) -> Response {
+        // Normalize the input (a pasted URL or host) before storing, so the
+        // config holds bare, lowercased hosts. Fail fast on bad input, before
+        // touching disk. Forward-only: existing entries are not rewritten.
+        let domain = match normalize_host(&domain) {
+            Ok(host) => host,
+            Err(e) => return Response::Error(format!("invalid domain: {e}")),
+        };
         let mut next = match self.load_fresh() {
             Ok(config) => config,
             Err(e) => return config_unreadable_reply(e),
         };
-        if next.vpn_hosts.iter().any(|d| d == &domain) {
+        // Host-equivalent dedup so `Example.com` / `example.com.` do not duplicate
+        // `example.com` (existing entries may be un-normalized; the new one is).
+        if next.vpn_hosts.iter().any(|d| domain::same_host(d, &domain)) {
             // Already present on disk: nothing to add. Still adopt the
             // freshly-loaded config (it may carry a concurrent external edit) and
             // reconcile, so the daemon converges to the source-of-truth file even
@@ -777,12 +802,111 @@ impl StateMachine {
         self.commit(next).await
     }
 
+    /// Handle a [`Request::CheckDomain`]: normalize the raw input to a host,
+    /// compute suffix-aware coverage against the configured routing domains, and
+    /// attempt a live resolution on the blocking pool. A resolution failure is
+    /// **not** a request failure — it returns `resolution: None`. The result
+    /// reports coverage and which resolver answered, not reachability.
+    ///
+    /// Resolved **off the actor on a detached task**: it snapshots the cheap state
+    /// (config domains, interface, enabled, vpn_up) synchronously, then resolves
+    /// and replies from a spawned task. This is deliberately not `on_request().
+    /// await`ed — a slow or hung resolver must never stall the actor (and thus VPN
+    /// reconciliation or other control requests). Coverage is computed from the
+    /// snapshot; a resolution failure replies with `resolution: None`, never an
+    /// `Error`. `&self`: it only reads.
+    fn spawn_check_domain(&self, raw: String, reply: oneshot::Sender<Response>) {
+        let host = match normalize_host(&raw) {
+            Ok(host) => host,
+            Err(e) => {
+                let _ = reply.send(Response::Error(format!("invalid domain: {e}")));
+                return;
+            }
+        };
+
+        // Coverage: the MOST specific configured domain that covers `host` (both
+        // sides normalized at compare time, so a pre-existing un-normalized entry
+        // still matches). With both `example.com` and `sub.example.com` configured,
+        // a check of `vault.sub.example.com` attributes to `sub.example.com` (the
+        // longest covering entry), not whichever appears first. Pure, no I/O.
+        let matched_domain = self
+            .config
+            .vpn_hosts
+            .iter()
+            .filter(|d| domain::domain_covers(d, &host))
+            .max_by_key(|d| d.len())
+            .cloned();
+        let backend = self.backend.clone();
+        let vpn_interface = self.config.vpn_name.clone();
+        let enabled = self.config.enabled;
+        let vpn_up = self.vpn_up;
+        // The daemon's belief about whether usable split-DNS is actually installed
+        // (covers VPN-up-but-no-DNS and apply-failed, which `enabled && vpn_up`
+        // would miss). The client keys its "routed right now" verdict on this.
+        let routing_state = self.routing_state();
+
+        // Detached: resolve (blocking I/O on the blocking pool) and reply here, so
+        // the actor returns immediately. A failure (NXDOMAIN, unsupported
+        // platform, …) degrades to `None`, never an `Error`. A small static
+        // semaphore bounds how many checks resolve concurrently — this detached
+        // path is the one client-driven path not serialized by the actor, so it
+        // must not fan out unbounded `resolvectl query` subprocesses.
+        tokio::spawn(async move {
+            let _permit = CHECK_RESOLVE_LIMIT.acquire().await.ok();
+            let host_for_resolve = host.clone();
+            let resolution =
+                match tokio::task::spawn_blocking(move || backend.resolve(&host_for_resolve)).await
+                {
+                    Ok(Ok(info)) => Some(info),
+                    Ok(Err(e)) => {
+                        log::debug!("resolution of {host} unavailable: {e}");
+                        None
+                    }
+                    Err(e) => {
+                        log::warn!("resolution task panicked for {host}: {e}");
+                        None
+                    }
+                };
+
+            let _ = reply.send(Response::DomainCheck(DomainCheckInfo {
+                host,
+                covered: matched_domain.is_some(),
+                matched_domain,
+                vpn_interface,
+                resolution,
+                enabled,
+                vpn_up,
+                routing_state,
+            }));
+        });
+    }
+
     async fn remove_domain(&mut self, domain: String) -> Response {
+        // An entry is a removal target if EITHER:
+        //   - it equals the raw input exactly, or
+        //   - the input normalizes and the entry is host-equivalent to it.
+        //
+        // The host-equivalent arm handles the normal case (`remove Example.com` /
+        // a pasted URL / a trailing dot removes the stored `example.com`). The
+        // exact-string arm is always tried too — not only when normalization
+        // fails — because a config predating normalization (the old CLI persisted
+        // arbitrary `AddDomain` strings) may hold a verbatim entry that does not
+        // fold to the normalized input, e.g. a stored `example.com:443` or
+        // `https://example.com/path`, or an entry the current normalizer rejects
+        // outright like `192.0.2.1`. Either way the user can remove exactly that
+        // listed string without hand-editing the config.
+        let normalized = normalize_host(&domain).ok();
+        let is_target = |d: &String| {
+            d == &domain
+                || normalized
+                    .as_ref()
+                    .is_some_and(|host| domain::same_host(d, host))
+        };
         let mut next = match self.load_fresh() {
             Ok(config) => config,
             Err(e) => return config_unreadable_reply(e),
         };
-        if !next.vpn_hosts.iter().any(|d| d == &domain) {
+        if !next.vpn_hosts.iter().any(&is_target) {
             // Absent on disk: nothing to remove. Adopt the freshly-loaded config
             // and reconcile anyway (mirroring the no-change `set_enabled` path):
             // an external edit may already have removed the domain, and its rules
@@ -793,7 +917,7 @@ impl StateMachine {
                 Err(e) => Response::Error(format!("failed to apply current state: {e}")),
             };
         }
-        next.vpn_hosts.retain(|d| d != &domain);
+        next.vpn_hosts.retain(|d| !is_target(d));
         self.commit(next).await
     }
 
@@ -1035,11 +1159,18 @@ pub async fn run_state(
                     Some(StateCommand::WatchEnded { generation }) => {
                         machine.on_watch_ended(generation)
                     }
-                    Some(StateCommand::Ipc { request, reply }) => {
-                        let response = machine.on_request(request).await;
-                        // The client may have hung up; that is fine.
-                        let _ = reply.send(response);
-                    }
+                    Some(StateCommand::Ipc { request, reply }) => match request {
+                        // Route checks resolve off the actor (see
+                        // `spawn_check_domain`), so a slow/hung resolver cannot
+                        // delay VPN reconciliation or other control requests.
+                        Request::CheckDomain(raw) => machine.spawn_check_domain(raw, reply),
+                        // Everything else replies inline.
+                        other => {
+                            let response = machine.on_request(other).await;
+                            // The client may have hung up; that is fine.
+                            let _ = reply.send(response);
+                        }
+                    },
                     Some(StateCommand::ConfigChanged) => machine.on_config_changed().await,
                     None => break,
                 }
@@ -1051,6 +1182,7 @@ pub async fn run_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use splitway_shared::ipc::ResolutionInfo;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
@@ -1065,6 +1197,11 @@ mod tests {
         fail_apply: AtomicBool,
         fail_revert: AtomicBool,
         global_revert: AtomicBool,
+        /// Scripted resolution: `Some(addrs)` → resolve returns those addresses
+        /// with `resolve_interface`; `None` → the default unsupported error.
+        resolve_addresses: Mutex<Option<Vec<String>>>,
+        resolve_interface: Mutex<Option<String>>,
+        fail_resolve: AtomicBool,
     }
 
     impl MockBackend {
@@ -1078,6 +1215,15 @@ mod tests {
 
         fn set_reverts_globally(&self, global: bool) {
             self.global_revert.store(global, Ordering::Relaxed);
+        }
+
+        fn set_resolution(&self, addresses: Vec<String>, via_interface: Option<String>) {
+            *self.resolve_addresses.lock().unwrap() = Some(addresses);
+            *self.resolve_interface.lock().unwrap() = via_interface;
+        }
+
+        fn set_fail_resolve(&self, fail: bool) {
+            self.fail_resolve.store(fail, Ordering::Relaxed);
         }
     }
 
@@ -1111,6 +1257,24 @@ mod tests {
 
         fn reverts_globally(&self) -> bool {
             self.global_revert.load(Ordering::Relaxed)
+        }
+
+        fn resolve(&self, _host: &str) -> Result<ResolutionInfo, PlatformError> {
+            if self.fail_resolve.load(Ordering::Relaxed) {
+                return Err(PlatformError::CommandFailed(
+                    "mock resolve failure".to_string(),
+                ));
+            }
+            match &*self.resolve_addresses.lock().unwrap() {
+                Some(addresses) => Ok(ResolutionInfo {
+                    addresses: addresses.clone(),
+                    via_interface: self.resolve_interface.lock().unwrap().clone(),
+                    via_dns: None,
+                }),
+                None => Err(PlatformError::Unsupported(
+                    "mock: no resolution scripted".to_string(),
+                )),
+            }
         }
     }
 
@@ -2758,5 +2922,201 @@ mod tests {
             applies_after_first,
             "recovery to an identical config must not re-apply (equality skip)"
         );
+    }
+
+    // ---- Phase 5b: CheckDomain route-check ----
+
+    fn domain_check(resp: Response) -> DomainCheckInfo {
+        match resp {
+            Response::DomainCheck(info) => info,
+            other => panic!("expected DomainCheck, got {other:?}"),
+        }
+    }
+
+    /// Drive the detached `CheckDomain` path the way `run_state` does — spawn it
+    /// with a reply channel and await the reply — so the tests exercise the real
+    /// off-actor handler rather than the inline `on_request` dispatch.
+    async fn check_via(sm: &StateMachine, raw: &str) -> Response {
+        let (tx, rx) = oneshot::channel();
+        sm.spawn_check_domain(raw.to_string(), tx);
+        rx.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn check_domain_normalizes_and_reports_suffix_coverage() {
+        let backend = Arc::new(MockBackend::default());
+        let sm = machine(backend, config(true, &["sub.example.com"]), "check-covered");
+
+        // A pasted URL whose host is a subdomain of a configured routing domain.
+        let info = domain_check(check_via(&sm, "https://vault.sub.example.com/x?y=1").await);
+
+        assert_eq!(info.host, "vault.sub.example.com");
+        assert!(info.covered);
+        assert_eq!(info.matched_domain.as_deref(), Some("sub.example.com"));
+        assert_eq!(info.vpn_interface, "wg0");
+        assert!(info.enabled);
+        assert!(!info.vpn_up);
+        // No resolution scripted → unsupported → None (not an error).
+        assert!(info.resolution.is_none());
+    }
+
+    #[tokio::test]
+    async fn check_domain_not_covered() {
+        let backend = Arc::new(MockBackend::default());
+        let sm = machine(
+            backend,
+            config(true, &["sub.example.com"]),
+            "check-uncovered",
+        );
+
+        let info = domain_check(check_via(&sm, "example.org").await);
+
+        assert_eq!(info.host, "example.org");
+        assert!(!info.covered);
+        assert!(info.matched_domain.is_none());
+    }
+
+    #[tokio::test]
+    async fn check_domain_invalid_input_is_an_error() {
+        let backend = Arc::new(MockBackend::default());
+        let sm = machine(backend, config(true, &["sub.example.com"]), "check-invalid");
+
+        // A path pasted onto a bare host (no scheme) cannot be normalized.
+        let resp = check_via(&sm, "example.com/path").await;
+        assert!(matches!(resp, Response::Error(_)), "got {resp:?}");
+    }
+
+    #[tokio::test]
+    async fn check_domain_surfaces_resolution() {
+        let backend = Arc::new(MockBackend::default());
+        // Synthetic, placeholder-only resolution.
+        backend.set_resolution(vec!["10.0.0.1".to_string()], Some("wg0".to_string()));
+        let sm = machine(
+            backend,
+            config(true, &["sub.example.com"]),
+            "check-resolved",
+        );
+
+        let info = domain_check(check_via(&sm, "vault.sub.example.com").await);
+
+        assert!(info.covered);
+        let resolution = info.resolution.expect("resolution should be surfaced");
+        assert_eq!(resolution.addresses, vec!["10.0.0.1".to_string()]);
+        assert_eq!(resolution.via_interface.as_deref(), Some("wg0"));
+        assert_eq!(resolution.via_dns, None);
+    }
+
+    #[tokio::test]
+    async fn check_domain_resolution_failure_is_none_not_error() {
+        let backend = Arc::new(MockBackend::default());
+        backend.set_fail_resolve(true);
+        let sm = machine(
+            backend,
+            config(true, &["sub.example.com"]),
+            "check-resolve-fail",
+        );
+
+        let info = domain_check(check_via(&sm, "vault.sub.example.com").await);
+
+        // Coverage is still reported; a resolution failure is never an Error.
+        assert!(info.covered);
+        assert!(info.resolution.is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_normalizes_input_to_match_a_stored_domain() {
+        // add stores the normalized `example.com`; remove must match it even when
+        // the user types a different case / a pasted URL / a trailing dot — not
+        // no-op while leaving it configured.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend, config(true, &["example.com"]), "remove-normalize");
+        sm.on_event(vpn_up("wg0")).await;
+        assert!(sm.applied.is_some());
+
+        let resp = sm
+            .on_request(Request::RemoveDomain("https://Example.com./".to_string()))
+            .await;
+
+        assert_eq!(resp, Response::Ok);
+        assert!(
+            sm.config.vpn_hosts.is_empty(),
+            "the stored domain must be removed, not left configured"
+        );
+        assert!(sm.config_store.load().unwrap().vpn_hosts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_legacy_unnormalizable_entry_via_exact_match() {
+        // A config that predates normalization may hold an entry the current
+        // normalizer rejects (here an IP literal). Removal must fall back to an
+        // exact-string match so the user can clean it up without hand-editing.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend, config(true, &["192.0.2.1"]), "remove-legacy");
+
+        let resp = sm
+            .on_request(Request::RemoveDomain("192.0.2.1".to_string()))
+            .await;
+
+        assert_eq!(resp, Response::Ok);
+        assert!(
+            sm.config.vpn_hosts.is_empty(),
+            "a legacy un-normalizable entry must be removable by exact match"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_legacy_verbatim_entry_when_input_normalizes() {
+        // A pre-normalization config may hold a verbatim entry like
+        // `example.com:443` that the old CLI accepted. `remove example.com:443`
+        // normalizes to `example.com`, which would NOT match the stored string by
+        // host-equivalence — so the exact-string arm (tried even when the input
+        // normalizes) must still remove the verbatim entry.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(
+            backend,
+            config(true, &["example.com:443"]),
+            "remove-verbatim",
+        );
+
+        let resp = sm
+            .on_request(Request::RemoveDomain("example.com:443".to_string()))
+            .await;
+
+        assert_eq!(resp, Response::Ok);
+        assert!(
+            sm.config.vpn_hosts.is_empty(),
+            "the verbatim legacy entry must be removable by exact string"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_surfaces_routing_state() {
+        // VPN up with usable DNS → routing_state Applied is carried in the check,
+        // so a client does not have to infer routing from enabled && vpn_up alone.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend, config(true, &["example.com"]), "check-routing");
+        sm.on_event(vpn_up("wg0")).await;
+        assert!(sm.applied.is_some());
+
+        let info = domain_check(check_via(&sm, "example.com").await);
+        assert!(info.covered);
+        assert_eq!(info.routing_state, RoutingState::Applied);
+    }
+
+    #[tokio::test]
+    async fn check_attributes_to_the_most_specific_domain() {
+        // Both a broad and a more specific domain cover the host; the most
+        // specific (longest) covering entry is attributed, regardless of the order
+        // they appear in the config.
+        let backend = Arc::new(MockBackend::default());
+        let sm = machine(
+            backend,
+            config(true, &["example.com", "sub.example.com"]),
+            "check-specific",
+        );
+
+        let info = domain_check(check_via(&sm, "vault.sub.example.com").await);
+        assert!(info.covered);
+        assert_eq!(info.matched_domain.as_deref(), Some("sub.example.com"));
     }
 }

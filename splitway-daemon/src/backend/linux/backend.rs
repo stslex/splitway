@@ -1,8 +1,10 @@
 use std::path::Path;
 use std::process::Command;
 
+use splitway_shared::ipc::ResolutionInfo;
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnInfo};
 
+use crate::backend::linux::query::parse_resolvectl_query;
 use crate::backend::linux::LinuxBackend;
 
 impl DnsBackend for LinuxBackend {
@@ -149,6 +151,36 @@ impl DnsBackend for LinuxBackend {
         }
 
         Ok(())
+    }
+
+    /// Strong attribution via systemd-resolved: `resolvectl query` routes the
+    /// query by the per-link routing domains, so the link it reports as having
+    /// answered reflects the actual split. The resolver IP is not reported, so
+    /// `via_dns` stays `None`. This reports which resolver answered, not
+    /// reachability (see the trait doc / `docs/architecture.md`).
+    fn resolve(&self, host: &str) -> Result<ResolutionInfo, PlatformError> {
+        let output = Command::new("resolvectl").arg("query").arg(host).output()?;
+
+        log::debug!(
+            "resolvectl query stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        if !output.status.success() {
+            // A non-zero exit is the normal NXDOMAIN / SERVFAIL path; surface it
+            // as a clean error the daemon turns into "resolution unavailable".
+            return Err(PlatformError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+
+        let info = parse_resolvectl_query(&String::from_utf8_lossy(&output.stdout));
+        if info.addresses.is_empty() {
+            return Err(PlatformError::ParseError(format!(
+                "no addresses parsed from `resolvectl query {host}`"
+            )));
+        }
+        Ok(info)
     }
 }
 

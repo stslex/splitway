@@ -37,6 +37,8 @@ enum Commands {
     List,
     /// Reload the daemon's config from disk.
     Reload,
+    /// Check whether a domain (a URL or bare host) routes through the VPN.
+    Check { url_or_host: String },
 }
 
 #[cfg(unix)]
@@ -66,6 +68,7 @@ fn run(cli: Cli) {
         Commands::Remove { domain } => Request::RemoveDomain(domain),
         Commands::List => Request::ListDomains,
         Commands::Reload => Request::ReloadConfig,
+        Commands::Check { url_or_host } => Request::CheckDomain(url_or_host),
     };
 
     match ipc::client::send_request(request) {
@@ -154,6 +157,119 @@ fn print_response(response: &splitway_shared::ipc::Response) {
                 }
             }
         }
+        Response::DomainCheck(info) => print_domain_check(info),
         Response::Error(message) => eprintln!("error: {message}"),
     }
+}
+
+/// Render a [`Response::DomainCheck`] plainly. Distinguishes coverage (is the
+/// host matched by a configured routing domain) from live resolution (which link
+/// actually answered), and is careful never to read "resolved" as "reachable" —
+/// Splitway governs DNS, not IP routing.
+#[cfg(unix)]
+fn print_domain_check(info: &splitway_shared::ipc::DomainCheckInfo) {
+    println!("host:      {}", info.host);
+
+    if info.covered {
+        match &info.matched_domain {
+            Some(domain) => println!("coverage:  covered by the configured domain `{domain}`"),
+            None => println!("coverage:  covered"),
+        }
+        // Coverage means "configured to route"; whether it is routed *right now*
+        // is the daemon's routing_state (its belief about whether usable
+        // split-DNS rules are installed) — not just enabled && vpn_up, which the
+        // VPN-up-but-no-DNS and apply-failed states would falsely read as routed.
+        use splitway_shared::ipc::RoutingState;
+        let iface = if info.vpn_interface.is_empty() {
+            "the VPN".to_string()
+        } else {
+            format!("the VPN ({})", info.vpn_interface)
+        };
+        let routing = match info.routing_state {
+            RoutingState::Applied => "routed through the VPN's DNS".to_string(),
+            RoutingState::Disabled => {
+                "configured to route, but rule application is disabled — not routed right now"
+                    .to_string()
+            }
+            RoutingState::VpnDown => {
+                format!("configured to route, but {iface} is down — not routed right now")
+            }
+            RoutingState::NoDnsFromVpn => {
+                format!("configured to route, but {iface} is up and pushes no DNS — not routed right now")
+            }
+            RoutingState::ApplyFailed => {
+                "configured to route, but applying the rules failed (out of sync) — not routed right now"
+                    .to_string()
+            }
+            RoutingState::ConfigInvalid => {
+                "the config file on disk is invalid; routing reflects the last-good config".to_string()
+            }
+            // Coverage implies a configured domain exists, so NoDomains is not
+            // expected here; render defensively rather than claim it is routed.
+            RoutingState::NoDomains => {
+                "configured to route, but no domains are configured — not routed right now".to_string()
+            }
+        };
+        println!("routing:   {routing}");
+    } else {
+        println!("coverage:  NOT covered by any configured domain");
+        println!("           add it with:  splitway add {}", info.host);
+    }
+
+    match &info.resolution {
+        Some(resolution) => {
+            let addrs = if resolution.addresses.is_empty() {
+                "(none)".to_string()
+            } else {
+                resolution.addresses.join(", ")
+            };
+            println!("resolved:  {addrs}");
+            match &resolution.via_interface {
+                // Resolved via the configured VPN link → routed through the VPN's DNS.
+                Some(link) if !info.vpn_interface.is_empty() && link == &info.vpn_interface => {
+                    println!("via link:  {link} — resolved through the VPN's DNS");
+                }
+                // Resolved via some other link → a drift hint, surfaced factually.
+                Some(link) => {
+                    let configured = if info.vpn_interface.is_empty() {
+                        "no VPN interface is configured".to_string()
+                    } else {
+                        format!("not the configured VPN interface `{}`", info.vpn_interface)
+                    };
+                    println!(
+                        "via link:  {link} — {configured}; this name is not resolving through the VPN right now"
+                    );
+                }
+                // No attribution (best-effort platforms, e.g. macOS).
+                None => println!("via link:  (the platform does not report which link answered)"),
+            }
+            if let Some(dns) = &resolution.via_dns {
+                println!("via dns:   {dns}");
+            }
+        }
+        None => println!("resolved:  (live resolution unavailable)"),
+    }
+
+    // The `routing:` line is the daemon's *belief* (it thinks rules are applied);
+    // the `via link:` line is *reality* (where the live query was answered). When
+    // those genuinely disagree — believed-applied but answered by a non-VPN link —
+    // frame it as drift so the two lines don't read as a bare contradiction. The
+    // live answer is authoritative; full read-back/drift reconciliation is Phase 5d.
+    let drifting = matches!(
+        info.routing_state,
+        splitway_shared::ipc::RoutingState::Applied
+    ) && info
+        .resolution
+        .as_ref()
+        .and_then(|r| r.via_interface.as_deref())
+        .is_some_and(|link| !info.vpn_interface.is_empty() && link != info.vpn_interface);
+    if drifting {
+        println!(
+            "drift:     'routing' (the daemon's belief) and 'via link' (the live result) disagree — trust the live result"
+        );
+    }
+
+    println!();
+    println!("note: this checks DNS only — whether the name resolves through the VPN's");
+    println!("      resolver, not whether the resolved address is reachable through the tunnel.");
 }

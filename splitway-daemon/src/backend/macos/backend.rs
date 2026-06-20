@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use splitway_shared::config::atomic_write;
+use splitway_shared::ipc::ResolutionInfo;
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnInfo};
 
 use super::resolver::{is_managed, is_valid_domain, resolver_contents, resolver_path};
@@ -58,6 +59,41 @@ impl DnsBackend for MacosBackend {
         // revert_rules removes every managed resolver file, not just one
         // interface's — resolver files are keyed by domain (see revert_rules).
         true
+    }
+
+    /// Best-effort live resolution. macOS routes the lookup through the system
+    /// resolver, which honors the `/etc/resolver/<domain>` files this backend
+    /// writes — so a covered domain resolves via the VPN's DNS. But the system
+    /// lookup does not attribute which link/resolver answered, so `via_interface`
+    /// and `via_dns` are always `None` (unlike Linux's strong attribution). This
+    /// reports the resolved address, not reachability (see the trait doc).
+    fn resolve(&self, host: &str) -> Result<ResolutionInfo, PlatformError> {
+        use std::net::ToSocketAddrs;
+
+        // Port 0: we only want the address resolution, not a connection. This
+        // goes through getaddrinfo, which respects `/etc/resolver`.
+        let addresses: Vec<String> = (host, 0u16)
+            .to_socket_addrs()
+            .map_err(|e| PlatformError::CommandFailed(format!("resolve {host}: {e}")))?
+            .map(|addr| addr.ip().to_string())
+            // Dedup while keeping output stable: getaddrinfo returns A/AAAA
+            // records, and a host often resolves to the same IP via several
+            // entries (duplicate records, or both the v4 and v6 family).
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        if addresses.is_empty() {
+            return Err(PlatformError::ParseError(format!(
+                "no addresses resolved for {host}"
+            )));
+        }
+
+        Ok(ResolutionInfo {
+            addresses,
+            via_interface: None,
+            via_dns: None,
+        })
     }
 }
 
