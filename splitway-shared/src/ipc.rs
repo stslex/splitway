@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::config::VpnBackend;
+use crate::domain;
 
 /// Bumped on any incompatible change to [`Request`] / [`Response`]. The
 /// daemon rejects envelopes whose version it does not speak.
@@ -23,13 +24,15 @@ use crate::config::VpnBackend;
 /// additive [`RoutingState::ConfigInvalid`] variant (the malformed-config freeze
 /// surfaced over IPC). Bumped to `5` in Phase 5b for the additive
 /// `CheckDomain` verb / [`Response::DomainCheck`] reply (the domain route-check).
-/// The daemon enforces *strict equality* (see
+/// Bumped to `6` in Phase 5d for the additive `Verify` verb /
+/// [`Response::Verify`] reply (live DNS read-back + drift detection — `reality`
+/// alongside `status`'s `belief`). The daemon enforces *strict equality* (see
 /// `daemon::ipc::process_line`): a daemon rejects a client whose version differs,
 /// and vice versa, so there is no silent mixed-version operation. The daemon, CLI
 /// and GUI all build from this one workspace, so they upgrade in lockstep; a
 /// mismatch only happens across separately-updated installs and is surfaced as
 /// actionable "update splitway" guidance, never a raw decode error.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Stable prefix the daemon uses to introduce a protocol-version-mismatch
 /// error reply. Shared so a client (CLI/GUI) can recognize skew and render
@@ -87,6 +90,14 @@ pub enum Request {
     /// resolver answered, *not* reachability (Splitway governs DNS, not IP
     /// routing — see `docs/architecture.md`).
     CheckDomain(String),
+    /// Read the **live** per-link DNS state back from the system and report any
+    /// drift from what the daemon believes it installed (`applied`). Read-only;
+    /// replied to with [`Response::Verify`]. This is the explicit `reality` check
+    /// — distinct from [`Request::Status`], which stays cheap `belief` (it never
+    /// reads the system back). Reports the live resolver state vs the believed
+    /// one, *not* reachability (Splitway governs DNS, not IP routing — see
+    /// `docs/architecture.md`).
+    Verify,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +114,8 @@ pub enum Response {
     Interfaces(Vec<InterfaceInfo>),
     /// Reply to [`Request::CheckDomain`].
     DomainCheck(DomainCheckInfo),
+    /// Reply to [`Request::Verify`].
+    Verify(VerifyInfo),
     /// The request failed; the string is a human-readable reason.
     Error(String),
 }
@@ -226,6 +239,143 @@ pub struct ResolutionInfo {
     /// The resolver that answered, when known (often `None` — `resolvectl query`
     /// does not report it).
     pub via_dns: Option<String>,
+}
+
+/// The **live** per-link DNS state read back from the system — the `reality`
+/// counterpart to the daemon's `belief` ([`AppliedInfo`]). On Linux it is parsed
+/// from `resolvectl status <iface>`; on macOS it is reconstructed best-effort from
+/// the managed `/etc/resolver` files Splitway wrote (which are keyed by domain,
+/// not interface). An all-empty value means the read-back was unavailable
+/// (unsupported platform, a vanished link, or a transient command failure) or the
+/// link genuinely carries no Splitway DNS — the two are indistinguishable here, by
+/// design: a read-back failure degrades to empty rather than an error.
+///
+/// `routing_domains` are stored **without** any leading `~`: `resolvectl` prints a
+/// routing-only domain as `~example.com`, but the wire form is the plain domain so
+/// a bare-vs-`~` difference is never read as drift (see [`compare_drift`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkDnsState {
+    /// The DNS servers the link currently resolves through (the union of
+    /// `resolvectl`'s `Current DNS Server` and `DNS Servers`), as text.
+    pub servers: Vec<String>,
+    /// The routing/search domains the link currently routes, each with any
+    /// leading `~` already stripped to the plain domain.
+    pub routing_domains: Vec<String>,
+}
+
+/// The result of a [`Request::Verify`] read-back: the live link state plus the
+/// drift verdict comparing it against what the daemon believes it installed. This
+/// is observability only — the daemon does **not** auto-remediate on drift.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyInfo {
+    /// The live per-link DNS state read back from the system (empty when the
+    /// read-back was unavailable — see [`LinkDnsState`]).
+    pub live: LinkDnsState,
+    /// How the live state compares to the daemon's `applied` belief.
+    pub drift: DriftVerdict,
+}
+
+/// Whether the live DNS state matches what the daemon believes it installed.
+/// Produced by [`compare_drift`]; report-only (no auto-remediation this phase).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DriftVerdict {
+    /// The daemon believes nothing is installed (`applied` is `None`), so there is
+    /// nothing to compare the live state against.
+    NotApplicable,
+    /// Every believed DNS server is present live and every believed domain is
+    /// covered by a live routing domain — reality matches belief.
+    InSync,
+    /// The live state diverges from belief. Each field names exactly what is
+    /// missing so a client can render the specifics; either may be empty as long
+    /// as the other is non-empty (an empty/empty `Drifted` is never produced —
+    /// that case is [`DriftVerdict::InSync`]).
+    Drifted {
+        /// Believed DNS servers not found in the live `servers`.
+        missing_servers: Vec<String>,
+        /// Believed domains not covered by any live routing domain.
+        unrouted_domains: Vec<String>,
+    },
+}
+
+/// Compare a live [`LinkDnsState`] against what the daemon believes it installed
+/// (`applied`) and report any [`DriftVerdict`]. Pure, no I/O.
+///
+/// - `applied` is `None` → [`DriftVerdict::NotApplicable`] (nothing to verify).
+/// - Otherwise, normalized so a cosmetic difference is never false drift:
+///   - every believed `dns_servers` entry must be **present** in the live
+///     `servers`. Servers compare by canonical IP equality when both parse as IPs
+///     (so `2001:DB8::1` equals `2001:db8::1` and a zero-compressed form equals
+///     its expansion), falling back to a case-folded string match otherwise.
+///   - every believed `domains` entry must be **covered** by some live
+///     `routing_domain`, suffix-aware via [`domain::domain_covers`] (so a live
+///     `example.com` covers a believed `sub.example.com`, and case / a trailing
+///     dot / a stripped `~` never matter).
+///   - all present and covered → [`DriftVerdict::InSync`]; otherwise
+///     [`DriftVerdict::Drifted`] naming the missing servers and unrouted domains.
+pub fn compare_drift(live: &LinkDnsState, applied: Option<&AppliedInfo>) -> DriftVerdict {
+    let Some(applied) = applied else {
+        return DriftVerdict::NotApplicable;
+    };
+
+    let missing_servers: Vec<String> = applied
+        .dns_servers
+        .iter()
+        .filter(|believed| {
+            !live
+                .servers
+                .iter()
+                .any(|live| server_matches(live, believed))
+        })
+        .cloned()
+        .collect();
+
+    // A believed domain is routed live if any live routing domain covers it
+    // (suffix-aware): the live link may route a broader parent (`example.com`)
+    // that still covers the believed `sub.example.com`, or route *everything* via
+    // the systemd route-all marker (`~.`, parsed to the root `.`).
+    let unrouted_domains: Vec<String> = applied
+        .domains
+        .iter()
+        .filter(|believed| {
+            !live
+                .routing_domains
+                .iter()
+                .any(|live| is_route_all(live) || domain::domain_covers(live, believed))
+        })
+        .cloned()
+        .collect();
+
+    if missing_servers.is_empty() && unrouted_domains.is_empty() {
+        DriftVerdict::InSync
+    } else {
+        DriftVerdict::Drifted {
+            missing_servers,
+            unrouted_domains,
+        }
+    }
+}
+
+/// Whether a live routing domain is systemd's route-all marker — the DNS root,
+/// printed by `resolvectl` as `~.` and parsed to `.` (the `~` stripped). It
+/// routes *every* query to the link, so it covers any believed domain. Without
+/// this, a full-tunnel link that legitimately carries `~.` would be reported as
+/// drift against every believed domain (`domain_covers(".", x)` folds `.` to the
+/// empty domain and never matches).
+fn is_route_all(domain: &str) -> bool {
+    domain.trim() == "."
+}
+
+/// Whether two DNS server strings denote the same resolver. Prefers canonical IP
+/// equality (handling case and IPv6 zero-compression differences), and falls back
+/// to a case-folded, trailing-dot-insensitive string match for any token that does
+/// not parse as an IP — so a non-address token still compares sanely rather than
+/// being treated as always-different.
+fn server_matches(a: &str, b: &str) -> bool {
+    use std::net::IpAddr;
+    match (a.trim().parse::<IpAddr>(), b.trim().parse::<IpAddr>()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => domain::same_host(a, b),
+    }
 }
 
 /// Why DNS routing is — or is not — active right now, mapped from the daemon's
@@ -577,6 +727,30 @@ mod tests {
                 vpn_up: false,
                 routing_state: RoutingState::NoDomains,
             }),
+            // Verify, in-sync: a populated live state with a matching belief.
+            Response::Verify(VerifyInfo {
+                live: LinkDnsState {
+                    servers: vec!["10.0.0.1".to_string()],
+                    routing_domains: vec!["example.com".to_string()],
+                },
+                drift: DriftVerdict::InSync,
+            }),
+            // Verify, drifted: the other shape, naming what diverged.
+            Response::Verify(VerifyInfo {
+                live: LinkDnsState {
+                    servers: vec!["198.51.100.1".to_string()],
+                    routing_domains: vec![],
+                },
+                drift: DriftVerdict::Drifted {
+                    missing_servers: vec!["10.0.0.1".to_string()],
+                    unrouted_domains: vec!["corp.example.com".to_string()],
+                },
+            }),
+            // Verify, not-applicable: an empty live state and nothing believed.
+            Response::Verify(VerifyInfo {
+                live: LinkDnsState::default(),
+                drift: DriftVerdict::NotApplicable,
+            }),
         ];
         for response in responses {
             let json = serde_json::to_string(&response).unwrap();
@@ -605,6 +779,144 @@ mod tests {
         assert_eq!(
             parsed.request,
             Request::CheckDomain("https://vault.sub.example.com/x".to_string())
+        );
+    }
+
+    #[test]
+    fn verify_verb_round_trips_in_envelope() {
+        let env = RequestEnvelope::new(Request::Verify);
+        let json = serde_json::to_string(&env).unwrap();
+        let parsed: RequestEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.version, PROTOCOL_VERSION);
+        assert_eq!(parsed.request, Request::Verify);
+    }
+
+    fn believed(servers: &[&str], domains: &[&str]) -> AppliedInfo {
+        AppliedInfo {
+            interface: "tun0".to_string(),
+            domains: domains.iter().map(|s| s.to_string()).collect(),
+            dns_servers: servers.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn live(servers: &[&str], domains: &[&str]) -> LinkDnsState {
+        LinkDnsState {
+            servers: servers.iter().map(|s| s.to_string()).collect(),
+            routing_domains: domains.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn drift_not_applicable_when_nothing_applied() {
+        // No belief → nothing to verify, regardless of what is live.
+        assert_eq!(
+            compare_drift(&live(&["10.0.0.1"], &["example.com"]), None),
+            DriftVerdict::NotApplicable
+        );
+    }
+
+    #[test]
+    fn drift_in_sync_when_live_matches_belief() {
+        let applied = believed(&["10.0.0.1", "10.0.0.2"], &["example.com"]);
+        assert_eq!(
+            compare_drift(
+                &live(&["10.0.0.1", "10.0.0.2"], &["example.com"]),
+                Some(&applied)
+            ),
+            DriftVerdict::InSync
+        );
+    }
+
+    #[test]
+    fn drift_bare_vs_tilde_and_case_are_not_false_drift() {
+        // The parser strips a leading `~`, so the live domain arrives bare; case
+        // and a trailing dot also must not count as drift (normalized compare).
+        let applied = believed(&["2001:DB8::1"], &["Example.COM"]);
+        let live = live(&["2001:db8::1"], &["example.com."]);
+        assert_eq!(compare_drift(&live, Some(&applied)), DriftVerdict::InSync);
+    }
+
+    #[test]
+    fn drift_server_zero_compression_is_not_false_drift() {
+        // The same IPv6 address in expanded vs zero-compressed form is one server.
+        let applied = believed(&["2001:db8:0:0:0:0:0:1"], &["example.com"]);
+        let live = live(&["2001:db8::1"], &["example.com"]);
+        assert_eq!(compare_drift(&live, Some(&applied)), DriftVerdict::InSync);
+    }
+
+    #[test]
+    fn drift_live_parent_domain_covers_believed_subdomain() {
+        // The live link routes a broader parent; a believed subdomain is still
+        // covered (suffix-aware), so this is in sync, not drift.
+        let applied = believed(&["10.0.0.1"], &["sub.example.com"]);
+        let live = live(&["10.0.0.1"], &["example.com"]);
+        assert_eq!(compare_drift(&live, Some(&applied)), DriftVerdict::InSync);
+    }
+
+    #[test]
+    fn drift_route_all_live_domain_covers_every_believed_domain() {
+        // A full-tunnel link carrying `~.` (parsed to `.`) routes everything, so
+        // every believed domain is covered — in sync, not a false drift.
+        let applied = believed(&["10.0.0.1"], &["example.com", "corp.example.com"]);
+        let live = live(&["10.0.0.1"], &["."]);
+        assert_eq!(compare_drift(&live, Some(&applied)), DriftVerdict::InSync);
+    }
+
+    #[test]
+    fn drift_live_child_does_not_cover_believed_parent() {
+        // Coverage is suffix-aware and asymmetric: a live child `sub.example.com`
+        // does NOT cover a believed parent `example.com`, so the parent is
+        // reported unrouted (guards against an over-broad bidirectional match).
+        let applied = believed(&["10.0.0.1"], &["example.com"]);
+        let live = live(&["10.0.0.1"], &["sub.example.com"]);
+        assert_eq!(
+            compare_drift(&live, Some(&applied)),
+            DriftVerdict::Drifted {
+                missing_servers: vec![],
+                unrouted_domains: vec!["example.com".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn drift_reports_missing_servers_and_unrouted_domains() {
+        let applied = believed(
+            &["10.0.0.1", "10.0.0.2"],
+            &["a.example.com", "b.example.com"],
+        );
+        // Live has only one of the two servers and routes only one domain.
+        let live = live(&["10.0.0.1"], &["a.example.com"]);
+        assert_eq!(
+            compare_drift(&live, Some(&applied)),
+            DriftVerdict::Drifted {
+                missing_servers: vec!["10.0.0.2".to_string()],
+                unrouted_domains: vec!["b.example.com".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn drift_empty_live_against_belief_is_full_drift() {
+        // An empty live state (e.g. read-back unavailable) against a non-empty
+        // belief reports everything as diverged — never a false InSync.
+        let applied = believed(&["10.0.0.1"], &["example.com"]);
+        assert_eq!(
+            compare_drift(&LinkDnsState::default(), Some(&applied)),
+            DriftVerdict::Drifted {
+                missing_servers: vec!["10.0.0.1".to_string()],
+                unrouted_domains: vec!["example.com".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn drift_in_sync_when_belief_is_empty() {
+        // A believed-but-empty mapping (nothing to install) is trivially in sync
+        // with any live state — including an empty one.
+        let applied = believed(&[], &[]);
+        assert_eq!(
+            compare_drift(&LinkDnsState::default(), Some(&applied)),
+            DriftVerdict::InSync
         );
     }
 

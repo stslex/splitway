@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::ipc::ResolutionInfo;
+use crate::ipc::{LinkDnsState, ResolutionInfo};
 
 #[derive(Error, Debug)]
 pub enum PlatformError {
@@ -51,8 +51,29 @@ pub trait DnsBackend: Send + Sync {
     /// Revert DNS rules for the given interface.
     fn revert_rules(&self, interface: &str) -> Result<(), PlatformError>;
 
-    /// Show DNS status for the given interface.
-    fn status(&self, interface: &str) -> Result<(), PlatformError>;
+    /// Read the **live** per-link DNS state back from the system: the resolvers
+    /// and routing domains the link actually has right now. This is the
+    /// `reality` read that backs the `Verify` drift-check — distinct from the
+    /// daemon's `belief` (its `applied` snapshot).
+    ///
+    /// Linux parses `resolvectl status <iface>`. macOS is best-effort: there is
+    /// no per-link DNS block, so it reconstructs the state from the managed
+    /// `/etc/resolver/<domain>` files Splitway wrote (keyed by domain, not
+    /// interface — the `interface` argument is therefore advisory there).
+    ///
+    /// Default: [`PlatformError::Unsupported`] — so a platform without a real
+    /// implementation (e.g. Windows) returns a clean error the caller turns into
+    /// "read-back unavailable", never a hard failure. A vanished link or a
+    /// transient command failure is likewise a clean error, degraded to an empty
+    /// read-back by the caller rather than surfaced as an IPC `Error`.
+    ///
+    /// Boundary: this reports the link's *resolver state*, not reachability —
+    /// Splitway governs DNS, not IP routing (see `docs/architecture.md`).
+    fn read_link_state(&self, _interface: &str) -> Result<LinkDnsState, PlatformError> {
+        Err(PlatformError::Unsupported(
+            "DNS read-back is not supported on this platform".to_string(),
+        ))
+    }
 
     /// Whether [`Self::revert_rules`] ignores its `interface` argument and
     /// reverts *all* managed DNS state at once, rather than only the named
