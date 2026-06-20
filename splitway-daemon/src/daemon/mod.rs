@@ -104,7 +104,12 @@ async fn run_async(config: LocalConfig, config_path: PathBuf) {
     // the file the single source of truth without requiring a manual reload. The
     // actor's equality check ignores the daemon's own writes. Best-effort: a
     // failure to start the watcher is logged and degrades to manual `ReloadConfig`.
-    spawn_config_watcher(config_path, state_tx.clone());
+    //
+    // Held until `run_async` returns so the watch stays armed for the daemon's
+    // lifetime; on shutdown its drop closes the watcher's event channel, which
+    // lets the bridging blocking task exit so the runtime can shut down promptly
+    // (otherwise that task's blocking `recv` would hang runtime shutdown).
+    let _config_watcher = spawn_config_watcher(config_path, state_tx.clone());
 
     // Serve IPC requests on the socket bound above (before the state pipeline
     // started, so a bind failure could never have stranded any rules).
@@ -187,7 +192,19 @@ async fn wait_for_shutdown_signal(sigint: &mut Signal, sigterm: &mut Signal) {
 ///
 /// A failure to set the watcher up is logged and degrades to manual
 /// `ReloadConfig` only; it is never fatal.
-fn spawn_config_watcher(config_path: PathBuf, state_tx: mpsc::Sender<StateCommand>) {
+///
+/// Returns the [`notify::RecommendedWatcher`] so the caller keeps it alive for
+/// the daemon's lifetime. Crucially, the bridging blocking task does **not** own
+/// the watcher — it holds only the receiving end of the channel. Dropping the
+/// returned watcher (on shutdown) drops the callback that holds the sender, which
+/// closes the channel, ends the blocking task's `recv` loop, and lets it exit.
+/// If the blocking task owned the watcher instead, its `recv` would block a
+/// runtime thread forever with no further event, and dropping the tokio runtime
+/// would hang waiting for that thread until systemd's stop timeout (a SIGKILL).
+fn spawn_config_watcher(
+    config_path: PathBuf,
+    state_tx: mpsc::Sender<StateCommand>,
+) -> Option<notify::RecommendedWatcher> {
     let dir = match config_path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
         _ => {
@@ -195,7 +212,7 @@ fn spawn_config_watcher(config_path: PathBuf, state_tx: mpsc::Sender<StateComman
                 "config path {} has no parent directory; live config watch disabled",
                 config_path.display()
             );
-            return;
+            return None;
         }
     };
     let target = match config_path.file_name() {
@@ -205,13 +222,12 @@ fn spawn_config_watcher(config_path: PathBuf, state_tx: mpsc::Sender<StateComman
                 "config path {} has no file name; live config watch disabled",
                 config_path.display()
             );
-            return;
+            return None;
         }
     };
 
     // notify delivers events on its own thread through this std channel; a
-    // blocking task owns the watcher (keeping it alive — dropping it stops
-    // watching) and bridges matching events onto the actor's async channel.
+    // blocking task bridges matching events onto the actor's async channel.
     let (raw_tx, raw_rx) = std::sync::mpsc::channel();
     let mut watcher = match notify::recommended_watcher(move |res| {
         let _ = raw_tx.send(res);
@@ -219,7 +235,7 @@ fn spawn_config_watcher(config_path: PathBuf, state_tx: mpsc::Sender<StateComman
         Ok(watcher) => watcher,
         Err(e) => {
             log::warn!("failed to create config watcher: {e}; live config watch disabled");
-            return;
+            return None;
         }
     };
     if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
@@ -227,14 +243,13 @@ fn spawn_config_watcher(config_path: PathBuf, state_tx: mpsc::Sender<StateComman
             "failed to watch config directory {}: {e}; live config watch disabled",
             dir.display()
         );
-        return;
+        return None;
     }
     log::info!("watching {} for external config edits", dir.display());
 
+    // Holds only `raw_rx` (not the watcher): the loop ends when the watcher is
+    // dropped (channel closed, on shutdown) or the actor is gone.
     tokio::task::spawn_blocking(move || {
-        // Hold the watcher for the lifetime of this loop. The loop ends when the
-        // watcher's channel closes or the actor is gone.
-        let _watcher = watcher;
         for event in raw_rx {
             match event {
                 Ok(event)
@@ -254,6 +269,8 @@ fn spawn_config_watcher(config_path: PathBuf, state_tx: mpsc::Sender<StateComman
             }
         }
     });
+
+    Some(watcher)
 }
 
 fn load_or_init_config(path: &Path) -> LocalConfig {
