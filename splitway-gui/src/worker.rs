@@ -6,7 +6,7 @@
 //! frame. No tokio: the client is synchronous and single-shot.
 //!
 //! This module is thin plumbing (no decision logic) and is not unit-tested; the
-//! decisions live in `model.rs`.
+//! decisions live in the framework-agnostic `splitway-gui-core` crate.
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;

@@ -11,8 +11,6 @@
 #[cfg(unix)]
 mod app;
 #[cfg(unix)]
-mod model;
-#[cfg(unix)]
 mod worker;
 
 #[cfg(unix)]
