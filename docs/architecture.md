@@ -28,7 +28,13 @@ or the `notify` crate) makes external hand-edits take effect live: watch the
 daemon's own writes so a self-write does not loop. A **malformed config freezes**
 the current state — the daemon keeps the last-applied rules, surfaces the file as
 invalid, and recovers automatically once it parses again; it never reverts to a
-blank or default state on a parse error.
+blank or default state on a parse error. **Hand-edit the config atomically**
+(write a temp file and rename over it, as the daemon does): an in-place
+truncate-then-write can be observed mid-write and briefly read as invalid until
+the completing write fires another event. Because the file is the single source
+of truth, a malformed file also blocks every IPC mutation (a write derived from a
+config the daemon could not read would clobber the fields it preserves from
+disk), so a corrupt config is repaired *on disk*, not through the GUI/CLI.
 
 Config access sits behind a **testable abstraction** — no inline `fs::read` /
 `fs::write` inside the `StateMachine` — so reconciliation logic is unit-testable

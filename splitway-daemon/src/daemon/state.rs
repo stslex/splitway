@@ -732,7 +732,7 @@ impl StateMachine {
         // other fields is merged, never clobbered from a stale snapshot.
         let mut next = match self.load_fresh() {
             Ok(config) => config,
-            Err(e) => return Response::Error(format!("failed to read config: {e}")),
+            Err(e) => return config_unreadable_reply(e),
         };
         // The "no change" early-out is evaluated against the freshly-loaded
         // value, not a possibly-stale `self.config`.
@@ -749,10 +749,16 @@ impl StateMachine {
         self.commit(next).await
     }
 
+    /// Note the `already present` error path is **not inert**: it first adopts +
+    /// reconciles the freshly-loaded config (so a concurrent external edit
+    /// converges without relying on the watcher), and may therefore re-arm the
+    /// watch or change applied rules before returning the error. The error is
+    /// preserved for the normal duplicate-add contract; a caller must not read it
+    /// as "nothing happened".
     async fn add_domain(&mut self, domain: String) -> Response {
         let mut next = match self.load_fresh() {
             Ok(config) => config,
-            Err(e) => return Response::Error(format!("failed to read config: {e}")),
+            Err(e) => return config_unreadable_reply(e),
         };
         if next.vpn_hosts.iter().any(|d| d == &domain) {
             // Already present on disk: nothing to add. Still adopt the
@@ -774,7 +780,7 @@ impl StateMachine {
     async fn remove_domain(&mut self, domain: String) -> Response {
         let mut next = match self.load_fresh() {
             Ok(config) => config,
-            Err(e) => return Response::Error(format!("failed to read config: {e}")),
+            Err(e) => return config_unreadable_reply(e),
         };
         if !next.vpn_hosts.iter().any(|d| d == &domain) {
             // Absent on disk: nothing to remove. Adopt the freshly-loaded config
@@ -809,6 +815,16 @@ impl StateMachine {
     /// failure freezes on the last-good config and surfaces
     /// [`RoutingState::ConfigInvalid`] (set via [`Self::load_fresh`]); recovery is
     /// automatic on the next valid edit.
+    ///
+    /// A non-atomic hand-edit (an editor that truncates-then-writes in place) can
+    /// be observed mid-write and briefly read as invalid, flipping to
+    /// `ConfigInvalid` until the completing write fires another event — which it
+    /// normally does (a coalesced event re-reads the *latest*, now-valid, state).
+    /// A permanent latch would require the watcher to drop the trailing event
+    /// entirely (inotify queue overflow), which is rare and not config-specific.
+    /// Hand-editing atomically (write a temp file and rename over the config, as
+    /// the daemon's own writes do) avoids the transient window; this is noted in
+    /// `docs/architecture.md`.
     async fn on_config_changed(&mut self) {
         match self.load_fresh() {
             Ok(loaded) => {
@@ -851,7 +867,7 @@ impl StateMachine {
         // domain list (owned by the other verbs) is preserved, not clobbered.
         let mut next = match self.load_fresh() {
             Ok(config) => config,
-            Err(e) => return Response::Error(format!("failed to read config: {e}")),
+            Err(e) => return config_unreadable_reply(e),
         };
         next.vpn_name = view.vpn_name;
         next.vpn_backend = view.vpn_backend;
@@ -967,6 +983,21 @@ impl StateMachine {
 /// only change `desired()`), so they reconcile without tearing the watch down.
 fn watch_settings_changed(old: &LocalConfig, new: &LocalConfig) -> bool {
     old.vpn_name != new.vpn_name || old.vpn_backend != new.vpn_backend || old.openvpn != new.openvpn
+}
+
+/// The reply when a mutation cannot read the config file (missing or malformed).
+/// Mutations are read-modify-write and deliberately refuse to write a config
+/// derived from one they could not read — `set_config` preserves the file's
+/// `enabled`/`vpn_hosts`, so overwriting an unreadable file would clobber them.
+/// The file must therefore be fixed *on disk*; the daemon keeps running on the
+/// last-good config meanwhile (surfaced as [`RoutingState::ConfigInvalid`]). The
+/// message guides the user/GUI to that recovery, since no IPC verb can repair a
+/// file the daemon cannot parse.
+fn config_unreadable_reply(e: ConfigParseError) -> Response {
+    Response::Error(format!(
+        "cannot change settings: the config file on disk could not be read ({e}) — \
+         fix it on disk; the daemon keeps running on the last-good config"
+    ))
 }
 
 /// The state-owner task loop. Owns the [`StateMachine`] outright.
@@ -2691,5 +2722,41 @@ mod tests {
             "the removed domain's rules must be reverted, not left applied"
         );
         assert_eq!(sm.routing_state(), RoutingState::NoDomains);
+    }
+
+    #[tokio::test]
+    async fn recovery_to_an_identical_last_good_config_clears_invalid() {
+        // Recovery must work even when the user reverts a malformed edit back to a
+        // file *identical* to the last-good config: `load_fresh` clears
+        // `config_invalid` before the equality check short-circuits the reload, so
+        // the freeze lifts without a redundant reconcile.
+        let backend = Arc::new(MockBackend::default());
+        let fake = FakeConfigStore::new(config(true, &["a.com"]));
+        let store: Arc<dyn ConfigStore> = Arc::new(fake.clone());
+        let mut sm = machine_with_store(backend.clone(), store, config(true, &["a.com"]));
+
+        sm.on_event(vpn_up("wg0")).await;
+        let applies_after_first = backend.applies.lock().unwrap().len();
+
+        // A malformed edit freezes on the last-good config.
+        fake.set_malformed();
+        sm.on_config_changed().await;
+        assert!(sm.config_invalid);
+        assert_eq!(sm.routing_state(), RoutingState::ConfigInvalid);
+
+        // The user reverts to a file identical to the last-good config.
+        fake.set_external(config(true, &["a.com"]));
+        sm.on_config_changed().await;
+
+        assert!(
+            !sm.config_invalid,
+            "an identical valid file must clear the freeze"
+        );
+        assert_eq!(sm.routing_state(), RoutingState::Applied);
+        assert_eq!(
+            backend.applies.lock().unwrap().len(),
+            applies_after_first,
+            "recovery to an identical config must not re-apply (equality skip)"
+        );
     }
 }
