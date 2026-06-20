@@ -57,9 +57,6 @@ in
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
-      # `cp` for the one-time config migration in preStart below.
-      path = [ pkgs.coreutils ];
-
       # One-time upgrade migration. The pre-5c module ran the daemon with no
       # `--config`, so it used the daemon's default path — which, for this root
       # service, resolves to /root/.config/splitway/config.json (whether or not
@@ -69,12 +66,17 @@ in
       # silently dropped (the daemon would otherwise create an empty config). The
       # guard makes this a no-op on fresh installs and every later start, and it
       # never overwrites an existing new-path config.
+      #
+      # Use an absolute `cp` (`[`/`echo` are bash builtins) rather than adding
+      # coreutils to the service `path`: the daemon resolves its runtime tools
+      # (`nmcli` / `resolvectl`) by bare name from the host's PATH, so the service
+      # PATH must be left untouched.
       preStart = ''
         old=/root/.config/splitway/config.json
         new=/var/lib/splitway/config.json
         if [ ! -e "$new" ] && [ -e "$old" ]; then
           echo "splitway: migrating config from $old to $new"
-          cp -p "$old" "$new"
+          ${pkgs.coreutils}/bin/cp -p "$old" "$new"
         fi
       '';
 
