@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
-use splitway_shared::config::{self, LocalConfig, OpenVpnConfig};
+use splitway_shared::config::{self, ConfigParseError, LocalConfig, OpenVpnConfig};
 use splitway_shared::ipc::{
     AppliedInfo, ConfigView, DetectorHealth, Request, Response, RoutingState, StatusInfo,
 };
@@ -39,6 +39,51 @@ impl DetectorFactory for PlatformDetectorFactory {
     }
 }
 
+/// Config persistence behind a trait, so the [`StateMachine`]'s config handling
+/// is unit-testable: a fake store can simulate a malformed file, a load error,
+/// or a concurrent external edit landing between an RMW read and write — none of
+/// which a real temp file exercises cleanly. Mirrors the [`DetectorFactory`]
+/// injection. The file is the single source of truth; this store is the only
+/// path the actor reads or writes it through (no inline `fs` access here).
+pub trait ConfigStore: Send + Sync {
+    /// Read and parse the config from its backing store.
+    fn load(&self) -> Result<LocalConfig, ConfigParseError>;
+    /// Persist the config. The production impl writes atomically (temp file then
+    /// rename — see [`config::save_config_to`]).
+    fn save(&self, config: &LocalConfig) -> Result<(), ConfigParseError>;
+    /// A human-readable description of where the config lives (the file path for
+    /// the production store), surfaced as the informational
+    /// [`ConfigView::config_path`]. Never used for I/O.
+    fn describe(&self) -> String;
+}
+
+/// Production store: the real config file at the path fixed at launch. `load` /
+/// `save` delegate to [`config::load_config_from`] / [`config::save_config_to`];
+/// the latter already performs the atomic temp-file-plus-rename write.
+pub struct FileConfigStore {
+    path: PathBuf,
+}
+
+impl FileConfigStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl ConfigStore for FileConfigStore {
+    fn load(&self) -> Result<LocalConfig, ConfigParseError> {
+        config::load_config_from(&self.path)
+    }
+
+    fn save(&self, config: &LocalConfig) -> Result<(), ConfigParseError> {
+        config::save_config_to(&self.path, config)
+    }
+
+    fn describe(&self) -> String {
+        self.path.display().to_string()
+    }
+}
+
 /// Routine commands funneled into the state-owner task. Shutdown is delivered
 /// out-of-band (see [`run_state`]) so it can preempt a backlog of these.
 pub enum StateCommand {
@@ -58,6 +103,12 @@ pub enum StateCommand {
         request: Request,
         reply: oneshot::Sender<Response>,
     },
+    /// The config file on disk changed — the file watcher saw an event touching
+    /// it (an external hand-edit). Carries no data: the file is the single source
+    /// of truth, so the actor always re-reads it. The actor's equality check
+    /// debounces the daemon's own writes and coalesces a burst into one reload
+    /// (see [`StateMachine::on_config_changed`]).
+    ConfigChanged,
 }
 
 /// A snapshot of what is currently applied to the system. Includes the DNS
@@ -78,8 +129,20 @@ pub struct StateMachine {
     /// A clone of the actor's own command sender, handed to each re-armed
     /// forwarding task so it can feed `StateCommand::Vpn` back into the actor.
     state_tx: mpsc::Sender<StateCommand>,
+    /// An in-memory working copy of the config the file watcher keeps reconciled
+    /// to disk — the file is the single source of truth, so this is not a
+    /// free-floating cache. It backs the cheap, infallible reads on the `status()`
+    /// hot path and is the re-arm baseline (`watch_settings_changed`); every
+    /// mutation is read-modify-write from disk through [`Self::config_store`].
     config: LocalConfig,
-    config_path: PathBuf,
+    /// The only path the actor reads or writes the config through. Injected for
+    /// testability (see [`ConfigStore`]).
+    config_store: Arc<dyn ConfigStore>,
+    /// Set when the last load (an RMW read or a watcher reload) failed to parse,
+    /// so the daemon froze on the last-good `config`. Drives the
+    /// highest-precedence [`RoutingState::ConfigInvalid`]; cleared on the next
+    /// successful load (see [`Self::load_fresh`]).
+    config_invalid: bool,
     vpn_up: bool,
     /// The most recent `Up` info, used to (re-)apply rules.
     last_info: Option<VpnInfo>,
@@ -117,7 +180,7 @@ impl StateMachine {
         backend: Arc<dyn DnsBackend>,
         detector_factory: Arc<dyn DetectorFactory>,
         config: LocalConfig,
-        config_path: PathBuf,
+        config_store: Arc<dyn ConfigStore>,
         state_tx: mpsc::Sender<StateCommand>,
     ) -> Self {
         Self {
@@ -125,7 +188,8 @@ impl StateMachine {
             detector_factory,
             state_tx,
             config,
-            config_path,
+            config_store,
+            config_invalid: false,
             vpn_up: false,
             last_info: None,
             applied: None,
@@ -607,6 +671,13 @@ impl StateMachine {
     /// `ApplyFailed` ("out of sync") until cleanup succeeds — e.g. a `Disable`
     /// whose revert failed reads `ApplyFailed`, not `Disabled`.
     fn routing_state(&self) -> RoutingState {
+        // A config file that does not parse takes precedence over everything:
+        // the daemon froze on the last-good config, and the user must learn
+        // their edit was rejected rather than see a stale "applied" (see
+        // `on_config_changed`). Clears automatically on the next valid load.
+        if self.config_invalid {
+            return RoutingState::ConfigInvalid;
+        }
         // Out-of-sync (a failed apply/revert, or a lingering orphaned interface)
         // overrides the inactive-reason branches below — see the doc above.
         if self.needs_resync || !self.orphaned.is_empty() {
@@ -637,42 +708,74 @@ impl StateMachine {
         }
     }
 
+    /// Load the config through the store, maintaining the `config_invalid` freeze
+    /// flag: cleared on a successful parse, set on any parse/read failure. Every
+    /// disk read of the config — the RMW mutations below, the manual reload, and
+    /// the watcher reload — goes through here, so the flag (and thus
+    /// [`RoutingState::ConfigInvalid`]) always reflects the latest load attempt.
+    fn load_fresh(&mut self) -> Result<LocalConfig, ConfigParseError> {
+        match self.config_store.load() {
+            Ok(config) => {
+                self.config_invalid = false;
+                Ok(config)
+            }
+            Err(e) => {
+                self.config_invalid = true;
+                Err(e)
+            }
+        }
+    }
+
     async fn set_enabled(&mut self, enabled: bool) -> Response {
-        if self.config.enabled == enabled {
-            // No config change, but a previous apply/revert may have failed;
-            // reconcile so a repeated enable/disable retries it instead of
-            // reporting success while the system is still out of sync.
-            return match self.reconcile().await {
+        // Read-modify-write from disk: load the current file, apply only this
+        // verb's delta, then persist + adopt — so a concurrent external edit to
+        // other fields is merged, never clobbered from a stale snapshot.
+        let mut next = match self.load_fresh() {
+            Ok(config) => config,
+            Err(e) => return Response::Error(format!("failed to read config: {e}")),
+        };
+        // The "no change" early-out is evaluated against the freshly-loaded
+        // value, not a possibly-stale `self.config`.
+        if next.enabled == enabled {
+            // Nothing to persist, but adopt the loaded config (it may carry an
+            // external edit) and reconcile so a previous failed apply/revert
+            // retries instead of reporting success while still out of sync.
+            return match self.adopt_config(next).await {
                 Ok(()) => Response::Ok,
                 Err(e) => Response::Error(format!("failed to apply current state: {e}")),
             };
         }
-        let mut next = self.config.clone();
         next.enabled = enabled;
         self.commit(next).await
     }
 
     async fn add_domain(&mut self, domain: String) -> Response {
-        if self.config.vpn_hosts.iter().any(|d| d == &domain) {
+        let mut next = match self.load_fresh() {
+            Ok(config) => config,
+            Err(e) => return Response::Error(format!("failed to read config: {e}")),
+        };
+        if next.vpn_hosts.iter().any(|d| d == &domain) {
             return Response::Error(format!("domain already present: {domain}"));
         }
-        let mut next = self.config.clone();
         next.vpn_hosts.push(domain);
         self.commit(next).await
     }
 
     async fn remove_domain(&mut self, domain: String) -> Response {
-        if !self.config.vpn_hosts.iter().any(|d| d == &domain) {
+        let mut next = match self.load_fresh() {
+            Ok(config) => config,
+            Err(e) => return Response::Error(format!("failed to read config: {e}")),
+        };
+        if !next.vpn_hosts.iter().any(|d| d == &domain) {
             // Removing an absent domain is a no-op success.
             return Response::Ok;
         }
-        let mut next = self.config.clone();
         next.vpn_hosts.retain(|d| d != &domain);
         self.commit(next).await
     }
 
     async fn reload_config(&mut self) -> Response {
-        match config::load_config_from(&self.config_path) {
+        match self.load_fresh() {
             Ok(next) => match self.adopt_config(next).await {
                 Ok(()) => Response::Ok,
                 Err(e) => Response::Error(format!("config reloaded, but applying it failed: {e}")),
@@ -681,16 +784,42 @@ impl StateMachine {
         }
     }
 
+    /// Handle a [`StateCommand::ConfigChanged`] from the file watcher: re-read the
+    /// file (the single source of truth) and reconcile to it. The equality check
+    /// debounces the daemon's own writes — after an RMW save `self.config` already
+    /// equals disk, so the watcher event for that write is a no-op — and
+    /// coalesces a burst of events for one save into a single reload. A parse
+    /// failure freezes on the last-good config and surfaces
+    /// [`RoutingState::ConfigInvalid`] (set via [`Self::load_fresh`]); recovery is
+    /// automatic on the next valid edit.
+    async fn on_config_changed(&mut self) {
+        match self.load_fresh() {
+            Ok(loaded) => {
+                if loaded == self.config {
+                    return;
+                }
+                log::info!("config file changed on disk; reloading");
+                if let Err(e) = self.adopt_config(loaded).await {
+                    log::error!("applying externally-edited config failed: {e}");
+                }
+            }
+            Err(e) => {
+                log::warn!("config file on disk is invalid ({e}); keeping the last-good config");
+            }
+        }
+    }
+
     /// Build the editable config projection sent in reply to
-    /// [`Request::GetConfig`]. `config_path` is the daemon's effective file
-    /// path, informational only — [`Self::set_config`] ignores it.
+    /// [`Request::GetConfig`]. The `config_path` is the daemon's effective config
+    /// location (from the store), informational only — [`Self::set_config`]
+    /// ignores it.
     fn config_view(&self) -> ConfigView {
         ConfigView {
             vpn_name: self.config.vpn_name.clone(),
             vpn_backend: self.config.vpn_backend,
             openvpn_management: self.config.openvpn.management.clone(),
             openvpn_management_password_file: self.config.openvpn.management_password_file.clone(),
-            config_path: self.config_path.display().to_string(),
+            config_path: self.config_store.describe(),
         }
     }
 
@@ -700,7 +829,13 @@ impl StateMachine {
     /// and reconciles through the single-writer [`Self::commit`] path. The
     /// incoming `config_path` is ignored: the active path is fixed at launch.
     async fn set_config(&mut self, view: ConfigView) -> Response {
-        let mut next = self.config.clone();
+        // Read-modify-write from disk: overwrite only the editable projection on
+        // the *loaded* config, so a concurrent external edit to `enabled` or the
+        // domain list (owned by the other verbs) is preserved, not clobbered.
+        let mut next = match self.load_fresh() {
+            Ok(config) => config,
+            Err(e) => return Response::Error(format!("failed to read config: {e}")),
+        };
         next.vpn_name = view.vpn_name;
         next.vpn_backend = view.vpn_backend;
         next.openvpn = OpenVpnConfig {
@@ -731,7 +866,11 @@ impl StateMachine {
     /// and disk in lockstep. A persisted change whose re-apply fails is reported
     /// as an error so the caller is not told "ok" while DNS is out of sync.
     async fn commit(&mut self, next: LocalConfig) -> Response {
-        if let Err(e) = config::save_config_to(&self.config_path, &next) {
+        // Residual: the RMW load and this save are not atomic w.r.t. an external
+        // writer (a narrow TOCTOU window). Acceptable here — the actor is the only
+        // daemon writer and hand-edits are manual/rare.
+        // TODO(phase-8): take an flock around the load→save pair to close it.
+        if let Err(e) = self.config_store.save(&next) {
             return Response::Error(format!("failed to persist config: {e}"));
         }
         match self.adopt_config(next).await {
@@ -853,6 +992,7 @@ pub async fn run_state(
                         // The client may have hung up; that is fine.
                         let _ = reply.send(response);
                     }
+                    Some(StateCommand::ConfigChanged) => machine.on_config_changed().await,
                     None => break,
                 }
             }
@@ -1084,6 +1224,91 @@ mod tests {
         dir.join("config.json")
     }
 
+    /// A real file-backed [`ConfigStore`] over a temp path, pre-seeded with `cfg`
+    /// so the first RMW load succeeds — mirroring production, where
+    /// `load_or_init_config` writes the file before the actor starts.
+    fn file_store(tag: &str, cfg: &LocalConfig) -> Arc<dyn ConfigStore> {
+        let store = FileConfigStore::new(temp_config_path(tag));
+        store.save(cfg).unwrap();
+        Arc::new(store)
+    }
+
+    /// An in-memory [`ConfigStore`] for tests that need to simulate what a real
+    /// temp file cannot exercise cleanly: a malformed/unreadable file (`None`
+    /// "on disk"), a concurrent external edit (`set_external`), and a count of
+    /// the actor's own writes (`save_count`, for the self-write debounce check).
+    #[derive(Clone)]
+    struct FakeConfigStore {
+        inner: Arc<Mutex<FakeStoreState>>,
+    }
+
+    struct FakeStoreState {
+        /// `Some` = a valid config "on disk"; `None` = the file does not parse.
+        current: Option<LocalConfig>,
+        saves: usize,
+    }
+
+    impl FakeConfigStore {
+        fn new(cfg: LocalConfig) -> Self {
+            FakeConfigStore {
+                inner: Arc::new(Mutex::new(FakeStoreState {
+                    current: Some(cfg),
+                    saves: 0,
+                })),
+            }
+        }
+
+        /// Simulate an external hand-edit landing a new valid config on disk.
+        fn set_external(&self, cfg: LocalConfig) {
+            self.inner.lock().unwrap().current = Some(cfg);
+        }
+
+        /// Simulate a malformed/unreadable file (a load will fail to parse).
+        fn set_malformed(&self) {
+            self.inner.lock().unwrap().current = None;
+        }
+
+        /// The current config "on disk", or `None` when malformed.
+        fn current(&self) -> Option<LocalConfig> {
+            self.inner.lock().unwrap().current.clone()
+        }
+
+        /// How many times the actor persisted through this store.
+        fn save_count(&self) -> usize {
+            self.inner.lock().unwrap().saves
+        }
+    }
+
+    impl ConfigStore for FakeConfigStore {
+        fn load(&self) -> Result<LocalConfig, ConfigParseError> {
+            match &self.inner.lock().unwrap().current {
+                Some(cfg) => Ok(cfg.clone()),
+                None => Err(ConfigParseError::SerializeError),
+            }
+        }
+
+        fn save(&self, config: &LocalConfig) -> Result<(), ConfigParseError> {
+            let mut state = self.inner.lock().unwrap();
+            state.current = Some(config.clone());
+            state.saves += 1;
+            Ok(())
+        }
+
+        fn describe(&self) -> String {
+            "<in-memory test store>".to_string()
+        }
+    }
+
+    /// Build a machine over an explicit store (used by the fake-store tests).
+    fn machine_with_store(
+        backend: Arc<MockBackend>,
+        store: Arc<dyn ConfigStore>,
+        cfg: LocalConfig,
+    ) -> StateMachine {
+        let (state_tx, _state_rx) = mpsc::channel(16);
+        StateMachine::new(backend, Arc::new(NoopDetectorFactory), cfg, store, state_tx)
+    }
+
     fn config(enabled: bool, hosts: &[&str]) -> LocalConfig {
         LocalConfig {
             vpn_name: "wg0".to_string(),
@@ -1106,13 +1331,8 @@ mod tests {
         // directly and never consume forwarded events, so the receiver is
         // dropped. The Noop factory never produces events anyway.
         let (state_tx, _state_rx) = mpsc::channel(16);
-        StateMachine::new(
-            backend,
-            Arc::new(NoopDetectorFactory),
-            cfg,
-            temp_config_path(tag),
-            state_tx,
-        )
+        let store = file_store(tag, &cfg);
+        StateMachine::new(backend, Arc::new(NoopDetectorFactory), cfg, store, state_tx)
     }
 
     /// Build a machine wired to a [`MockDetectorFactory`], keeping the command
@@ -1126,7 +1346,8 @@ mod tests {
     ) -> (StateMachine, mpsc::Receiver<StateCommand>) {
         let (state_tx, state_rx) = mpsc::channel(16);
         let factory = Arc::new(MockDetectorFactory { shared });
-        let sm = StateMachine::new(backend, factory, cfg, temp_config_path(tag), state_tx);
+        let store = file_store(tag, &cfg);
+        let sm = StateMachine::new(backend, factory, cfg, store, state_tx);
         (sm, state_rx)
     }
 
@@ -1211,7 +1432,7 @@ mod tests {
         assert_eq!(backend.reverts.lock().unwrap().as_slice(), &["wg0"]);
         assert!(sm.applied.is_none());
         // Disable is persisted.
-        let saved = config::load_config_from(&sm.config_path).unwrap();
+        let saved = sm.config_store.load().unwrap();
         assert!(!saved.enabled);
     }
 
@@ -1228,7 +1449,7 @@ mod tests {
         assert_eq!(applies.len(), 2);
         assert_eq!(applies[1].1, vec!["a.com", "b.com"]);
         // Persisted.
-        let saved = config::load_config_from(&sm.config_path).unwrap();
+        let saved = sm.config_store.load().unwrap();
         assert_eq!(saved.vpn_hosts, vec!["a.com", "b.com"]);
     }
 
@@ -1358,7 +1579,7 @@ mod tests {
             vpn_backend: config::VpnBackend::default(),
             openvpn: config::OpenVpnConfig::default(),
         };
-        config::save_config_to(&sm.config_path, &new_cfg).unwrap();
+        sm.config_store.save(&new_cfg).unwrap();
         let resp = sm.on_request(Request::ReloadConfig).await;
 
         assert_eq!(resp, Response::Ok);
@@ -1523,7 +1744,7 @@ mod tests {
         // The re-apply fails, so the caller is told so rather than "ok"...
         assert!(matches!(resp, Response::Error(_)));
         // ...but the config change is still persisted to disk.
-        let saved = config::load_config_from(&sm.config_path).unwrap();
+        let saved = sm.config_store.load().unwrap();
         assert_eq!(saved.vpn_hosts, vec!["a.com", "b.com"]);
     }
 
@@ -1623,7 +1844,7 @@ mod tests {
             Some("/etc/mgmt.pass")
         );
         // The daemon reports its effective config path, informational only.
-        assert_eq!(view.config_path, sm.config_path.display().to_string());
+        assert_eq!(view.config_path, sm.config_store.describe());
     }
 
     #[tokio::test]
@@ -1656,7 +1877,7 @@ mod tests {
         assert!(sm.config.enabled);
         // ...and the change is persisted to the active file (whose path the
         // incoming view did not alter).
-        let saved = config::load_config_from(&sm.config_path).unwrap();
+        let saved = sm.config_store.load().unwrap();
         assert_eq!(saved.vpn_name, "tun9");
         assert_eq!(saved.vpn_hosts, vec!["a.com", "b.com"]);
         assert!(saved.enabled);
@@ -2250,5 +2471,177 @@ mod tests {
             "a watch that ends on its own must report an unhealthy detector, got {:?}",
             info.detector_health
         );
+    }
+
+    // ---- Phase 5c: config as the single source of truth ----
+
+    #[tokio::test]
+    async fn mutation_is_read_modify_write_merging_a_concurrent_external_edit() {
+        // The in-memory config starts as {wg0, [a.com]}; a concurrent external
+        // edit changes a *different* field (vpn_name -> tun9). add_domain must
+        // load fresh and merge, so the saved config keeps the external vpn_name
+        // AND gains the new domain — not clobber tun9 from the stale snapshot.
+        let backend = Arc::new(MockBackend::default());
+        let fake = FakeConfigStore::new(config(true, &["a.com"]));
+        let store: Arc<dyn ConfigStore> = Arc::new(fake.clone());
+        let mut sm = machine_with_store(backend, store, config(true, &["a.com"]));
+
+        let mut external = config(true, &["a.com"]);
+        external.vpn_name = "tun9".to_string();
+        fake.set_external(external);
+
+        assert_eq!(sm.add_domain("b.com".to_string()).await, Response::Ok);
+
+        let saved = fake.current().expect("config still valid");
+        assert_eq!(
+            saved.vpn_name, "tun9",
+            "external vpn_name edit was clobbered"
+        );
+        assert_eq!(saved.vpn_hosts, vec!["a.com", "b.com"]);
+        // The in-memory working copy is kept in lockstep with disk.
+        assert_eq!(sm.config.vpn_name, "tun9");
+        assert_eq!(sm.config.vpn_hosts, vec!["a.com", "b.com"]);
+    }
+
+    #[tokio::test]
+    async fn mutation_with_unreadable_config_errors_without_writing_and_freezes() {
+        let backend = Arc::new(MockBackend::default());
+        let fake = FakeConfigStore::new(config(true, &["a.com"]));
+        let store: Arc<dyn ConfigStore> = Arc::new(fake.clone());
+        let mut sm = machine_with_store(backend, store, config(true, &["a.com"]));
+
+        // The file becomes malformed before the RMW read.
+        fake.set_malformed();
+        let response = sm.add_domain("b.com".to_string()).await;
+
+        assert!(
+            matches!(response, Response::Error(_)),
+            "an RMW load failure must error"
+        );
+        assert_eq!(
+            fake.save_count(),
+            0,
+            "no config may be written after a failed read"
+        );
+        // The in-memory config is untouched, and the failure is surfaced.
+        assert_eq!(sm.config.vpn_hosts, vec!["a.com"]);
+        assert_eq!(sm.routing_state(), RoutingState::ConfigInvalid);
+    }
+
+    #[tokio::test]
+    async fn self_write_does_not_trigger_a_redundant_reconcile() {
+        // After the daemon's own write, self.config already equals disk, so the
+        // watcher event for that write must be a no-op (the equality skip) and
+        // must not re-run apply.
+        let backend = Arc::new(MockBackend::default());
+        let fake = FakeConfigStore::new(config(true, &["a.com"]));
+        let store: Arc<dyn ConfigStore> = Arc::new(fake.clone());
+        let mut sm = machine_with_store(backend.clone(), store, config(true, &["a.com"]));
+
+        sm.on_event(vpn_up("wg0")).await;
+        let applies_before = backend.applies.lock().unwrap().len();
+        assert_eq!(applies_before, 1);
+
+        // Simulate the watcher firing for the daemon's own (equal) write.
+        sm.on_config_changed().await;
+
+        assert_eq!(
+            backend.applies.lock().unwrap().len(),
+            applies_before,
+            "an equal config must not re-apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_edit_to_a_watch_field_reloads_and_rearms() {
+        let backend = Arc::new(MockBackend::default());
+        let fake = FakeConfigStore::new(config(true, &["a.com"]));
+        let store: Arc<dyn ConfigStore> = Arc::new(fake.clone());
+        let mut sm = machine_with_store(backend, store, config(true, &["a.com"]));
+
+        // Arm once so the generation has a baseline.
+        sm.arm_watch();
+        let generation_before = sm.watch_generation;
+
+        let mut external = config(true, &["a.com"]);
+        external.vpn_name = "tun9".to_string();
+        fake.set_external(external);
+
+        sm.on_config_changed().await;
+
+        assert_eq!(
+            sm.config.vpn_name, "tun9",
+            "external watch-field edit was not adopted"
+        );
+        assert!(
+            sm.watch_generation > generation_before,
+            "a watch-field change must re-arm the watch"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_edit_to_a_non_watch_field_reloads_without_rearm() {
+        let backend = Arc::new(MockBackend::default());
+        let fake = FakeConfigStore::new(config(true, &["a.com"]));
+        let store: Arc<dyn ConfigStore> = Arc::new(fake.clone());
+        let mut sm = machine_with_store(backend, store, config(true, &["a.com"]));
+
+        sm.arm_watch();
+        let generation_before = sm.watch_generation;
+
+        // Only the domain list changes (not a watch field).
+        fake.set_external(config(true, &["a.com", "c.com"]));
+        sm.on_config_changed().await;
+
+        assert_eq!(
+            sm.config.vpn_hosts,
+            vec!["a.com", "c.com"],
+            "external domain edit not adopted"
+        );
+        assert_eq!(
+            sm.watch_generation, generation_before,
+            "a domain-only change must not re-arm the watch"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_file_freezes_on_last_good_then_recovers() {
+        let backend = Arc::new(MockBackend::default());
+        let fake = FakeConfigStore::new(config(true, &["a.com"]));
+        let store: Arc<dyn ConfigStore> = Arc::new(fake.clone());
+        let mut sm = machine_with_store(backend.clone(), store, config(true, &["a.com"]));
+
+        sm.on_event(vpn_up("wg0")).await;
+        assert!(sm.applied.is_some());
+        let applies_after_first = backend.applies.lock().unwrap().len();
+
+        // A malformed hand-edit: freeze on the last-good config, surface invalid.
+        fake.set_malformed();
+        sm.on_config_changed().await;
+        assert_eq!(sm.routing_state(), RoutingState::ConfigInvalid);
+        assert_eq!(
+            sm.config.vpn_hosts,
+            vec!["a.com"],
+            "the last-good config must be kept"
+        );
+        assert!(
+            sm.applied.is_some(),
+            "applied rules must be held while frozen"
+        );
+        assert_eq!(
+            backend.applies.lock().unwrap().len(),
+            applies_after_first,
+            "a malformed file must not re-apply or revert"
+        );
+
+        // The user fixes the file: recovery is automatic on the next load.
+        fake.set_external(config(true, &["a.com", "c.com"]));
+        sm.on_config_changed().await;
+        assert!(
+            !sm.config_invalid,
+            "a valid file must clear the freeze flag"
+        );
+        assert_ne!(sm.routing_state(), RoutingState::ConfigInvalid);
+        assert_eq!(sm.config.vpn_hosts, vec!["a.com", "c.com"]);
     }
 }

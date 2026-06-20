@@ -18,7 +18,16 @@ sudo install -Dm755 target/release/splitway         /usr/bin/splitway
 sudo systemctl enable --now splitway
 ```
 
-On NixOS, use the flake's `nixosModules.default` instead (`services.splitway.enable = true;`).
+On NixOS, use the flake's `nixosModules.default` instead
+(`services.splitway.enable = true;`) — this is also the author's daily-driver and
+iteration channel. The module runs the daemon with
+`--config /var/lib/splitway/config.json` and provisions that path via systemd's
+`StateDirectory` (a `0700` dir owned by the service). The config is **writable
+and owned by the daemon** (the GUI/CLI mutate it at runtime, and external
+hand-edits are picked up live); the module deliberately does not generate a
+read-only `/etc` config. The daemon creates an empty config there on first run.
+See [docs/architecture.md](../docs/architecture.md) ("Config is the single
+source of truth").
 
 ### Socket security model
 

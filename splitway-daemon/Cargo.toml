@@ -19,6 +19,9 @@ tokio = { version = "1", features = [
     "signal",
     "time",
 ] }
+# Live config-file watch (inotify on Linux, FSEvents on macOS). Default features
+# enable the cross-platform backends; no extra system dependency is pulled in.
+notify = "6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }

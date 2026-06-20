@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::Arc;
 
+use notify::{RecursiveMode, Watcher};
 use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::{mpsc, oneshot};
 
@@ -17,7 +18,10 @@ use splitway_shared::ipc::socket_path;
 use splitway_shared::platform::DnsBackend;
 
 use crate::backend::create_dns_backend;
-use state::{run_state, DetectorFactory, PlatformDetectorFactory, StateCommand, StateMachine};
+use state::{
+    run_state, ConfigStore, DetectorFactory, FileConfigStore, PlatformDetectorFactory,
+    StateCommand, StateMachine,
+};
 
 /// Entry point for `splitway-daemon run`. `config_path` is the optional
 /// `--config <PATH>` override; `None` uses the default config location. The
@@ -79,11 +83,14 @@ async fn run_async(config: LocalConfig, config_path: PathBuf) {
     let (state_tx, state_rx) = mpsc::channel::<StateCommand>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<oneshot::Sender<bool>>();
     let detector_factory: Arc<dyn DetectorFactory> = Arc::new(PlatformDetectorFactory);
+    // The config file is the single source of truth; the actor reads and writes
+    // it only through this store (no inline `fs` in `StateMachine`).
+    let config_store: Arc<dyn ConfigStore> = Arc::new(FileConfigStore::new(config_path.clone()));
     let machine = StateMachine::new(
         backend,
         detector_factory,
         config,
-        config_path,
+        config_store,
         state_tx.clone(),
     );
     // `run_state` arms the watch before entering its command loop. That happens
@@ -92,6 +99,12 @@ async fn run_async(config: LocalConfig, config_path: PathBuf) {
     // empty `vpn_name` or a detector that fails to start leaves auto-apply off
     // while IPC stays up (see `arm_watch`).
     let state_handle = tokio::spawn(run_state(machine, state_rx, shutdown_rx));
+
+    // Watch the config file for external hand-edits so they apply live, keeping
+    // the file the single source of truth without requiring a manual reload. The
+    // actor's equality check ignores the daemon's own writes. Best-effort: a
+    // failure to start the watcher is logged and degrades to manual `ReloadConfig`.
+    spawn_config_watcher(config_path, state_tx.clone());
 
     // Serve IPC requests on the socket bound above (before the state pipeline
     // started, so a bind failure could never have stranded any rules).
@@ -161,6 +174,86 @@ async fn wait_for_shutdown_signal(sigint: &mut Signal, sigterm: &mut Signal) {
         _ = sigint.recv() => log::info!("received SIGINT"),
         _ = sigterm.recv() => log::info!("received SIGTERM"),
     }
+}
+
+/// Spawn a best-effort watcher that turns an external hand-edit of the config
+/// file into a [`StateCommand::ConfigChanged`] for the state actor — so an edit
+/// applies live without an IPC call. It watches the file's *parent directory*
+/// (not the inode) so the atomic temp-file-plus-rename write that `save`
+/// performs — which replaces the file rather than editing it in place — is still
+/// observed. Events are filtered to the config file's name; the actor's equality
+/// check then debounces the daemon's own writes and coalesces a burst of events
+/// for one save into a single reload.
+///
+/// A failure to set the watcher up is logged and degrades to manual
+/// `ReloadConfig` only; it is never fatal.
+fn spawn_config_watcher(config_path: PathBuf, state_tx: mpsc::Sender<StateCommand>) {
+    let dir = match config_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => {
+            log::warn!(
+                "config path {} has no parent directory; live config watch disabled",
+                config_path.display()
+            );
+            return;
+        }
+    };
+    let target = match config_path.file_name() {
+        Some(name) => name.to_os_string(),
+        None => {
+            log::warn!(
+                "config path {} has no file name; live config watch disabled",
+                config_path.display()
+            );
+            return;
+        }
+    };
+
+    // notify delivers events on its own thread through this std channel; a
+    // blocking task owns the watcher (keeping it alive — dropping it stops
+    // watching) and bridges matching events onto the actor's async channel.
+    let (raw_tx, raw_rx) = std::sync::mpsc::channel();
+    let mut watcher = match notify::recommended_watcher(move |res| {
+        let _ = raw_tx.send(res);
+    }) {
+        Ok(watcher) => watcher,
+        Err(e) => {
+            log::warn!("failed to create config watcher: {e}; live config watch disabled");
+            return;
+        }
+    };
+    if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
+        log::warn!(
+            "failed to watch config directory {}: {e}; live config watch disabled",
+            dir.display()
+        );
+        return;
+    }
+    log::info!("watching {} for external config edits", dir.display());
+
+    tokio::task::spawn_blocking(move || {
+        // Hold the watcher for the lifetime of this loop. The loop ends when the
+        // watcher's channel closes or the actor is gone.
+        let _watcher = watcher;
+        for event in raw_rx {
+            match event {
+                Ok(event)
+                    if event
+                        .paths
+                        .iter()
+                        .any(|p| p.file_name() == Some(target.as_os_str())) =>
+                {
+                    // One notification per observed event for the config file; the
+                    // actor's equality check makes redundant reloads no-ops.
+                    if state_tx.blocking_send(StateCommand::ConfigChanged).is_err() {
+                        return; // actor gone; stop watching
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("config watcher error: {e}"),
+            }
+        }
+    });
 }
 
 fn load_or_init_config(path: &Path) -> LocalConfig {
