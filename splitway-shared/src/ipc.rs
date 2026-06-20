@@ -337,6 +337,13 @@ pub fn compare_drift(live: &LinkDnsState, applied: Option<&AppliedInfo>) -> Drif
         .domains
         .iter()
         .filter(|believed| {
+            // Strip a leading `~` (systemd's route-only marker) from the believed
+            // domain too — the live parser already strips it, so a configured /
+            // hand-edited `~corp.example.com` must compare against the live
+            // `corp.example.com` rather than read as drift. Symmetric with the
+            // parser's normalization.
+            let believed = believed.as_str();
+            let believed = believed.strip_prefix('~').unwrap_or(believed);
             !live
                 .routing_domains
                 .iter()
@@ -882,6 +889,16 @@ mod tests {
         // A non-address token falls back to a folded string compare.
         assert!(!server_matches("10.0.0.1", "not-an-ip"));
         assert!(server_matches("not-an-ip", "not-an-ip"));
+    }
+
+    #[test]
+    fn drift_believed_route_only_marker_matches_stripped_live_domain() {
+        // A believed domain configured with systemd's route-only `~` marker (a
+        // hand-edited config, or `add_domain` accepting it) matches the live
+        // `corp.example.com` the parser already stripped — not false drift.
+        let applied = believed(&["10.0.0.1"], &["~corp.example.com"]);
+        let live = live(&["10.0.0.1"], &["corp.example.com"]);
+        assert_eq!(compare_drift(&live, Some(&applied)), DriftVerdict::InSync);
     }
 
     #[test]
