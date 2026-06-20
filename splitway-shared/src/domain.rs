@@ -38,7 +38,8 @@ fn fold(host: &str) -> String {
 /// Accepts `https://vault.sub.example.com/x?y=1` (→ `vault.sub.example.com`),
 /// `sub.example.com:443` (→ `sub.example.com`), `user@host`, and a trailing
 /// dot. Rejects empty/whitespace-only input, a path pasted without a scheme
-/// (a bare `host/x`), a bracketed IPv6 literal, and hosts with empty labels.
+/// (a bare `host/x`), IP literals (bare/bracketed IPv6 and IPv4 — a routing
+/// domain is a name, not an address), and hosts with empty labels.
 ///
 /// TODO(idn): IDN / punycode is out of scope. Non-ASCII hosts pass through as-is
 /// (only ASCII is lowercased); a future change should punycode-encode them so an
@@ -80,6 +81,14 @@ pub fn normalize_host(input: &str) -> Result<String, DomainError> {
     let host = host_port.split(':').next().unwrap_or(host_port);
 
     let host = fold(host);
+
+    // An IPv4 literal is not a routing domain either — like the IPv6 cases above,
+    // it is an address, not a name (it would never match a real DNS lookup, and a
+    // route-check on it is meaningless). Reject it for symmetry.
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Err(DomainError::NotAHost(trimmed.to_string()));
+    }
+
     validate_host(&host).map(|()| host)
 }
 
@@ -184,6 +193,15 @@ mod tests {
         // An empty scheme is not a valid URL — falls through and is rejected.
         assert!(matches!(
             normalize_host("://x"),
+            Err(DomainError::NotAHost(_))
+        ));
+        // IPv4 literals are not routing domains (symmetry with the IPv6 cases).
+        assert!(matches!(
+            normalize_host("192.0.2.1"),
+            Err(DomainError::NotAHost(_))
+        ));
+        assert!(matches!(
+            normalize_host("https://192.0.2.1/"),
             Err(DomainError::NotAHost(_))
         ));
         // Empty labels.

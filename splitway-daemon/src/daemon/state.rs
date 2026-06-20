@@ -595,7 +595,12 @@ impl StateMachine {
                     Err(e) => Response::Error(format!("interface enumeration task panicked: {e}")),
                 }
             }
-            Request::CheckDomain(raw) => self.check_domain(raw).await,
+            // `CheckDomain` is handled out-of-band in `run_state` (resolved on a
+            // detached task via `spawn_check_domain`, so a slow resolver cannot
+            // stall the actor); it never reaches this inline dispatch.
+            Request::CheckDomain(_) => {
+                Response::Error("internal error: CheckDomain is handled out-of-band".to_string())
+            }
         }
     }
 
@@ -794,50 +799,66 @@ impl StateMachine {
     /// attempt a live resolution on the blocking pool. A resolution failure is
     /// **not** a request failure — it returns `resolution: None`. The result
     /// reports coverage and which resolver answered, not reachability.
-    async fn check_domain(&mut self, raw: String) -> Response {
+    ///
+    /// Resolved **off the actor on a detached task**: it snapshots the cheap state
+    /// (config domains, interface, enabled, vpn_up) synchronously, then resolves
+    /// and replies from a spawned task. This is deliberately not `on_request().
+    /// await`ed — a slow or hung resolver must never stall the actor (and thus VPN
+    /// reconciliation or other control requests). Coverage is computed from the
+    /// snapshot; a resolution failure replies with `resolution: None`, never an
+    /// `Error`. `&self`: it only reads.
+    fn spawn_check_domain(&self, raw: String, reply: oneshot::Sender<Response>) {
         let host = match normalize_host(&raw) {
             Ok(host) => host,
-            Err(e) => return Response::Error(format!("invalid domain: {e}")),
+            Err(e) => {
+                let _ = reply.send(Response::Error(format!("invalid domain: {e}")));
+                return;
+            }
         };
 
         // Coverage: the first configured domain that covers `host` (both sides
         // normalized at compare time, so a pre-existing un-normalized entry still
-        // matches). Pure, no I/O.
+        // matches). Pure, no I/O — computed now, on the actor, from the snapshot.
         let matched_domain = self
             .config
             .vpn_hosts
             .iter()
             .find(|d| domain::domain_covers(d, &host))
             .cloned();
-
-        // Live resolution off the actor (it shells out / does network I/O), like
-        // `list_interfaces`, so a slow lookup never stalls VPN-event or IPC
-        // handling. A failure (NXDOMAIN, unsupported platform, …) degrades to
-        // `None`, never an `Error` reply.
         let backend = self.backend.clone();
-        let host_for_resolve = host.clone();
-        let resolution =
-            match tokio::task::spawn_blocking(move || backend.resolve(&host_for_resolve)).await {
-                Ok(Ok(info)) => Some(info),
-                Ok(Err(e)) => {
-                    log::debug!("resolution of {host} unavailable: {e}");
-                    None
-                }
-                Err(e) => {
-                    log::warn!("resolution task panicked for {host}: {e}");
-                    None
-                }
-            };
+        let vpn_interface = self.config.vpn_name.clone();
+        let enabled = self.config.enabled;
+        let vpn_up = self.vpn_up;
 
-        Response::DomainCheck(DomainCheckInfo {
-            host,
-            covered: matched_domain.is_some(),
-            matched_domain,
-            vpn_interface: self.config.vpn_name.clone(),
-            resolution,
-            enabled: self.config.enabled,
-            vpn_up: self.vpn_up,
-        })
+        // Detached: resolve (blocking I/O on the blocking pool) and reply here, so
+        // the actor returns immediately. A failure (NXDOMAIN, unsupported
+        // platform, …) degrades to `None`, never an `Error`.
+        tokio::spawn(async move {
+            let host_for_resolve = host.clone();
+            let resolution =
+                match tokio::task::spawn_blocking(move || backend.resolve(&host_for_resolve)).await
+                {
+                    Ok(Ok(info)) => Some(info),
+                    Ok(Err(e)) => {
+                        log::debug!("resolution of {host} unavailable: {e}");
+                        None
+                    }
+                    Err(e) => {
+                        log::warn!("resolution task panicked for {host}: {e}");
+                        None
+                    }
+                };
+
+            let _ = reply.send(Response::DomainCheck(DomainCheckInfo {
+                host,
+                covered: matched_domain.is_some(),
+                matched_domain,
+                vpn_interface,
+                resolution,
+                enabled,
+                vpn_up,
+            }));
+        });
     }
 
     async fn remove_domain(&mut self, domain: String) -> Response {
@@ -1107,11 +1128,18 @@ pub async fn run_state(
                     Some(StateCommand::WatchEnded { generation }) => {
                         machine.on_watch_ended(generation)
                     }
-                    Some(StateCommand::Ipc { request, reply }) => {
-                        let response = machine.on_request(request).await;
-                        // The client may have hung up; that is fine.
-                        let _ = reply.send(response);
-                    }
+                    Some(StateCommand::Ipc { request, reply }) => match request {
+                        // Route checks resolve off the actor (see
+                        // `spawn_check_domain`), so a slow/hung resolver cannot
+                        // delay VPN reconciliation or other control requests.
+                        Request::CheckDomain(raw) => machine.spawn_check_domain(raw, reply),
+                        // Everything else replies inline.
+                        other => {
+                            let response = machine.on_request(other).await;
+                            // The client may have hung up; that is fine.
+                            let _ = reply.send(response);
+                        }
+                    },
                     Some(StateCommand::ConfigChanged) => machine.on_config_changed().await,
                     None => break,
                 }
@@ -2874,18 +2902,22 @@ mod tests {
         }
     }
 
+    /// Drive the detached `CheckDomain` path the way `run_state` does — spawn it
+    /// with a reply channel and await the reply — so the tests exercise the real
+    /// off-actor handler rather than the inline `on_request` dispatch.
+    async fn check_via(sm: &StateMachine, raw: &str) -> Response {
+        let (tx, rx) = oneshot::channel();
+        sm.spawn_check_domain(raw.to_string(), tx);
+        rx.await.unwrap()
+    }
+
     #[tokio::test]
     async fn check_domain_normalizes_and_reports_suffix_coverage() {
         let backend = Arc::new(MockBackend::default());
-        let mut sm = machine(backend, config(true, &["sub.example.com"]), "check-covered");
+        let sm = machine(backend, config(true, &["sub.example.com"]), "check-covered");
 
         // A pasted URL whose host is a subdomain of a configured routing domain.
-        let info = domain_check(
-            sm.on_request(Request::CheckDomain(
-                "https://vault.sub.example.com/x?y=1".to_string(),
-            ))
-            .await,
-        );
+        let info = domain_check(check_via(&sm, "https://vault.sub.example.com/x?y=1").await);
 
         assert_eq!(info.host, "vault.sub.example.com");
         assert!(info.covered);
@@ -2900,16 +2932,13 @@ mod tests {
     #[tokio::test]
     async fn check_domain_not_covered() {
         let backend = Arc::new(MockBackend::default());
-        let mut sm = machine(
+        let sm = machine(
             backend,
             config(true, &["sub.example.com"]),
             "check-uncovered",
         );
 
-        let info = domain_check(
-            sm.on_request(Request::CheckDomain("example.org".to_string()))
-                .await,
-        );
+        let info = domain_check(check_via(&sm, "example.org").await);
 
         assert_eq!(info.host, "example.org");
         assert!(!info.covered);
@@ -2919,12 +2948,10 @@ mod tests {
     #[tokio::test]
     async fn check_domain_invalid_input_is_an_error() {
         let backend = Arc::new(MockBackend::default());
-        let mut sm = machine(backend, config(true, &["sub.example.com"]), "check-invalid");
+        let sm = machine(backend, config(true, &["sub.example.com"]), "check-invalid");
 
         // A path pasted onto a bare host (no scheme) cannot be normalized.
-        let resp = sm
-            .on_request(Request::CheckDomain("example.com/path".to_string()))
-            .await;
+        let resp = check_via(&sm, "example.com/path").await;
         assert!(matches!(resp, Response::Error(_)), "got {resp:?}");
     }
 
@@ -2933,16 +2960,13 @@ mod tests {
         let backend = Arc::new(MockBackend::default());
         // Synthetic, placeholder-only resolution.
         backend.set_resolution(vec!["10.0.0.1".to_string()], Some("wg0".to_string()));
-        let mut sm = machine(
+        let sm = machine(
             backend,
             config(true, &["sub.example.com"]),
             "check-resolved",
         );
 
-        let info = domain_check(
-            sm.on_request(Request::CheckDomain("vault.sub.example.com".to_string()))
-                .await,
-        );
+        let info = domain_check(check_via(&sm, "vault.sub.example.com").await);
 
         assert!(info.covered);
         let resolution = info.resolution.expect("resolution should be surfaced");
@@ -2955,16 +2979,13 @@ mod tests {
     async fn check_domain_resolution_failure_is_none_not_error() {
         let backend = Arc::new(MockBackend::default());
         backend.set_fail_resolve(true);
-        let mut sm = machine(
+        let sm = machine(
             backend,
             config(true, &["sub.example.com"]),
             "check-resolve-fail",
         );
 
-        let info = domain_check(
-            sm.on_request(Request::CheckDomain("vault.sub.example.com".to_string()))
-                .await,
-        );
+        let info = domain_check(check_via(&sm, "vault.sub.example.com").await);
 
         // Coverage is still reported; a resolution failure is never an Error.
         assert!(info.covered);

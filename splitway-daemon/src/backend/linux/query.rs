@@ -46,7 +46,12 @@ pub(crate) fn parse_resolvectl_query(output: &str) -> ResolutionInfo {
         if !addresses.iter().any(|a| a == token) {
             addresses.push(token.to_string());
         }
-        // Take the first reported link; all answers for one query share it.
+        // Attribution is keyed on the FIRST reported link, by design: under
+        // systemd-resolved's per-name link routing all answers for one query
+        // share a link. If a future resolver ever split answers across links
+        // (e.g. A via one, AAAA via another) this samples only the first — and
+        // the CLI's "not resolving through the VPN" verdict would then key off
+        // that single sample.
         if via_interface.is_none() {
             if let Some(iface) = link {
                 if !iface.is_empty() {

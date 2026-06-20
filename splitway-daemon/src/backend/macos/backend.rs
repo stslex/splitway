@@ -76,8 +76,9 @@ impl DnsBackend for MacosBackend {
             .to_socket_addrs()
             .map_err(|e| PlatformError::CommandFailed(format!("resolve {host}: {e}")))?
             .map(|addr| addr.ip().to_string())
-            // Dedup while keeping output stable (a host often has several SRV/AAAA
-            // entries that map to the same IP for different ports).
+            // Dedup while keeping output stable: getaddrinfo returns A/AAAA
+            // records, and a host often resolves to the same IP via several
+            // entries (duplicate records, or both the v4 and v6 family).
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
