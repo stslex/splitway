@@ -140,6 +140,19 @@ struct Applied {
     dns_servers: Vec<String>,
 }
 
+/// Project the internal applied snapshot to its wire form. Defined once and used
+/// by both `status()` (belief) and `spawn_verify()` (the read-back's belief
+/// baseline) so the two can never silently diverge if a field is added.
+impl From<&Applied> for AppliedInfo {
+    fn from(applied: &Applied) -> Self {
+        AppliedInfo {
+            interface: applied.interface.clone(),
+            domains: applied.domains.clone(),
+            dns_servers: applied.dns_servers.clone(),
+        }
+    }
+}
+
 pub struct StateMachine {
     backend: Arc<dyn DnsBackend>,
     /// Builds the VPN detector on every (re-)arm. Injected for testability.
@@ -669,11 +682,7 @@ impl StateMachine {
             // Map the private `Applied` snapshot to the wire projection: `None`
             // recovers the old "applied?" bool, and `Some` exposes the live
             // domain → DNS mapping for client-side verification.
-            applied: self.applied.as_ref().map(|a| AppliedInfo {
-                interface: a.interface.clone(),
-                domains: a.domains.clone(),
-                dns_servers: a.dns_servers.clone(),
-            }),
+            applied: self.applied.as_ref().map(AppliedInfo::from),
             routing_state: self.routing_state(),
             detector_health: self.detector_health.clone(),
             domains: self.config.vpn_hosts.clone(),
@@ -913,11 +922,7 @@ impl StateMachine {
     fn spawn_verify(&self, reply: oneshot::Sender<Response>) {
         let backend = self.backend.clone();
         // The believed mapping, projected to the wire type for the pure compare.
-        let applied = self.applied.as_ref().map(|a| AppliedInfo {
-            interface: a.interface.clone(),
-            domains: a.domains.clone(),
-            dns_servers: a.dns_servers.clone(),
-        });
+        let applied = self.applied.as_ref().map(AppliedInfo::from);
         // Read the applied interface if any, else the configured one — so the
         // link's current state still shows when nothing is applied.
         let interface = match &self.applied {

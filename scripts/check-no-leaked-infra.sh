@@ -74,8 +74,8 @@ fi
 #    output whose IPv4 fields are real — which checks 1 and 2 miss when the dump
 #    carries only real IPs and no internal-domain suffix. The allowlist is the
 #    RFC 5737 documentation ranges plus the conventional stand-ins already used
-#    across the fixtures; any other IPv4 on such a field line fails. (IPv6 doc
-#    ranges 2001:db8::/fd00::/fe80:: are placeholders and are not checked.)
+#    across the fixtures; any other IPv4 on such a field line fails. (IPv6 on the
+#    same field lines is checked separately in check 4.)
 #    Limits (heuristic, acceptable for an optional guard): assumes one IPv4 per
 #    field line, and cannot flag a real IP that happens to fall inside a stand-in
 #    range (10.0.0./10.8.0./10.9.0./192.168.1.). The CLAUDE.md redaction policy
@@ -94,6 +94,26 @@ if [ -n "$dns_field_hits" ]; then
   echo "       like real captured nmcli/scutil/resolv output. Replace with RFC 5737" >&2
   echo "       placeholders (192.0.2.x / 198.51.100.x), or extend the allowlist if" >&2
   echo "       it is a deliberate stand-in (see CLAUDE.md)." >&2
+  status=1
+fi
+
+# 4. DNS-field IPv6 addresses must use placeholder ranges too — the IPv4-only
+#    check 3 would miss a real IPv6 resolver pasted into the resolvectl-status
+#    fixtures (exempt from check 2). Allowed: RFC 3849 2001:db8::/32, ULA
+#    fc00::/7, link-local fe80::/10. Detection requires two consecutive hex
+#    groups (`h:h:`), so it catches a real multi-group address but never
+#    false-positives on a Rust `::` path (e.g. `State::default` -> `e::d` is a
+#    single group). Same heuristic limits as check 3: one token per line, and a
+#    single-leading-group form (`2a00::1`) is not caught — placeholders plus human
+#    review remain the primary defense.
+ALLOW_V6='(2001:0*db8:|f[cd][0-9a-f]{0,2}:|fe[89ab][0-9a-f]:)'
+v6_field_hits=$(git grep -hIE "$DNS_FIELD" -- "${EXCLUDES[@]}" \
+  | grep -oiE '([0-9a-f]{1,4}:){2,}[0-9a-f]{0,4}' | grep -ivE "$ALLOW_V6" || true)
+if [ -n "$v6_field_hits" ]; then
+  printf '%s\n' "$v6_field_hits" >&2
+  echo "ERROR: a DNS field uses a non-placeholder IPv6 — this looks like a real" >&2
+  echo "       captured resolver address. Use a documentation range (RFC 3849" >&2
+  echo "       2001:db8::/32, ULA fc00::/7, link-local fe80::/10), or extend the allowlist." >&2
   status=1
 fi
 
