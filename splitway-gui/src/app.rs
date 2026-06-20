@@ -250,6 +250,7 @@ impl SplitwayApp {
                 // The GUI never issues these.
                 Request::ListDomains => {}
                 Request::CheckDomain(_) => {}
+                Request::Verify => {}
             }
         }
     }

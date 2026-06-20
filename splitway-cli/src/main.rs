@@ -39,6 +39,9 @@ enum Commands {
     Reload,
     /// Check whether a domain (a URL or bare host) routes through the VPN.
     Check { url_or_host: String },
+    /// Read the live DNS state back from the system and report any drift from
+    /// what the daemon believes it installed.
+    Verify,
 }
 
 #[cfg(unix)]
@@ -69,6 +72,7 @@ fn run(cli: Cli) {
         Commands::List => Request::ListDomains,
         Commands::Reload => Request::ReloadConfig,
         Commands::Check { url_or_host } => Request::CheckDomain(url_or_host),
+        Commands::Verify => Request::Verify,
     };
 
     match ipc::client::send_request(request) {
@@ -158,8 +162,88 @@ fn print_response(response: &splitway_shared::ipc::Response) {
             }
         }
         Response::DomainCheck(info) => print_domain_check(info),
+        Response::Verify(info) => print_verify(info),
         Response::Error(message) => eprintln!("error: {message}"),
     }
+}
+
+/// Render a [`Response::Verify`] plainly: the live per-link DNS state read back
+/// from the system, then the drift verdict comparing it to what the daemon
+/// believes it installed. Careful to read as *reality vs belief* — and, like the
+/// route-check, never to imply reachability (Splitway governs DNS, not IP
+/// routing). Status stays the daemon's belief; `verify` is the explicit reality
+/// check.
+#[cfg(unix)]
+fn print_verify(info: &splitway_shared::ipc::VerifyInfo) {
+    use splitway_shared::ipc::DriftVerdict;
+
+    let live = &info.live;
+    let live_empty = live.servers.is_empty() && live.routing_domains.is_empty();
+
+    println!(
+        "live DNS servers: {}",
+        if live.servers.is_empty() {
+            "(none)".to_string()
+        } else {
+            live.servers.join(", ")
+        }
+    );
+    println!(
+        "live DNS domains: {}",
+        if live.routing_domains.is_empty() {
+            "(none)".to_string()
+        } else {
+            live.routing_domains.join(", ")
+        }
+    );
+
+    match &info.drift {
+        DriftVerdict::NotApplicable => {
+            println!("verdict:          nothing is applied right now — the daemon believes no DNS");
+            println!("                  rules are installed, so there is nothing to verify");
+            println!(
+                "                  (the lines above are the link's current DNS state, if any)"
+            );
+        }
+        DriftVerdict::InSync => {
+            println!(
+                "verdict:          in sync — the live DNS state matches what the daemon installed"
+            );
+        }
+        DriftVerdict::Drifted {
+            missing_servers,
+            unrouted_domains,
+        } => {
+            println!(
+                "verdict:          DRIFT — the live DNS state diverges from what the daemon believes"
+            );
+            println!("                  it installed:");
+            if !missing_servers.is_empty() {
+                println!(
+                    "                  missing servers (believed, absent live): {}",
+                    missing_servers.join(", ")
+                );
+            }
+            if !unrouted_domains.is_empty() {
+                println!(
+                    "                  unrouted domains (believed, not routed live): {}",
+                    unrouted_domains.join(", ")
+                );
+            }
+            if live_empty {
+                println!("                  (the live read came back empty — the read-back may be");
+                println!(
+                    "                   unavailable on this system, or the link no longer carries"
+                );
+                println!("                   Splitway's DNS)");
+            }
+        }
+    }
+
+    println!();
+    println!("note: this checks DNS only — what the link's resolver state IS versus what the");
+    println!("      daemon installed, not whether the resolved addresses are reachable through");
+    println!("      the tunnel.");
 }
 
 /// Render a [`Response::DomainCheck`] plainly. Distinguishes coverage (is the
@@ -254,7 +338,8 @@ fn print_domain_check(info: &splitway_shared::ipc::DomainCheckInfo) {
     // the `via link:` line is *reality* (where the live query was answered). When
     // those genuinely disagree — believed-applied but answered by a non-VPN link —
     // frame it as drift so the two lines don't read as a bare contradiction. The
-    // live answer is authoritative; full read-back/drift reconciliation is Phase 5d.
+    // live answer is authoritative; `splitway verify` surfaces read-back/drift
+    // for the whole link explicitly (reconcile-on-drift remains future).
     let drifting = matches!(
         info.routing_state,
         splitway_shared::ipc::RoutingState::Applied

@@ -18,8 +18,8 @@ use tokio::task::AbortHandle;
 use splitway_shared::config::{self, ConfigParseError, LocalConfig, OpenVpnConfig};
 use splitway_shared::domain::{self, normalize_host};
 use splitway_shared::ipc::{
-    AppliedInfo, ConfigView, DetectorHealth, DomainCheckInfo, Request, Response, RoutingState,
-    StatusInfo,
+    compare_drift, AppliedInfo, ConfigView, DetectorHealth, DomainCheckInfo, LinkDnsState, Request,
+    Response, RoutingState, StatusInfo, VerifyInfo,
 };
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnDetector, VpnEvent, VpnInfo};
 
@@ -32,6 +32,14 @@ use crate::interfaces::list_interfaces;
 /// fan out to many concurrent `resolvectl query` subprocesses. 8 is ample for
 /// interactive use while keeping a flood bounded.
 static CHECK_RESOLVE_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+
+/// Caps how many `Verify` read-backs run concurrently, for the same reason as
+/// [`CHECK_RESOLVE_LIMIT`]: the detached read-back path (like the route-check) is
+/// not serialized by the actor, so a burst of `verify` requests could otherwise
+/// fan out to many concurrent `resolvectl status` subprocesses. Kept separate
+/// from the check limit so a flood of one verb never starves the other. 8 is
+/// ample for interactive use while keeping a flood bounded.
+static VERIFY_READ_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
 /// Builds the platform VPN detector for a config. Injected into the
 /// [`StateMachine`] (like [`DnsBackend`]) so the re-arm lifecycle can be driven
@@ -130,6 +138,19 @@ struct Applied {
     interface: String,
     domains: Vec<String>,
     dns_servers: Vec<String>,
+}
+
+/// Project the internal applied snapshot to its wire form. Defined once and used
+/// by both `status()` (belief) and `spawn_verify()` (the read-back's belief
+/// baseline) so the two can never silently diverge if a field is added.
+impl From<&Applied> for AppliedInfo {
+    fn from(applied: &Applied) -> Self {
+        AppliedInfo {
+            interface: applied.interface.clone(),
+            domains: applied.domains.clone(),
+            dns_servers: applied.dns_servers.clone(),
+        }
+    }
 }
 
 pub struct StateMachine {
@@ -603,11 +624,15 @@ impl StateMachine {
                     Err(e) => Response::Error(format!("interface enumeration task panicked: {e}")),
                 }
             }
-            // `CheckDomain` is handled out-of-band in `run_state` (resolved on a
-            // detached task via `spawn_check_domain`, so a slow resolver cannot
-            // stall the actor); it never reaches this inline dispatch.
+            // `CheckDomain` and `Verify` are handled out-of-band in `run_state`
+            // (resolved on a detached task via `spawn_check_domain` /
+            // `spawn_verify`, so a slow `resolvectl` cannot stall the actor); they
+            // never reach this inline dispatch.
             Request::CheckDomain(_) => {
                 Response::Error("internal error: CheckDomain is handled out-of-band".to_string())
+            }
+            Request::Verify => {
+                Response::Error("internal error: Verify is handled out-of-band".to_string())
             }
         }
     }
@@ -657,11 +682,7 @@ impl StateMachine {
             // Map the private `Applied` snapshot to the wire projection: `None`
             // recovers the old "applied?" bool, and `Some` exposes the live
             // domain → DNS mapping for client-side verification.
-            applied: self.applied.as_ref().map(|a| AppliedInfo {
-                interface: a.interface.clone(),
-                domains: a.domains.clone(),
-                dns_servers: a.dns_servers.clone(),
-            }),
+            applied: self.applied.as_ref().map(AppliedInfo::from),
             routing_state: self.routing_state(),
             detector_health: self.detector_health.clone(),
             domains: self.config.vpn_hosts.clone(),
@@ -878,6 +899,63 @@ impl StateMachine {
                 vpn_up,
                 routing_state,
             }));
+        });
+    }
+
+    /// Handle a [`Request::Verify`]: read the **live** per-link DNS state back
+    /// from the system and compare it to what the daemon believes it installed
+    /// (`applied`), reporting any drift. This is the explicit `reality` check;
+    /// `status` stays cheap `belief` and is deliberately never given a read-back
+    /// (the architecture invariant — see `docs/architecture.md`).
+    ///
+    /// Like [`Self::spawn_check_domain`], it resolves **off the actor on a
+    /// detached task**: it snapshots the cheap state (the interface to read and
+    /// the believed `applied` mapping) synchronously, then reads on the blocking
+    /// pool and replies from a spawned task — so a slow or hung `resolvectl
+    /// status` never stalls the actor (and thus VPN reconciliation or other
+    /// control requests). It reads the **applied** interface when something is
+    /// applied, else the configured one (so a client still sees the link's
+    /// current state when nothing is applied). A read-back failure (unsupported
+    /// platform, a vanished link, a transient command error) degrades to an empty
+    /// live state and the drift verdict computed against it — never an `Error`,
+    /// matching `CheckDomain`'s degrade-to-`None` ethos. `&self`: it only reads.
+    fn spawn_verify(&self, reply: oneshot::Sender<Response>) {
+        let backend = self.backend.clone();
+        // The believed mapping, projected to the wire type for the pure compare.
+        let applied = self.applied.as_ref().map(AppliedInfo::from);
+        // Read the applied interface if any, else the configured one — so the
+        // link's current state still shows when nothing is applied.
+        let interface = match &self.applied {
+            Some(a) => a.interface.clone(),
+            None => self.config.vpn_name.clone(),
+        };
+
+        // Detached: read (blocking I/O on the blocking pool) and reply here, so
+        // the actor returns immediately. A read failure degrades to an empty live
+        // state, never an `Error`. A small static semaphore bounds how many
+        // read-backs run concurrently (see [`VERIFY_READ_LIMIT`]).
+        tokio::spawn(async move {
+            let _permit = VERIFY_READ_LIMIT.acquire().await.ok();
+            // With no interface to read (nothing applied and none configured),
+            // there is nothing to read back — report an empty live state.
+            let live = if interface.is_empty() {
+                LinkDnsState::default()
+            } else {
+                let iface = interface.clone();
+                match tokio::task::spawn_blocking(move || backend.read_link_state(&iface)).await {
+                    Ok(Ok(state)) => state,
+                    Ok(Err(e)) => {
+                        log::debug!("DNS read-back unavailable for {interface}: {e}");
+                        LinkDnsState::default()
+                    }
+                    Err(e) => {
+                        log::warn!("read-back task panicked for {interface}: {e}");
+                        LinkDnsState::default()
+                    }
+                }
+            };
+            let drift = compare_drift(&live, applied.as_ref());
+            let _ = reply.send(Response::Verify(VerifyInfo { live, drift }));
         });
     }
 
@@ -1160,10 +1238,12 @@ pub async fn run_state(
                         machine.on_watch_ended(generation)
                     }
                     Some(StateCommand::Ipc { request, reply }) => match request {
-                        // Route checks resolve off the actor (see
-                        // `spawn_check_domain`), so a slow/hung resolver cannot
-                        // delay VPN reconciliation or other control requests.
+                        // Route checks and read-backs resolve off the actor (see
+                        // `spawn_check_domain` / `spawn_verify`), so a slow/hung
+                        // `resolvectl` cannot delay VPN reconciliation or other
+                        // control requests.
                         Request::CheckDomain(raw) => machine.spawn_check_domain(raw, reply),
+                        Request::Verify => machine.spawn_verify(reply),
                         // Everything else replies inline.
                         other => {
                             let response = machine.on_request(other).await;
@@ -1182,7 +1262,7 @@ pub async fn run_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use splitway_shared::ipc::ResolutionInfo;
+    use splitway_shared::ipc::{DriftVerdict, ResolutionInfo};
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
@@ -1202,6 +1282,16 @@ mod tests {
         resolve_addresses: Mutex<Option<Vec<String>>>,
         resolve_interface: Mutex<Option<String>>,
         fail_resolve: AtomicBool,
+        /// Scripted read-back: `Some(state)` → `read_link_state` returns it for
+        /// any interface; `None` → the trait's default unsupported error.
+        link_state: Mutex<Option<LinkDnsState>>,
+        /// Records the interface `read_link_state` was last asked to read, so a
+        /// test can assert the applied (vs configured) interface was chosen.
+        read_link_interface: Mutex<Option<String>>,
+        fail_read_link: AtomicBool,
+        /// Makes `read_link_state` panic, to exercise the detached read-back's
+        /// `spawn_blocking` JoinError (task-panic) degrade-to-empty arm.
+        panic_read_link: AtomicBool,
     }
 
     impl MockBackend {
@@ -1224,6 +1314,22 @@ mod tests {
 
         fn set_fail_resolve(&self, fail: bool) {
             self.fail_resolve.store(fail, Ordering::Relaxed);
+        }
+
+        fn set_link_state(&self, state: LinkDnsState) {
+            *self.link_state.lock().unwrap() = Some(state);
+        }
+
+        fn set_fail_read_link(&self, fail: bool) {
+            self.fail_read_link.store(fail, Ordering::Relaxed);
+        }
+
+        fn set_panic_read_link(&self, panic: bool) {
+            self.panic_read_link.store(panic, Ordering::Relaxed);
+        }
+
+        fn last_read_link_interface(&self) -> Option<String> {
+            self.read_link_interface.lock().unwrap().clone()
         }
     }
 
@@ -1251,8 +1357,22 @@ mod tests {
             Ok(())
         }
 
-        fn status(&self, _interface: &str) -> Result<(), PlatformError> {
-            Ok(())
+        fn read_link_state(&self, interface: &str) -> Result<LinkDnsState, PlatformError> {
+            *self.read_link_interface.lock().unwrap() = Some(interface.to_string());
+            if self.panic_read_link.load(Ordering::Relaxed) {
+                panic!("mock read_link_state panic");
+            }
+            if self.fail_read_link.load(Ordering::Relaxed) {
+                return Err(PlatformError::CommandFailed(
+                    "mock read_link_state failure".to_string(),
+                ));
+            }
+            match &*self.link_state.lock().unwrap() {
+                Some(state) => Ok(state.clone()),
+                None => Err(PlatformError::Unsupported(
+                    "mock: no link state scripted".to_string(),
+                )),
+            }
         }
 
         fn reverts_globally(&self) -> bool {
@@ -3118,5 +3238,144 @@ mod tests {
         let info = domain_check(check_via(&sm, "vault.sub.example.com").await);
         assert!(info.covered);
         assert_eq!(info.matched_domain.as_deref(), Some("sub.example.com"));
+    }
+
+    // ---- Phase 5d: Verify read-back + drift ----
+
+    fn verify_info(resp: Response) -> VerifyInfo {
+        match resp {
+            Response::Verify(info) => info,
+            other => panic!("expected Verify, got {other:?}"),
+        }
+    }
+
+    /// Drive the detached `Verify` path the way `run_state` does — spawn it with a
+    /// reply channel and await the reply — so the tests exercise the real
+    /// off-actor handler rather than the inline `on_request` dispatch.
+    async fn verify_via(sm: &StateMachine) -> Response {
+        let (tx, rx) = oneshot::channel();
+        sm.spawn_verify(tx);
+        rx.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn verify_in_sync_reads_the_applied_interface() {
+        let backend = Arc::new(MockBackend::default());
+        // The live read-back matches what the daemon applies (wg0 + 10.0.0.1).
+        backend.set_link_state(LinkDnsState {
+            servers: vec!["10.0.0.1".to_string()],
+            routing_domains: vec!["example.com".to_string()],
+        });
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["example.com"]),
+            "verify-insync",
+        );
+        sm.on_event(vpn_up("wg0")).await;
+        assert!(sm.applied.is_some());
+
+        let info = verify_info(verify_via(&sm).await);
+        assert_eq!(info.drift, DriftVerdict::InSync);
+        assert_eq!(info.live.servers, vec!["10.0.0.1"]);
+        assert_eq!(info.live.routing_domains, vec!["example.com"]);
+        // The read targets the applied interface.
+        assert_eq!(backend.last_read_link_interface().as_deref(), Some("wg0"));
+    }
+
+    #[tokio::test]
+    async fn verify_reports_drift_when_live_diverges() {
+        let backend = Arc::new(MockBackend::default());
+        // The live link is missing the believed server and routes nothing.
+        backend.set_link_state(LinkDnsState {
+            servers: vec!["198.51.100.9".to_string()],
+            routing_domains: vec![],
+        });
+        let mut sm = machine(backend, config(true, &["example.com"]), "verify-drift");
+        sm.on_event(vpn_up("wg0")).await;
+
+        let info = verify_info(verify_via(&sm).await);
+        match info.drift {
+            DriftVerdict::Drifted {
+                missing_servers,
+                unrouted_domains,
+            } => {
+                assert_eq!(missing_servers, vec!["10.0.0.1"]);
+                assert_eq!(unrouted_domains, vec!["example.com"]);
+            }
+            other => panic!("expected Drifted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_not_applicable_when_nothing_applied() {
+        let backend = Arc::new(MockBackend::default());
+        // Even with a live state present, nothing is applied → NotApplicable; the
+        // configured interface is still read so the client sees its current state.
+        backend.set_link_state(LinkDnsState {
+            servers: vec!["10.0.0.1".to_string()],
+            routing_domains: vec!["example.com".to_string()],
+        });
+        let sm = machine(backend.clone(), config(true, &["example.com"]), "verify-na");
+        assert!(sm.applied.is_none());
+
+        let info = verify_info(verify_via(&sm).await);
+        assert_eq!(info.drift, DriftVerdict::NotApplicable);
+        // The configured interface (wg0) is read so its live state still shows.
+        assert_eq!(backend.last_read_link_interface().as_deref(), Some("wg0"));
+        assert_eq!(info.live.servers, vec!["10.0.0.1"]);
+    }
+
+    #[tokio::test]
+    async fn verify_read_failure_degrades_to_empty_live_not_error() {
+        let backend = Arc::new(MockBackend::default());
+        backend.set_fail_read_link(true);
+        let mut sm = machine(backend, config(true, &["example.com"]), "verify-readfail");
+        sm.on_event(vpn_up("wg0")).await;
+        assert!(sm.applied.is_some());
+
+        let info = verify_info(verify_via(&sm).await);
+        // The live state is empty (read-back unavailable); it is never an Error.
+        assert!(info.live.servers.is_empty());
+        assert!(info.live.routing_domains.is_empty());
+        assert!(matches!(info.drift, DriftVerdict::Drifted { .. }));
+    }
+
+    #[tokio::test]
+    async fn verify_read_panic_degrades_to_empty_live_not_error() {
+        // A panic inside the blocking read-back (a `spawn_blocking` JoinError) must
+        // also degrade to an empty live state — never an Error — upholding the
+        // "never an Error for a read-back failure" invariant on the panic arm too.
+        let backend = Arc::new(MockBackend::default());
+        backend.set_panic_read_link(true);
+        let mut sm = machine(backend, config(true, &["example.com"]), "verify-panic");
+        sm.on_event(vpn_up("wg0")).await;
+        assert!(sm.applied.is_some());
+
+        let resp = verify_via(&sm).await;
+        let info = verify_info(resp); // panics here if it were a Response::Error
+        assert!(info.live.servers.is_empty());
+        assert!(info.live.routing_domains.is_empty());
+        assert!(matches!(info.drift, DriftVerdict::Drifted { .. }));
+    }
+
+    #[tokio::test]
+    async fn verify_with_no_interface_skips_the_read() {
+        let backend = Arc::new(MockBackend::default());
+        backend.set_link_state(LinkDnsState::default());
+        // No configured interface and nothing applied → nothing to read back.
+        let cfg = LocalConfig {
+            vpn_name: String::new(),
+            vpn_hosts: vec![],
+            enabled: true,
+            vpn_backend: config::VpnBackend::default(),
+            openvpn: config::OpenVpnConfig::default(),
+        };
+        let sm = machine(backend.clone(), cfg, "verify-no-iface");
+
+        let info = verify_info(verify_via(&sm).await);
+        assert_eq!(info.drift, DriftVerdict::NotApplicable);
+        assert!(info.live.servers.is_empty());
+        // The empty-interface guard means the backend was never asked to read.
+        assert_eq!(backend.last_read_link_interface(), None);
     }
 }

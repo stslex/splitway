@@ -11,7 +11,7 @@ impl DnsBackend for WindowsBackend {
         todo!("windows revert_rules not implemented")
     }
 
-    fn status(&self, _interface: &str) -> Result<(), PlatformError> {
-        todo!("windows status not implemented")
-    }
+    // `read_link_state` is intentionally not implemented: Windows is unsupported,
+    // so it inherits the trait's default clean `PlatformError::Unsupported`, which
+    // the daemon degrades to "read-back unavailable".
 }

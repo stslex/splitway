@@ -1,10 +1,11 @@
 use std::path::Path;
 use std::process::Command;
 
-use splitway_shared::ipc::ResolutionInfo;
+use splitway_shared::ipc::{LinkDnsState, ResolutionInfo};
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnInfo};
 
 use crate::backend::linux::query::parse_resolvectl_query;
+use crate::backend::linux::status::parse_resolvectl_status;
 use crate::backend::linux::LinuxBackend;
 
 impl DnsBackend for LinuxBackend {
@@ -138,19 +139,34 @@ impl DnsBackend for LinuxBackend {
         Ok(())
     }
 
-    fn status(&self, interface: &str) -> Result<(), PlatformError> {
-        let status = Command::new("resolvectl")
+    /// Read the live per-link DNS state from `resolvectl status <iface>` and
+    /// parse it (I/O-free) via [`parse_resolvectl_status`]. A non-zero exit or a
+    /// vanished link is a clean [`PlatformError`] the daemon degrades to
+    /// "read-back unavailable" — never a hard failure. This reports the link's
+    /// resolver state, not reachability (see the trait doc / `docs/architecture.md`).
+    fn read_link_state(&self, interface: &str) -> Result<LinkDnsState, PlatformError> {
+        let output = Command::new("resolvectl")
             .arg("status")
             .arg(interface)
-            .status()?;
+            .output()?;
 
-        if !status.success() {
+        log::debug!(
+            "resolvectl status stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        if !output.status.success() {
+            // A non-zero exit is usually a vanished link (the VPN-down race) or a
+            // bad interface name; surface it as a clean error the daemon turns
+            // into "read-back unavailable".
             return Err(PlatformError::CommandFailed(
-                "resolvectl status failed".to_string(),
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
             ));
         }
 
-        Ok(())
+        Ok(parse_resolvectl_status(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
     }
 
     /// Strong attribution via systemd-resolved: `resolvectl query` routes the
