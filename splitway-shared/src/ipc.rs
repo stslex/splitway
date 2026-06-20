@@ -365,15 +365,45 @@ fn is_route_all(domain: &str) -> bool {
     domain.trim() == "."
 }
 
-/// Whether two DNS server strings denote the same resolver. Prefers canonical IP
-/// equality (handling case and IPv6 zero-compression differences), and falls back
-/// to a case-folded, trailing-dot-insensitive string match for any token that does
-/// not parse as an IP — so a non-address token still compares sanely rather than
-/// being treated as always-different.
-fn server_matches(a: &str, b: &str) -> bool {
+/// Extract the bare IP from a resolver token, dropping the optional decorations
+/// systemd prints around a server: `ADDRESS[:PORT][%ifname]#SNI` (per `man
+/// resolvectl`), with an IPv6 address bracketed when a port follows
+/// (`[2001:db8::1]:53`). Returns `None` for a non-address token.
+///
+/// Shared by the `resolvectl status` parser (`linux/status.rs`) and the drift
+/// comparison so both normalize a server **the same way**: otherwise a decoration
+/// kept on one side — e.g. the detector's scoped `fe80::1%wg0` believed server vs
+/// the bare `fe80::1` the live parser strips to — would read as false drift.
+pub fn server_address(token: &str) -> Option<std::net::IpAddr> {
     use std::net::IpAddr;
-    match (a.trim().parse::<IpAddr>(), b.trim().parse::<IpAddr>()) {
-        (Ok(a), Ok(b)) => a == b,
+    let token = token.trim();
+    // Drop the `#SNI` (DNS-over-TLS server name) and a `%ifname` scope first.
+    let token = token.split('#').next().unwrap_or(token);
+    let token = token.split('%').next().unwrap_or(token);
+    // A bracketed IPv6 literal, optionally with a trailing `:PORT`.
+    let candidate = if let Some(rest) = token.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else if token.parse::<IpAddr>().is_ok() {
+        // A bare address — including an unbracketed IPv6, which has >= 2 colons
+        // and so must be accepted before the `:PORT` strip below.
+        token
+    } else {
+        // A bare `v4:port` has a single colon; strip the port. (A bare IPv6 was
+        // already accepted above, so a remaining colon here is a port separator.)
+        token.rsplit_once(':').map_or(token, |(host, _port)| host)
+    };
+    candidate.parse::<IpAddr>().ok()
+}
+
+/// Whether two DNS server strings denote the same resolver. Both are reduced to
+/// their bare IP via [`server_address`] (so a `:port` / `%ifname` / `#SNI`
+/// decoration on either side, and IPv6 case / zero-compression, never matter),
+/// then compared as canonical addresses. A token that is not an address at all
+/// falls back to a case-folded, trailing-dot-insensitive string match so it still
+/// compares sanely rather than being treated as always-different.
+fn server_matches(a: &str, b: &str) -> bool {
+    match (server_address(a), server_address(b)) {
+        (Some(a), Some(b)) => a == b,
         _ => domain::same_host(a, b),
     }
 }
@@ -833,6 +863,34 @@ mod tests {
         // and a trailing dot also must not count as drift (normalized compare).
         let applied = believed(&["2001:DB8::1"], &["Example.COM"]);
         let live = live(&["2001:db8::1"], &["example.com."]);
+        assert_eq!(compare_drift(&live, Some(&applied)), DriftVerdict::InSync);
+    }
+
+    #[test]
+    fn server_matches_ignores_scope_port_and_sni_decorations() {
+        // The live parser strips `%ifname` / `:port` / `#SNI`; the believed side
+        // (from the detector) may still carry them. Both reduce to the same bare
+        // IP, so they are the same resolver — not drift.
+        assert!(server_matches("fe80::1", "fe80::1%wg0"));
+        assert!(server_matches("10.0.0.1", "10.0.0.1:53"));
+        assert!(server_matches(
+            "2001:db8::1",
+            "[2001:db8::1]:853#dns.example.com"
+        ));
+        // Genuinely different resolvers still differ.
+        assert!(!server_matches("10.0.0.1", "10.0.0.2"));
+        // A non-address token falls back to a folded string compare.
+        assert!(!server_matches("10.0.0.1", "not-an-ip"));
+        assert!(server_matches("not-an-ip", "not-an-ip"));
+    }
+
+    #[test]
+    fn drift_scoped_believed_server_matches_bare_live_server() {
+        // A believed scoped IPv6 resolver (the detector kept the `%ifname`) vs the
+        // live token the parser stripped to bare — the same resolver, so in sync,
+        // not a false `Drifted` with the server listed as missing.
+        let applied = believed(&["fe80::1%wg0"], &["example.com"]);
+        let live = live(&["fe80::1"], &["example.com"]);
         assert_eq!(compare_drift(&live, Some(&applied)), DriftVerdict::InSync);
     }
 

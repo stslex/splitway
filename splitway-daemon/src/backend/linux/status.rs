@@ -27,9 +27,7 @@
 //! (routing-only marker) stripped to the plain domain. Never fails — an empty
 //! result means nothing parsed, which the caller treats as "read-back empty".
 
-use std::net::IpAddr;
-
-use splitway_shared::ipc::LinkDnsState;
+use splitway_shared::ipc::{server_address, LinkDnsState};
 
 /// The multi-valued field a continuation line would extend, tracked so a wrapped
 /// `DNS Servers` / `DNS Domain` list is gathered across lines.
@@ -90,46 +88,21 @@ pub(crate) fn parse_resolvectl_status(output: &str) -> LinkDnsState {
 }
 
 /// Push the bare IP of each whitespace token of `values` onto `servers`,
-/// de-duplicated. The IP check is the defensive gate (like `query.rs`): a
-/// non-address token — a label fragment, a header — is dropped rather than
-/// recorded as a bogus server.
+/// de-duplicated. [`server_address`] is the defensive gate (like `query.rs`): a
+/// non-address token — a label fragment, a header — yields `None` and is dropped
+/// rather than recorded as a bogus server, and systemd's `:port` / `%ifname` /
+/// `#SNI` decorations are stripped to the bare IP so the live read-back compares
+/// equal to the daemon's believed plain IP (the *same* normalization the drift
+/// comparison applies — see [`server_address`]).
 fn push_servers(values: &str, servers: &mut Vec<String>) {
     for token in values.split_whitespace() {
-        if let Some(ip) = parse_server_ip(token) {
+        if let Some(ip) = server_address(token) {
+            let ip = ip.to_string();
             if !servers.iter().any(|s| s == &ip) {
                 servers.push(ip);
             }
         }
     }
-}
-
-/// Extract the bare IP from a `resolvectl` server token, dropping the optional
-/// decorations systemd prints around it: `ADDRESS[:PORT][%ifname]#SNI` (per `man
-/// resolvectl`), with an IPv6 address bracketed when a port follows
-/// (`[2001:db8::1]:53`). Returns the address (decorations removed) only if it is
-/// a valid IP, so a non-address token is still rejected. Without this, a
-/// DoT-with-SNI or port-decorated resolver would be dropped from the read-back
-/// and then mis-reported as drift against the believed plain IP.
-fn parse_server_ip(token: &str) -> Option<String> {
-    // Drop the `#SNI` (DNS-over-TLS server name) and a `%ifname` scope first.
-    let token = token.split('#').next().unwrap_or(token);
-    let token = token.split('%').next().unwrap_or(token);
-    // A bracketed IPv6 literal, optionally with a trailing `:PORT`.
-    let candidate = if let Some(rest) = token.strip_prefix('[') {
-        rest.split(']').next().unwrap_or(rest)
-    } else if token.parse::<IpAddr>().is_ok() {
-        // A bare address — including an unbracketed IPv6, which has >= 2 colons
-        // and so must be accepted before the `:PORT` strip below.
-        token
-    } else {
-        // A bare `v4:port` has a single colon; strip the port. (A bare IPv6 was
-        // already accepted above, so a remaining colon here is a port separator.)
-        token.rsplit_once(':').map_or(token, |(host, _port)| host)
-    };
-    candidate
-        .parse::<IpAddr>()
-        .ok()
-        .map(|_| candidate.to_string())
 }
 
 /// Push each whitespace token of `values` onto `routing_domains`, stripping a
