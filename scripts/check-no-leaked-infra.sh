@@ -18,6 +18,10 @@
 #   2. Pasted resolver-dump signatures (a `resolvectl status` / `scutil --dns`
 #      block carries these field labels verbatim, which never belong in tracked
 #      files — fixtures use the per-field forms `IP4.DNS[n]:` / `nameserver[n]:`).
+#      Exception: the `resolvectl status` parser legitimately matches these labels
+#      in code and tests its parsing with synthetic-value fixtures in that format
+#      (see DUMP_EXCLUDES); its IP *values* stay guarded by check 3 below, which
+#      now also covers the `Current DNS Server:` / `DNS Servers:` lines.
 #
 # Exit non-zero on any match. To allowlist a deliberate occurrence, extend the
 # `:!path` exclusions below.
@@ -34,6 +38,17 @@ EXCLUDES=(
   ':!.github/workflows/ci.yml'
 )
 
+# The `resolvectl status` parser (and its synthetic fixtures) must reference the
+# `Current DNS Server:` / `DNS Servers:` / `DNS Domain:` field labels verbatim —
+# matching them is its whole job — so it is exempt from the dump-signature check
+# (2) only. It stays subject to the internal-domain check (1) and, crucially, to
+# the placeholder-IP check (3), which now scans its server lines too, so a real
+# resolver IP pasted into a fixture is still caught.
+DUMP_EXCLUDES=(
+  "${EXCLUDES[@]}"
+  ':!splitway-daemon/src/backend/linux/status.rs'
+)
+
 status=0
 
 # 1. Internal / custom-TLD domains.
@@ -43,8 +58,10 @@ if git grep -nIE '\b[a-z0-9-]+\.(corp|lan|intranet|internal|home)\b' -- "${EXCLU
   status=1
 fi
 
-# 2. Pasted resolver-dump signatures.
-if git grep -nIE '(Current DNS Server|DNS Servers|DNS Domain)[[:space:]]*:|^[[:space:]]*Link[[:space:]]+[0-9]+[[:space:]]*\(' -- "${EXCLUDES[@]}"; then
+# 2. Pasted resolver-dump signatures. The `resolvectl status` parser is exempt
+#    (DUMP_EXCLUDES) — it must match these labels — but its IP values stay guarded
+#    by check 3, which now scans the `DNS Servers:` / `Current DNS Server:` lines.
+if git grep -nIE '(Current DNS Server|DNS Servers|DNS Domain)[[:space:]]*:|^[[:space:]]*Link[[:space:]]+[0-9]+[[:space:]]*\(' -- "${DUMP_EXCLUDES[@]}"; then
   echo "ERROR: a pasted resolvectl/scutil status dump was found in a tracked file." >&2
   echo "       Redact it to placeholder values before committing (see CLAUDE.md)." >&2
   status=1
@@ -63,7 +80,11 @@ fi
 #    field line, and cannot flag a real IP that happens to fall inside a stand-in
 #    range (10.0.0./10.8.0./10.9.0./192.168.1.). The CLAUDE.md redaction policy
 #    plus human review remain the primary defense.
-DNS_FIELD='(IP4\.DNS\[|IP6\.DNS\[|IP4\.ADDRESS\[|IP4\.GATEWAY|IP4\.ROUTE\[|nameserver|dhcp-option DNS)'
+#    The `resolvectl status` server labels (`Current DNS Server:` / `DNS Servers:`)
+#    are included so the read-back parser's fixtures — exempt from check 2 — still
+#    have their IP values enforced here. (`DNS Domain:` carries names, not IPs, so
+#    it is not listed.)
+DNS_FIELD='(IP4\.DNS\[|IP6\.DNS\[|IP4\.ADDRESS\[|IP4\.GATEWAY|IP4\.ROUTE\[|nameserver|dhcp-option DNS|Current DNS Server:|DNS Servers:)'
 ALLOW_IP='(192\.0\.2\.|198\.51\.100\.|203\.0\.113\.|10\.0\.0\.|10\.8\.0\.|10\.9\.0\.|192\.168\.1\.|1\.2\.3\.4|1\.1\.1\.1|1\.0\.0\.1|2\.2\.2\.2|3\.3\.3\.3|8\.8\.8\.8|8\.8\.4\.4|9\.9\.9\.9|0\.0\.0\.0|127\.0\.0\.1|255\.255\.)'
 dns_field_hits=$(git grep -nIE "$DNS_FIELD" -- "${EXCLUDES[@]}" \
   | grep -E '([0-9]{1,3}\.){3}[0-9]{1,3}' | grep -vE "$ALLOW_IP" || true)
