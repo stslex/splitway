@@ -770,13 +770,9 @@ impl StateMachine {
             Ok(config) => config,
             Err(e) => return config_unreadable_reply(e),
         };
-        // Case-insensitive dedup so `Example.com` does not duplicate `example.com`
-        // (existing entries may be un-normalized; the new one is normalized).
-        if next
-            .vpn_hosts
-            .iter()
-            .any(|d| d.eq_ignore_ascii_case(&domain))
-        {
+        // Host-equivalent dedup so `Example.com` / `example.com.` do not duplicate
+        // `example.com` (existing entries may be un-normalized; the new one is).
+        if next.vpn_hosts.iter().any(|d| domain::same_host(d, &domain)) {
             // Already present on disk: nothing to add. Still adopt the
             // freshly-loaded config (it may carry a concurrent external edit) and
             // reconcile, so the daemon converges to the source-of-truth file even
@@ -845,11 +841,20 @@ impl StateMachine {
     }
 
     async fn remove_domain(&mut self, domain: String) -> Response {
+        // Normalize the input the same way `add_domain` does, and compare
+        // host-equivalently, so `remove Example.com` (or a pasted URL / trailing
+        // dot) removes the stored `example.com` rather than no-op'ing while it
+        // stays configured. Existing entries may be un-normalized; `same_host`
+        // folds both sides.
+        let host = match normalize_host(&domain) {
+            Ok(host) => host,
+            Err(e) => return Response::Error(format!("invalid domain: {e}")),
+        };
         let mut next = match self.load_fresh() {
             Ok(config) => config,
             Err(e) => return config_unreadable_reply(e),
         };
-        if !next.vpn_hosts.iter().any(|d| d == &domain) {
+        if !next.vpn_hosts.iter().any(|d| domain::same_host(d, &host)) {
             // Absent on disk: nothing to remove. Adopt the freshly-loaded config
             // and reconcile anyway (mirroring the no-change `set_enabled` path):
             // an external edit may already have removed the domain, and its rules
@@ -860,7 +865,7 @@ impl StateMachine {
                 Err(e) => Response::Error(format!("failed to apply current state: {e}")),
             };
         }
-        next.vpn_hosts.retain(|d| d != &domain);
+        next.vpn_hosts.retain(|d| !domain::same_host(d, &host));
         self.commit(next).await
     }
 
@@ -2964,5 +2969,27 @@ mod tests {
         // Coverage is still reported; a resolution failure is never an Error.
         assert!(info.covered);
         assert!(info.resolution.is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_normalizes_input_to_match_a_stored_domain() {
+        // add stores the normalized `example.com`; remove must match it even when
+        // the user types a different case / a pasted URL / a trailing dot — not
+        // no-op while leaving it configured.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend, config(true, &["example.com"]), "remove-normalize");
+        sm.on_event(vpn_up("wg0")).await;
+        assert!(sm.applied.is_some());
+
+        let resp = sm
+            .on_request(Request::RemoveDomain("https://Example.com./".to_string()))
+            .await;
+
+        assert_eq!(resp, Response::Ok);
+        assert!(
+            sm.config.vpn_hosts.is_empty(),
+            "the stored domain must be removed, not left configured"
+        );
+        assert!(sm.config_store.load().unwrap().vpn_hosts.is_empty());
     }
 }

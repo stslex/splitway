@@ -99,6 +99,13 @@ fn validate_host(host: &str) -> Result<(), DomainError> {
     Ok(())
 }
 
+/// Whether two hosts are the same name, ignoring case and a trailing dot — the
+/// equivalence used for add/remove dedup so `Example.com`, `example.com.`, and
+/// `example.com` are one domain. Pure, no I/O.
+pub fn same_host(a: &str, b: &str) -> bool {
+    fold(a) == fold(b)
+}
+
 /// Whether the configured routing `domain` covers `host` (suffix-aware):
 /// systemd-resolved routes a domain *and all its subdomains*, so
 /// `sub.example.com` is covered by a configured `example.com`. Both sides are
@@ -211,5 +218,15 @@ mod tests {
         assert!(!domain_covers("example.com", "example.com.evil.test"));
         // Empty domain never covers.
         assert!(!domain_covers("", "example.com"));
+    }
+
+    #[test]
+    fn same_host_ignores_case_and_trailing_dot() {
+        assert!(same_host("Example.com", "example.com"));
+        assert!(same_host("example.com.", "example.com"));
+        assert!(same_host("EXAMPLE.COM.", "example.com"));
+        // Different hosts (subdomain, sibling) are not the same.
+        assert!(!same_host("a.example.com", "example.com"));
+        assert!(!same_host("example.org", "example.com"));
     }
 }
