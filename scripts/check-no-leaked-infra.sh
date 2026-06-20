@@ -31,7 +31,6 @@ cd "$(git rev-parse --show-toplevel)"
 EXCLUDES=(
   ':!scripts/check-no-leaked-infra.sh'
   ':!CLAUDE.md'
-  ':!docs/prompts/security-scrub.md'
   ':!.github/workflows/ci.yml'
 )
 
