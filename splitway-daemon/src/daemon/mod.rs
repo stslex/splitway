@@ -201,13 +201,26 @@ async fn wait_for_shutdown_signal(sigint: &mut Signal, sigterm: &mut Signal) {
 /// If the blocking task owned the watcher instead, its `recv` would block a
 /// runtime thread forever with no further event, and dropping the tokio runtime
 /// would hang waiting for that thread until systemd's stop timeout (a SIGKILL).
+/// The directory to watch for a given config path, or `None` when it cannot be
+/// determined. A bare relative path like `config.json` has an *empty* parent, but
+/// load/save still operate on it in the current directory — so watch `.` there
+/// rather than disabling the live watch; only a truly parent-less path (e.g. a
+/// bare root) returns `None`.
+fn watch_dir(config_path: &Path) -> Option<PathBuf> {
+    match config_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => Some(dir.to_path_buf()),
+        Some(_) => Some(PathBuf::from(".")),
+        None => None,
+    }
+}
+
 fn spawn_config_watcher(
     config_path: PathBuf,
     state_tx: mpsc::Sender<StateCommand>,
 ) -> Option<notify::RecommendedWatcher> {
-    let dir = match config_path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
-        _ => {
+    let dir = match watch_dir(&config_path) {
+        Some(dir) => dir,
+        None => {
             log::warn!(
                 "config path {} has no parent directory; live config watch disabled",
                 config_path.display()
@@ -294,5 +307,33 @@ fn load_or_init_config(path: &Path) -> LocalConfig {
             log::error!("failed to read config: {e}");
             exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::watch_dir;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn watch_dir_resolves_parent_or_current_directory() {
+        // An absolute path watches its parent directory.
+        assert_eq!(
+            watch_dir(Path::new("/var/lib/splitway/config.json")),
+            Some(PathBuf::from("/var/lib/splitway"))
+        );
+        // A bare relative path watches the current directory (where load/save
+        // operate), rather than disabling the live watch.
+        assert_eq!(
+            watch_dir(Path::new("config.json")),
+            Some(PathBuf::from("."))
+        );
+        // A relative path with a directory component watches that directory.
+        assert_eq!(
+            watch_dir(Path::new("sub/config.json")),
+            Some(PathBuf::from("sub"))
+        );
+        // A parent-less path (a bare root) cannot be watched.
+        assert_eq!(watch_dir(Path::new("/")), None);
     }
 }
