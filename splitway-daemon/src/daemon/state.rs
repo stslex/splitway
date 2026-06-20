@@ -755,6 +755,16 @@ impl StateMachine {
             Err(e) => return Response::Error(format!("failed to read config: {e}")),
         };
         if next.vpn_hosts.iter().any(|d| d == &domain) {
+            // Already present on disk: nothing to add. Still adopt the
+            // freshly-loaded config (it may carry a concurrent external edit) and
+            // reconcile, so the daemon converges to the source-of-truth file even
+            // if the watcher has not (or cannot) deliver that edit — then report
+            // the no-op error. A failed reconcile is surfaced over the success.
+            if let Err(e) = self.adopt_config(next).await {
+                return Response::Error(format!(
+                    "domain already present: {domain} (and applying the current config failed: {e})"
+                ));
+            }
             return Response::Error(format!("domain already present: {domain}"));
         }
         next.vpn_hosts.push(domain);
@@ -767,8 +777,15 @@ impl StateMachine {
             Err(e) => return Response::Error(format!("failed to read config: {e}")),
         };
         if !next.vpn_hosts.iter().any(|d| d == &domain) {
-            // Removing an absent domain is a no-op success.
-            return Response::Ok;
+            // Absent on disk: nothing to remove. Adopt the freshly-loaded config
+            // and reconcile anyway (mirroring the no-change `set_enabled` path):
+            // an external edit may already have removed the domain, and its rules
+            // must be reverted now rather than waiting on the best-effort watcher
+            // — otherwise this would report success while DNS stays out of sync.
+            return match self.adopt_config(next).await {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error(format!("failed to apply current state: {e}")),
+            };
         }
         next.vpn_hosts.retain(|d| d != &domain);
         self.commit(next).await
@@ -2643,5 +2660,36 @@ mod tests {
         );
         assert_ne!(sm.routing_state(), RoutingState::ConfigInvalid);
         assert_eq!(sm.config.vpn_hosts, vec!["a.com", "c.com"]);
+    }
+
+    #[tokio::test]
+    async fn remove_of_an_externally_removed_domain_adopts_disk_and_reverts() {
+        // The watcher's event has not arrived (or it is unavailable): an external
+        // edit already removed the only domain on disk while the daemon still has
+        // it applied. Removing that now-absent domain must adopt the disk config
+        // and revert the stale rules — not report success while DNS stays out of
+        // sync (the no-op early-out must reconcile, not just return Ok).
+        let backend = Arc::new(MockBackend::default());
+        let fake = FakeConfigStore::new(config(true, &["a.com"]));
+        let store: Arc<dyn ConfigStore> = Arc::new(fake.clone());
+        let mut sm = machine_with_store(backend.clone(), store, config(true, &["a.com"]));
+
+        sm.on_event(vpn_up("wg0")).await;
+        assert!(sm.applied.is_some());
+
+        // External edit removes the domain on disk before the IPC remove runs.
+        fake.set_external(config(true, &[]));
+        let resp = sm.remove_domain("a.com".to_string()).await;
+
+        assert_eq!(resp, Response::Ok);
+        assert!(
+            sm.config.vpn_hosts.is_empty(),
+            "the disk removal must be adopted"
+        );
+        assert!(
+            sm.applied.is_none(),
+            "the removed domain's rules must be reverted, not left applied"
+        );
+        assert_eq!(sm.routing_state(), RoutingState::NoDomains);
     }
 }
