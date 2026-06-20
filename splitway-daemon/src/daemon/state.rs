@@ -867,21 +867,25 @@ impl StateMachine {
     }
 
     async fn remove_domain(&mut self, domain: String) -> Response {
-        // Normalize the input the same way `add_domain` does, and compare
-        // host-equivalently, so `remove Example.com` (or a pasted URL / trailing
-        // dot) removes the stored `example.com` rather than no-op'ing while it
-        // stays configured. Existing entries may be un-normalized; `same_host`
-        // folds both sides.
+        // An entry is a removal target if EITHER:
+        //   - it equals the raw input exactly, or
+        //   - the input normalizes and the entry is host-equivalent to it.
         //
-        // Fallback: if the input does NOT normalize, match it by exact string
-        // instead of erroring. A config that predates normalization (the old CLI
-        // persisted arbitrary `AddDomain` strings) may hold entries the current
-        // normalizer rejects — e.g. `192.0.2.1` or `example.com/path` — and the
-        // user must be able to remove exactly that bad entry without hand-editing.
+        // The host-equivalent arm handles the normal case (`remove Example.com` /
+        // a pasted URL / a trailing dot removes the stored `example.com`). The
+        // exact-string arm is always tried too — not only when normalization
+        // fails — because a config predating normalization (the old CLI persisted
+        // arbitrary `AddDomain` strings) may hold a verbatim entry that does not
+        // fold to the normalized input, e.g. a stored `example.com:443` or
+        // `https://example.com/path`, or an entry the current normalizer rejects
+        // outright like `192.0.2.1`. Either way the user can remove exactly that
+        // listed string without hand-editing the config.
         let normalized = normalize_host(&domain).ok();
-        let is_target = |d: &String| match &normalized {
-            Some(host) => domain::same_host(d, host),
-            None => d == &domain,
+        let is_target = |d: &String| {
+            d == &domain
+                || normalized
+                    .as_ref()
+                    .is_some_and(|host| domain::same_host(d, host))
         };
         let mut next = match self.load_fresh() {
             Ok(config) => config,
@@ -3042,6 +3046,31 @@ mod tests {
         assert!(
             sm.config.vpn_hosts.is_empty(),
             "a legacy un-normalizable entry must be removable by exact match"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_legacy_verbatim_entry_when_input_normalizes() {
+        // A pre-normalization config may hold a verbatim entry like
+        // `example.com:443` that the old CLI accepted. `remove example.com:443`
+        // normalizes to `example.com`, which would NOT match the stored string by
+        // host-equivalence — so the exact-string arm (tried even when the input
+        // normalizes) must still remove the verbatim entry.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(
+            backend,
+            config(true, &["example.com:443"]),
+            "remove-verbatim",
+        );
+
+        let resp = sm
+            .on_request(Request::RemoveDomain("example.com:443".to_string()))
+            .await;
+
+        assert_eq!(resp, Response::Ok);
+        assert!(
+            sm.config.vpn_hosts.is_empty(),
+            "the verbatim legacy entry must be removable by exact string"
         );
     }
 
