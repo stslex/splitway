@@ -17,8 +17,7 @@ use splitway_shared::ipc::socket_path;
 use splitway_shared::platform::DnsBackend;
 
 use crate::backend::create_dns_backend;
-use crate::detector::create_vpn_detector;
-use state::{run_state, StateCommand, StateMachine};
+use state::{run_state, DetectorFactory, PlatformDetectorFactory, StateCommand, StateMachine};
 
 /// Entry point for `splitway-daemon run`. `config_path` is the optional
 /// `--config <PATH>` override; `None` uses the default config location. The
@@ -41,13 +40,9 @@ pub fn run(config_path: Option<PathBuf>) {
 }
 
 async fn run_async(config: LocalConfig, config_path: PathBuf) {
+    // Captured for the startup log only; the watch lifecycle (including the
+    // empty-vpn_name case) is owned by the state machine's `arm_watch`.
     let interface = config.vpn_name.clone();
-    if interface.is_empty() {
-        log::warn!(
-            "vpn_name is empty in config; set it and restart the daemon to enable auto-apply \
-             (config reload re-reads domains/enabled but does not restart the interface watch)"
-        );
-    }
 
     let backend: Arc<dyn DnsBackend> = Arc::from(create_dns_backend());
 
@@ -75,48 +70,28 @@ async fn run_async(config: LocalConfig, config_path: PathBuf) {
     // startup, so an early shutdown still reverts gracefully.
     let (mut sigint, mut sigterm) = install_shutdown_signals();
 
-    // Start the VPN watch before `config` is moved into the state machine.
-    // Skipped when vpn_name is unset: the state machine only applies for an
-    // event whose interface matches the configured name (NM and macOS watches
-    // key on the interface; standalone OpenVPN detects via its management
-    // socket but its events are still gated on `vpn_name`), so with no name a
-    // watch can never drive an apply — it would only hold an idle D-Bus or
-    // management connection open. IPC still comes up below so the daemon stays
-    // controllable; set vpn_name and restart to enable auto-apply.
-    let vpn_events = if interface.is_empty() {
-        None
-    } else {
-        match create_vpn_detector(&config).watch(&interface) {
-            Ok(events) => Some(events),
-            Err(e) => {
-                log::error!(
-                    "failed to start VPN watch for {interface}: {e}; \
-                     IPC is still available, auto-apply is not"
-                );
-                None
-            }
-        }
-    };
-
     // Single state-owner task. Shutdown is delivered out-of-band via its own
-    // channel so the revert preempts any queued commands.
+    // channel so the revert preempts any queued commands. The command channel
+    // is built *before* the state machine so the machine can hold a clone of
+    // `state_tx`: it now owns the VPN-watch lifecycle (arming at startup,
+    // re-arming on a config change), and each (re-)armed forwarding task feeds
+    // `StateCommand::Vpn` back in through that clone.
     let (state_tx, state_rx) = mpsc::channel::<StateCommand>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<oneshot::Sender<bool>>();
-    let machine = StateMachine::new(backend, config, config_path);
+    let detector_factory: Arc<dyn DetectorFactory> = Arc::new(PlatformDetectorFactory);
+    let machine = StateMachine::new(
+        backend,
+        detector_factory,
+        config,
+        config_path,
+        state_tx.clone(),
+    );
+    // `run_state` arms the watch before entering its command loop. That happens
+    // here — after the socket bind and signal handlers above (so a fatal startup
+    // error can never strand applied rules) and before IPC is served below. An
+    // empty `vpn_name` or a detector that fails to start leaves auto-apply off
+    // while IPC stays up (see `arm_watch`).
     let state_handle = tokio::spawn(run_state(machine, state_rx, shutdown_rx));
-
-    // Forward VPN events into the state task.
-    if let Some(mut events) = vpn_events {
-        let tx = state_tx.clone();
-        tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
-                if tx.send(StateCommand::Vpn(event)).await.is_err() {
-                    break;
-                }
-            }
-            log::warn!("VPN event stream ended");
-        });
-    }
 
     // Serve IPC requests on the socket bound above (before the state pipeline
     // started, so a bind failure could never have stranded any rules).

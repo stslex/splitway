@@ -97,7 +97,15 @@ fn print_response(response: &splitway_shared::ipc::Response) {
             println!("enabled:   {}", info.enabled);
             println!("interface: {}", info.interface);
             println!("vpn_up:    {}", info.vpn_up);
-            println!("applied:   {}", info.applied);
+            println!("routing:   {}", info.routing_state);
+            println!(
+                "applied:   {}",
+                match &info.applied {
+                    Some(applied) => applied.to_string(),
+                    None => "(none)".to_string(),
+                }
+            );
+            println!("detector:  {}", info.detector_health);
             println!(
                 "domains:   {}",
                 if info.domains.is_empty() {
@@ -131,6 +139,20 @@ fn print_response(response: &splitway_shared::ipc::Response) {
                     .unwrap_or("(none)")
             );
             println!("config_path: {}", view.config_path);
+        }
+        // The CLI has no interface-listing subcommand, so it never sends
+        // `ListInterfaces`. Render defensively (like `Config`) rather than panic,
+        // so a future peer that replies with it stays readable.
+        Response::Interfaces(interfaces) => {
+            if interfaces.is_empty() {
+                println!("(no interfaces found)");
+            } else {
+                for iface in interfaces {
+                    let up = if iface.up { "up" } else { "down" };
+                    let vpn = if iface.vpn_like { ", vpn-like" } else { "" };
+                    println!("{} ({up}{vpn})", iface.name);
+                }
+            }
         }
         Response::Error(message) => eprintln!("error: {message}"),
     }

@@ -25,6 +25,8 @@ mod command;
 mod daemon;
 #[cfg(unix)]
 mod detector;
+#[cfg(unix)]
+mod interfaces;
 
 #[cfg(unix)]
 fn main() {
@@ -55,7 +57,15 @@ fn status() {
             println!("enabled:   {}", info.enabled);
             println!("interface: {}", info.interface);
             println!("vpn_up:    {}", info.vpn_up);
-            println!("applied:   {}", info.applied);
+            println!("routing:   {}", info.routing_state);
+            println!(
+                "applied:   {}",
+                match &info.applied {
+                    Some(applied) => applied.to_string(),
+                    None => "(none)".to_string(),
+                }
+            );
+            println!("detector:  {}", info.detector_health);
             println!(
                 "domains:   {}",
                 if info.domains.is_empty() {
