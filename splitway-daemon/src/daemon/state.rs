@@ -25,6 +25,14 @@ use splitway_shared::platform::{DnsBackend, PlatformError, VpnDetector, VpnEvent
 
 use crate::interfaces::list_interfaces;
 
+/// Caps how many `CheckDomain` resolutions run concurrently. The detached
+/// route-check path is the one client-driven path not serialized by the actor
+/// (every other blocking call is `spawn_blocking` awaited by the actor, so at
+/// most one runs at a time), so without a bound a burst of `check` requests could
+/// fan out to many concurrent `resolvectl query` subprocesses. 8 is ample for
+/// interactive use while keeping a flood bounded.
+static CHECK_RESOLVE_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+
 /// Builds the platform VPN detector for a config. Injected into the
 /// [`StateMachine`] (like [`DnsBackend`]) so the re-arm lifecycle can be driven
 /// with a mock detector in tests instead of touching the real platform.
@@ -816,14 +824,17 @@ impl StateMachine {
             }
         };
 
-        // Coverage: the first configured domain that covers `host` (both sides
-        // normalized at compare time, so a pre-existing un-normalized entry still
-        // matches). Pure, no I/O — computed now, on the actor, from the snapshot.
+        // Coverage: the MOST specific configured domain that covers `host` (both
+        // sides normalized at compare time, so a pre-existing un-normalized entry
+        // still matches). With both `example.com` and `sub.example.com` configured,
+        // a check of `vault.sub.example.com` attributes to `sub.example.com` (the
+        // longest covering entry), not whichever appears first. Pure, no I/O.
         let matched_domain = self
             .config
             .vpn_hosts
             .iter()
-            .find(|d| domain::domain_covers(d, &host))
+            .filter(|d| domain::domain_covers(d, &host))
+            .max_by_key(|d| d.len())
             .cloned();
         let backend = self.backend.clone();
         let vpn_interface = self.config.vpn_name.clone();
@@ -836,8 +847,12 @@ impl StateMachine {
 
         // Detached: resolve (blocking I/O on the blocking pool) and reply here, so
         // the actor returns immediately. A failure (NXDOMAIN, unsupported
-        // platform, …) degrades to `None`, never an `Error`.
+        // platform, …) degrades to `None`, never an `Error`. A small static
+        // semaphore bounds how many checks resolve concurrently — this detached
+        // path is the one client-driven path not serialized by the actor, so it
+        // must not fan out unbounded `resolvectl query` subprocesses.
         tokio::spawn(async move {
+            let _permit = CHECK_RESOLVE_LIMIT.acquire().await.ok();
             let host_for_resolve = host.clone();
             let resolution =
                 match tokio::task::spawn_blocking(move || backend.resolve(&host_for_resolve)).await
@@ -3086,5 +3101,22 @@ mod tests {
         let info = domain_check(check_via(&sm, "example.com").await);
         assert!(info.covered);
         assert_eq!(info.routing_state, RoutingState::Applied);
+    }
+
+    #[tokio::test]
+    async fn check_attributes_to_the_most_specific_domain() {
+        // Both a broad and a more specific domain cover the host; the most
+        // specific (longest) covering entry is attributed, regardless of the order
+        // they appear in the config.
+        let backend = Arc::new(MockBackend::default());
+        let sm = machine(
+            backend,
+            config(true, &["example.com", "sub.example.com"]),
+            "check-specific",
+        );
+
+        let info = domain_check(check_via(&sm, "vault.sub.example.com").await);
+        assert!(info.covered);
+        assert_eq!(info.matched_domain.as_deref(), Some("sub.example.com"));
     }
 }

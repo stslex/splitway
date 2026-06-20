@@ -250,6 +250,25 @@ fn print_domain_check(info: &splitway_shared::ipc::DomainCheckInfo) {
         None => println!("resolved:  (live resolution unavailable)"),
     }
 
+    // The `routing:` line is the daemon's *belief* (it thinks rules are applied);
+    // the `via link:` line is *reality* (where the live query was answered). When
+    // those genuinely disagree — believed-applied but answered by a non-VPN link —
+    // frame it as drift so the two lines don't read as a bare contradiction. The
+    // live answer is authoritative; full read-back/drift reconciliation is Phase 5d.
+    let drifting = matches!(
+        info.routing_state,
+        splitway_shared::ipc::RoutingState::Applied
+    ) && info
+        .resolution
+        .as_ref()
+        .and_then(|r| r.via_interface.as_deref())
+        .is_some_and(|link| !info.vpn_interface.is_empty() && link != info.vpn_interface);
+    if drifting {
+        println!(
+            "drift:     'routing' (the daemon's belief) and 'via link' (the live result) disagree — trust the live result"
+        );
+    }
+
     println!();
     println!("note: this checks DNS only — whether the name resolves through the VPN's");
     println!("      resolver, not whether the resolved address is reachable through the tunnel.");

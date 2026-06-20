@@ -96,9 +96,13 @@ pub fn normalize_host(input: &str) -> Result<String, DomainError> {
     validate_host(&host).map(|()| host)
 }
 
-/// Reject an empty host, embedded whitespace, or an empty label (which catches a
-/// leading/trailing/doubled dot). Intentionally lenient otherwise so IDN hosts
-/// pass through (see [`normalize_host`]).
+/// Reject an empty host, embedded whitespace, an empty label (a
+/// leading/trailing/doubled dot), or a label that begins or ends with a hyphen.
+/// The hyphen rule matters at the trust boundary: a leading-`-` label is never a
+/// valid RFC 1035/1123 hostname and is the textbook argument-injection shape
+/// (the host flows verbatim into `resolvectl`'s argv), so the normalizer — the
+/// gate for untrusted IPC input — must reject it. Interior hyphens and non-ASCII
+/// label bytes (IDN, a pass-through TODO) stay lenient.
 fn validate_host(host: &str) -> Result<(), DomainError> {
     if host.is_empty() {
         return Err(DomainError::Empty);
@@ -106,7 +110,9 @@ fn validate_host(host: &str) -> Result<(), DomainError> {
     if host.contains(char::is_whitespace) {
         return Err(DomainError::InvalidHost(host.to_string()));
     }
-    if host.split('.').any(|label| label.is_empty()) {
+    let label_ok =
+        |label: &str| !label.is_empty() && !label.starts_with('-') && !label.ends_with('-');
+    if !host.split('.').all(label_ok) {
         return Err(DomainError::InvalidHost(host.to_string()));
     }
     Ok(())
@@ -154,6 +160,9 @@ mod tests {
             ("user@sub.example.com", "sub.example.com"),
             ("https://user:pass@sub.example.com:443/p", "sub.example.com"),
             ("localhost", "localhost"),
+            // Interior hyphens are fine; punycode (xn--) too (leading char is `x`).
+            ("my-host.example.com", "my-host.example.com"),
+            ("xn--caf-dma.example.com", "xn--caf-dma.example.com"),
             // A scheme we do not special-case still yields the authority host.
             ("ftp://files.example.org/pub", "files.example.org"),
             // Query / fragment are stripped even without a scheme or path.
@@ -226,6 +235,20 @@ mod tests {
         // single trailing dot is the valid FQDN root form).
         assert!(matches!(
             normalize_host("example.com.."),
+            Err(DomainError::InvalidHost(_))
+        ));
+        // A label may not begin or end with a hyphen (RFC LDH; also the
+        // argument-injection shape that reaches resolvectl's argv).
+        assert!(matches!(
+            normalize_host("-x"),
+            Err(DomainError::InvalidHost(_))
+        ));
+        assert!(matches!(
+            normalize_host("--foo.example.com"),
+            Err(DomainError::InvalidHost(_))
+        ));
+        assert!(matches!(
+            normalize_host("foo-.example.com"),
             Err(DomainError::InvalidHost(_))
         ));
     }
