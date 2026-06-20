@@ -244,7 +244,7 @@ Tauri GUI, and a hardening pass.
 
 ## Development
 
-Workflow rules live in [CLAUDE.md](CLAUDE.md): one phase = one branch = one PR into `dev`, English only. Per-phase implementation prompts are in `docs/prompts/`.
+Workflow rules live in [CLAUDE.md](CLAUDE.md): one phase = one branch = one PR into `dev`, English only. Implementation prompts are ephemeral and not committed; durable design lives in [ROADMAP.md](ROADMAP.md), [docs/architecture.md](docs/architecture.md), and [docs/design/](docs/design/).
 
 ## Stack
 

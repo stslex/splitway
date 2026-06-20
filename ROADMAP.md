@@ -1,6 +1,6 @@
 # Roadmap
 
-Reflects code state as of 2026-06-18.
+Reflects code state as of 2026-06-20.
 
 Goal: finish the DNS-split solution to a shippable **v1 for Linux + macOS** —
 complete the verification / business-logic work, package it, and replace the
@@ -8,9 +8,11 @@ interim GUI with a native one. Anything past that (other VPN backends, proxy
 route targets) is deliberately deferred; see [Later](#later).
 
 Process: one phase = one branch = one PR into `dev` (workflow rules in
-`CLAUDE.md`); per-phase implementation prompts live in `docs/prompts/`. Hard
-constraint: **no shortcuts at the expense of code quality** — no phase trades
-correctness, tests, or a clean abstraction for speed.
+`CLAUDE.md`). Implementation prompts are ephemeral and **not committed**; durable
+design lives in this file (the plan), `docs/architecture.md` (cross-cutting
+invariants), and `docs/design/` (per-feature decisions). Hard constraint: **no
+shortcuts at the expense of code quality** — no phase trades correctness, tests,
+or a clean abstraction for speed.
 
 ## Ordering rationale
 
@@ -47,6 +49,22 @@ landed, on the abstraction split that keeps each one a small isolated impl.
 - **Phase 4 — Primitive GUI.** `splitway-gui` (egui): status, enable/disable,
   domain add/remove, and config editing — all over the CLI's IPC socket, zero
   privileges, behind the get/set-config `PROTOCOL_VERSION` bump.
+- **Phase 5 — live config, interface selection, verification (belief).** The
+  usability scope **plus** exposing state the daemon already computes — all on one
+  `PROTOCOL_VERSION` bump (to 3), egui kept minimal:
+  - Daemon re-arms the VPN watch **live** when `vpn_name` / `vpn_backend` /
+    `openvpn` change (the restart-on-`vpn_name` caveat is gone; the old interface
+    is reverted on switch with no half-configured state).
+  - A `ListInterfaces` verb enumerates local interfaces (name + up/down, VPN-like
+    flagged) so the GUI offers a picker without touching the platform.
+  - The **belief surface**: an applied snapshot in `StatusInfo` (interface +
+    domains + DNS servers), a `RoutingState` enum mirroring the `desired()`
+    branches (disabled / no domains / VPN down / no DNS from VPN / applied /
+    apply-failed), and `detector_health` — what the daemon *intends*, not yet a
+    read-back of reality.
+  - GUI: `vpn_name` picker over the live interface list (free-text fallback kept),
+    a Resync button, immediate refresh after every change, and an opaque grouped
+    visual pass.
 
 ## Frontend: egui is interim, Tauri is the target
 
@@ -62,32 +80,7 @@ Tauri replaces it.
 
 The sequence to v1, in order. Each is one phase = one branch = one PR.
 
-### Phase 5 — live config, interface selection, verification (belief)
-
-The original Phase 5 usability scope **plus** exposing state the daemon already
-computes internally but does not surface. All of it rides **one**
-`PROTOCOL_VERSION` bump (to 3); egui stays functional, not redesigned.
-
-- Daemon: re-arm the VPN watch live when `vpn_name`/`vpn_backend`/`openvpn`
-  change, so the restart-on-`vpn_name` caveat disappears and `vpn_up` reflects
-  the configured interface immediately. The detectors are reused unchanged — only
-  their lifecycle (start/stop/restart) becomes dynamic, with the old interface
-  reverted on switch and no half-configured state.
-- Daemon: a `ListInterfaces` verb enumerating local interfaces (name + up/down,
-  VPN-like flagged) so the GUI can offer an interface picker without itself
-  touching the platform or holding privileges.
-- Daemon: surface what reconciliation already knows — an applied snapshot in
-  `StatusInfo` (interface + domains + DNS servers, from the existing `Applied`
-  struct), a `RoutingState` enum mirroring the existing `desired()` branches
-  (disabled / no domains / VPN down / no DNS from VPN / applied / apply-failed),
-  and `detector_health`. This is *belief*: what the daemon intends, not yet a
-  read-back of what the system actually shows.
-- GUI: `vpn_name` becomes a picker over the live interface list (free-text
-  fallback kept); a Resync button (re-read config + reconcile + refresh);
-  immediate refresh after every change; and an opaque, grouped visual pass (the
-  current build renders with a transparent background).
-
-### Phase 5b — verification (reality) + domain normalization
+### Phase 5b — verification (reality) + domain normalization + route-check
 
 - Extend `DnsBackend::status()` to **return** the live mapping (resolvectl on
   Linux, `/etc/resolver` on macOS) instead of only printing it, so the daemon can
@@ -95,21 +88,58 @@ computes internally but does not surface. All of it rides **one**
   *belief*.
 - Domain normalization + case-insensitive dedup in `splitway-shared`, shared by
   the daemon and every client, so the daemon no longer trusts raw IPC input.
+- A **`CheckDomain(host)`** verb answering two questions:
+  - **Coverage** (pure, suffix-aware): resolvectl routes a domain *and its
+    subdomains*, so `vault.example.com` is already covered by a configured
+    `example.com`. Not-covered → offer to add it.
+  - **Live resolution**: Linux-strong via systemd-resolved's resolving `ifindex`;
+    macOS best-effort.
+  - Input is a pasted **URL** → parse host → normalize; CLI `splitway check <url>`.
+  - **Boundary:** coverage + resolution are in scope; **reachability is not** —
+    Splitway governs DNS, not IP routing (see `docs/architecture.md`).
 
-### Phase 6 — packaging (pulled forward)
+### Phase 5c — config as the single source of truth
 
-The gate that deferred packaging — no real daemon before Phase 2 — has expired,
-so this comes ahead of the native GUI: a dev channel is needed to iterate on the
-later phases.
+The config file becomes the authoritative state and the daemon stops caching it.
+(Full invariant in `docs/architecture.md`.)
+
+- The daemon **reads the config fresh on every operation** — **no in-memory
+  config cache**; reconciliation is event-driven, not a hot loop. The only
+  in-memory state is what the file cannot hold: the applied snapshot and the
+  armed-watch parameters.
+- **Atomic writes** (temp + rename) + **read-modify-write** on every mutation, so
+  a concurrent external edit is never clobbered and a crash leaves no half-written
+  file.
+- A **file watcher** (inotify / FSEvents or the `notify` crate) picks up external
+  hand-edits live — watch the *directory*, handle atomic-rename-replace, debounce
+  self-writes.
+- **Malformed = freeze**: keep the last-applied rules, surface the file as
+  invalid, recover automatically when it parses again — never revert to a default.
+- Config access behind a **testable abstraction** (no inline `fs::read` in
+  `StateMachine`), so reconciliation is unit-testable without the filesystem.
+- **NixOS:** the writable config lives in **`/var/lib/splitway/config.json` via
+  `StateDirectory`**, not a module-generated read-only `/etc` file. The
+  `nixosModule` provisions the state dir and passes `--config`; the model is
+  **imperative** (the daemon owns the writable file, the GUI mutates at runtime),
+  not declarative — options may *seed* an initial config but must not *lock* it.
+
+### Phase 6 — packaging (distribution to other users)
+
+The author's daily-driver path **already exists** via the Phase 0.5 flake +
+`nixosModule` — that is the iteration channel. So this phase is **distribution to
+other users, not the author's iteration unblock**: general-distro packaging gets
+Splitway onto non-Nix machines, which is its own work because **generic Linux
+binaries do not run on NixOS** (the dynamic linker is in the Nix store, not
+`/lib64`) and immutable-`/usr` hosts need writable install paths.
 
 - **One package** `splitway` containing daemon + cli + gui + the service unit, at
   a single version. This sidesteps the GUI↔daemon version matrix entirely: there
   are no separately-versioned packages to mismatch. `postinst` restarts
   `splitway.service` on upgrade so the running daemon always matches the new
   binaries; the existing version-peek (`VERSION_MISMATCH_PREFIX`) covers the brief
-  upgrade window.
-- **Linux first:** apt / dnf / pacman / nix repos on GitHub Pages, with **dev and
-  release channels** as separate Pages subtrees. Pattern reusable from
+  upgrade window. **On NixOS the module is the single-version equivalent.**
+- **Linux first:** tarball + apt / dnf / pacman repos on GitHub Pages, with **dev
+  and release channels** as separate Pages subtrees. Pattern reusable from
   `stslex/claude-desktop-linux` — take the packaging/publishing half, drop the
   repackage half, and source artifacts from `cargo build --release`. Watch the
   Pages "full-site replace" trap that makes concurrent dev + stable deploys
@@ -121,7 +151,11 @@ later phases.
 
 ### Phase 7 — native Tauri GUI
 
-Build the Tauri frontend over the now-rich IPC and retire the egui GUI.
+Build the Tauri frontend over the now-rich IPC and retire the egui GUI. A
+**full window** is favored over a tray-popover: niri (and many Wayland
+compositors) have **no system tray**, and the simultaneous-multi-VPN north-star
+(see [Later](#later)) scales in a windowed / sidebar layout. The GUI must be
+Wayland-native (egui and Tauri both are).
 
 ### Phase 8 — feature freeze + hardening
 
@@ -135,7 +169,21 @@ negotiated compatibility.
 
 Explicitly deferred — out of the v1 scope above.
 
-- **More VPN backends** beyond the current set (WireGuard, …).
+- **Multi-VPN** — three distinct directions, **explicitly unscheduled (no phase
+  number)**:
+  - **(A) Different VPN *types* / backends** — WireGuard, IKEv2, … i.e. more
+    detectors on the existing trait.
+  - **(B) VPN *profiles*** — several configured, one active at a time,
+    switchable. Lighter: it leans on Phase 5's live re-arm.
+  - **(C) Multiple *simultaneous* routings — the stated north-star.** Several VPNs
+    active in parallel, each routing its own domains (resolvectl supports per-link
+    routing domains). This pluralizes the whole data model: config → a list, watch
+    → N self-contained units, applied → a per-interface map, reconcile / status →
+    per-VPN, IPC → carries a `vpn_id`, GUI → per-VPN, plus a single→plural config
+    migration. v1 is **migration-aware** — read-fresh + atomic writes (Phase 5c)
+    de-risk that migration, and modeling the watch as a self-contained unit
+    (Phase 5) is the stepping stone, so keeping v1 single paints no corner. Still
+    **unscheduled**.
 - **Proxy / `RouteTarget` route targets** (VLESS / Xray over SOCKS5). This is its
   own deliberate track, not a side-feature: split-DNS routes by *resolving* a
   domain through the VPN's DNS, whereas sending a domain through a SOCKS5 proxy
