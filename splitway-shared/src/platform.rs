@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::ipc::ResolutionInfo;
+
 #[derive(Error, Debug)]
 pub enum PlatformError {
     #[error("command failed: {0}")]
@@ -10,6 +12,10 @@ pub enum PlatformError {
     ParseError(String),
     #[error("D-Bus error: {0}")]
     DbusError(String),
+    /// The operation is not supported on this platform (e.g. live resolution on
+    /// Windows). A clean, expected error — not a failure.
+    #[error("unsupported on this platform: {0}")]
+    Unsupported(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -61,5 +67,22 @@ pub trait DnsBackend: Send + Sync {
     /// anyway.
     fn reverts_globally(&self) -> bool {
         false
+    }
+
+    /// Resolve `host` live and report the resolved address(es) plus best-effort
+    /// attribution of the link/resolver that answered. This is the route-check's
+    /// *reality* read: Linux (systemd-resolved) attributes the answering link
+    /// strongly via `resolvectl query`; macOS is best-effort (no attribution).
+    ///
+    /// Default: [`PlatformError::Unsupported`] — so a platform without a real
+    /// implementation (e.g. Windows) returns a clean error that the caller turns
+    /// into "resolution unavailable", never a hard failure.
+    ///
+    /// Boundary: this reports *which resolver answered*, not reachability —
+    /// Splitway governs DNS, not IP routing (see `docs/architecture.md`).
+    fn resolve(&self, _host: &str) -> Result<ResolutionInfo, PlatformError> {
+        Err(PlatformError::Unsupported(
+            "live resolution is not supported on this platform".to_string(),
+        ))
     }
 }

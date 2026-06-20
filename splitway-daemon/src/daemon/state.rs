@@ -16,8 +16,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
 use splitway_shared::config::{self, ConfigParseError, LocalConfig, OpenVpnConfig};
+use splitway_shared::domain::{self, normalize_host};
 use splitway_shared::ipc::{
-    AppliedInfo, ConfigView, DetectorHealth, Request, Response, RoutingState, StatusInfo,
+    AppliedInfo, ConfigView, DetectorHealth, DomainCheckInfo, Request, Response, RoutingState,
+    StatusInfo,
 };
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnDetector, VpnEvent, VpnInfo};
 
@@ -593,6 +595,7 @@ impl StateMachine {
                     Err(e) => Response::Error(format!("interface enumeration task panicked: {e}")),
                 }
             }
+            Request::CheckDomain(raw) => self.check_domain(raw).await,
         }
     }
 
@@ -756,11 +759,24 @@ impl StateMachine {
     /// preserved for the normal duplicate-add contract; a caller must not read it
     /// as "nothing happened".
     async fn add_domain(&mut self, domain: String) -> Response {
+        // Normalize the input (a pasted URL or host) before storing, so the
+        // config holds bare, lowercased hosts. Fail fast on bad input, before
+        // touching disk. Forward-only: existing entries are not rewritten.
+        let domain = match normalize_host(&domain) {
+            Ok(host) => host,
+            Err(e) => return Response::Error(format!("invalid domain: {e}")),
+        };
         let mut next = match self.load_fresh() {
             Ok(config) => config,
             Err(e) => return config_unreadable_reply(e),
         };
-        if next.vpn_hosts.iter().any(|d| d == &domain) {
+        // Case-insensitive dedup so `Example.com` does not duplicate `example.com`
+        // (existing entries may be un-normalized; the new one is normalized).
+        if next
+            .vpn_hosts
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(&domain))
+        {
             // Already present on disk: nothing to add. Still adopt the
             // freshly-loaded config (it may carry a concurrent external edit) and
             // reconcile, so the daemon converges to the source-of-truth file even
@@ -775,6 +791,57 @@ impl StateMachine {
         }
         next.vpn_hosts.push(domain);
         self.commit(next).await
+    }
+
+    /// Handle a [`Request::CheckDomain`]: normalize the raw input to a host,
+    /// compute suffix-aware coverage against the configured routing domains, and
+    /// attempt a live resolution on the blocking pool. A resolution failure is
+    /// **not** a request failure — it returns `resolution: None`. The result
+    /// reports coverage and which resolver answered, not reachability.
+    async fn check_domain(&mut self, raw: String) -> Response {
+        let host = match normalize_host(&raw) {
+            Ok(host) => host,
+            Err(e) => return Response::Error(format!("invalid domain: {e}")),
+        };
+
+        // Coverage: the first configured domain that covers `host` (both sides
+        // normalized at compare time, so a pre-existing un-normalized entry still
+        // matches). Pure, no I/O.
+        let matched_domain = self
+            .config
+            .vpn_hosts
+            .iter()
+            .find(|d| domain::domain_covers(d, &host))
+            .cloned();
+
+        // Live resolution off the actor (it shells out / does network I/O), like
+        // `list_interfaces`, so a slow lookup never stalls VPN-event or IPC
+        // handling. A failure (NXDOMAIN, unsupported platform, …) degrades to
+        // `None`, never an `Error` reply.
+        let backend = self.backend.clone();
+        let host_for_resolve = host.clone();
+        let resolution =
+            match tokio::task::spawn_blocking(move || backend.resolve(&host_for_resolve)).await {
+                Ok(Ok(info)) => Some(info),
+                Ok(Err(e)) => {
+                    log::debug!("resolution of {host} unavailable: {e}");
+                    None
+                }
+                Err(e) => {
+                    log::warn!("resolution task panicked for {host}: {e}");
+                    None
+                }
+            };
+
+        Response::DomainCheck(DomainCheckInfo {
+            host,
+            covered: matched_domain.is_some(),
+            matched_domain,
+            vpn_interface: self.config.vpn_name.clone(),
+            resolution,
+            enabled: self.config.enabled,
+            vpn_up: self.vpn_up,
+        })
     }
 
     async fn remove_domain(&mut self, domain: String) -> Response {
@@ -1051,6 +1118,7 @@ pub async fn run_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use splitway_shared::ipc::ResolutionInfo;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
@@ -1065,6 +1133,11 @@ mod tests {
         fail_apply: AtomicBool,
         fail_revert: AtomicBool,
         global_revert: AtomicBool,
+        /// Scripted resolution: `Some(addrs)` → resolve returns those addresses
+        /// with `resolve_interface`; `None` → the default unsupported error.
+        resolve_addresses: Mutex<Option<Vec<String>>>,
+        resolve_interface: Mutex<Option<String>>,
+        fail_resolve: AtomicBool,
     }
 
     impl MockBackend {
@@ -1078,6 +1151,15 @@ mod tests {
 
         fn set_reverts_globally(&self, global: bool) {
             self.global_revert.store(global, Ordering::Relaxed);
+        }
+
+        fn set_resolution(&self, addresses: Vec<String>, via_interface: Option<String>) {
+            *self.resolve_addresses.lock().unwrap() = Some(addresses);
+            *self.resolve_interface.lock().unwrap() = via_interface;
+        }
+
+        fn set_fail_resolve(&self, fail: bool) {
+            self.fail_resolve.store(fail, Ordering::Relaxed);
         }
     }
 
@@ -1111,6 +1193,24 @@ mod tests {
 
         fn reverts_globally(&self) -> bool {
             self.global_revert.load(Ordering::Relaxed)
+        }
+
+        fn resolve(&self, _host: &str) -> Result<ResolutionInfo, PlatformError> {
+            if self.fail_resolve.load(Ordering::Relaxed) {
+                return Err(PlatformError::CommandFailed(
+                    "mock resolve failure".to_string(),
+                ));
+            }
+            match &*self.resolve_addresses.lock().unwrap() {
+                Some(addresses) => Ok(ResolutionInfo {
+                    addresses: addresses.clone(),
+                    via_interface: self.resolve_interface.lock().unwrap().clone(),
+                    via_dns: None,
+                }),
+                None => Err(PlatformError::Unsupported(
+                    "mock: no resolution scripted".to_string(),
+                )),
+            }
         }
     }
 
@@ -2758,5 +2858,111 @@ mod tests {
             applies_after_first,
             "recovery to an identical config must not re-apply (equality skip)"
         );
+    }
+
+    // ---- Phase 5b: CheckDomain route-check ----
+
+    fn domain_check(resp: Response) -> DomainCheckInfo {
+        match resp {
+            Response::DomainCheck(info) => info,
+            other => panic!("expected DomainCheck, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_domain_normalizes_and_reports_suffix_coverage() {
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend, config(true, &["sub.example.com"]), "check-covered");
+
+        // A pasted URL whose host is a subdomain of a configured routing domain.
+        let info = domain_check(
+            sm.on_request(Request::CheckDomain(
+                "https://vault.sub.example.com/x?y=1".to_string(),
+            ))
+            .await,
+        );
+
+        assert_eq!(info.host, "vault.sub.example.com");
+        assert!(info.covered);
+        assert_eq!(info.matched_domain.as_deref(), Some("sub.example.com"));
+        assert_eq!(info.vpn_interface, "wg0");
+        assert!(info.enabled);
+        assert!(!info.vpn_up);
+        // No resolution scripted → unsupported → None (not an error).
+        assert!(info.resolution.is_none());
+    }
+
+    #[tokio::test]
+    async fn check_domain_not_covered() {
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(
+            backend,
+            config(true, &["sub.example.com"]),
+            "check-uncovered",
+        );
+
+        let info = domain_check(
+            sm.on_request(Request::CheckDomain("example.org".to_string()))
+                .await,
+        );
+
+        assert_eq!(info.host, "example.org");
+        assert!(!info.covered);
+        assert!(info.matched_domain.is_none());
+    }
+
+    #[tokio::test]
+    async fn check_domain_invalid_input_is_an_error() {
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend, config(true, &["sub.example.com"]), "check-invalid");
+
+        // A path pasted onto a bare host (no scheme) cannot be normalized.
+        let resp = sm
+            .on_request(Request::CheckDomain("example.com/path".to_string()))
+            .await;
+        assert!(matches!(resp, Response::Error(_)), "got {resp:?}");
+    }
+
+    #[tokio::test]
+    async fn check_domain_surfaces_resolution() {
+        let backend = Arc::new(MockBackend::default());
+        // Synthetic, placeholder-only resolution.
+        backend.set_resolution(vec!["10.0.0.1".to_string()], Some("wg0".to_string()));
+        let mut sm = machine(
+            backend,
+            config(true, &["sub.example.com"]),
+            "check-resolved",
+        );
+
+        let info = domain_check(
+            sm.on_request(Request::CheckDomain("vault.sub.example.com".to_string()))
+                .await,
+        );
+
+        assert!(info.covered);
+        let resolution = info.resolution.expect("resolution should be surfaced");
+        assert_eq!(resolution.addresses, vec!["10.0.0.1".to_string()]);
+        assert_eq!(resolution.via_interface.as_deref(), Some("wg0"));
+        assert_eq!(resolution.via_dns, None);
+    }
+
+    #[tokio::test]
+    async fn check_domain_resolution_failure_is_none_not_error() {
+        let backend = Arc::new(MockBackend::default());
+        backend.set_fail_resolve(true);
+        let mut sm = machine(
+            backend,
+            config(true, &["sub.example.com"]),
+            "check-resolve-fail",
+        );
+
+        let info = domain_check(
+            sm.on_request(Request::CheckDomain("vault.sub.example.com".to_string()))
+                .await,
+        );
+
+        // Coverage is still reported; a resolution failure is never an Error.
+        assert!(info.covered);
+        assert!(info.resolution.is_none());
     }
 }

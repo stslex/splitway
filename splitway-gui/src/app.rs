@@ -247,8 +247,9 @@ impl SplitwayApp {
                     // flap. The picker keeps working off the free-text field.
                     other => self.note_connection_from(&other),
                 },
-                // The GUI never issues this.
+                // The GUI never issues these.
                 Request::ListDomains => {}
+                Request::CheckDomain(_) => {}
             }
         }
     }

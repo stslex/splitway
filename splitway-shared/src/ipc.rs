@@ -21,13 +21,15 @@ use crate::config::VpnBackend;
 /// [`StatusInfo`] (the `applied` mapping, [`RoutingState`] and
 /// [`DetectorHealth`] — all additive). Bumped to `4` in Phase 5c for the
 /// additive [`RoutingState::ConfigInvalid`] variant (the malformed-config freeze
-/// surfaced over IPC). The daemon enforces *strict equality* (see
+/// surfaced over IPC). Bumped to `5` in Phase 5b for the additive
+/// `CheckDomain` verb / [`Response::DomainCheck`] reply (the domain route-check).
+/// The daemon enforces *strict equality* (see
 /// `daemon::ipc::process_line`): a daemon rejects a client whose version differs,
 /// and vice versa, so there is no silent mixed-version operation. The daemon, CLI
 /// and GUI all build from this one workspace, so they upgrade in lockstep; a
 /// mismatch only happens across separately-updated installs and is surfaced as
 /// actionable "update splitway" guidance, never a raw decode error.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Stable prefix the daemon uses to introduce a protocol-version-mismatch
 /// error reply. Shared so a client (CLI/GUI) can recognize skew and render
@@ -79,6 +81,12 @@ pub enum Request {
     /// interface picker without itself touching the platform or holding
     /// privileges. Read-only; replied to with [`Response::Interfaces`].
     ListInterfaces,
+    /// Check whether a domain routes through the VPN. The argument is raw input —
+    /// a pasted URL or a bare host — which the daemon normalizes. Read-only;
+    /// replied to with [`Response::DomainCheck`]. Reports coverage and which
+    /// resolver answered, *not* reachability (Splitway governs DNS, not IP
+    /// routing — see `docs/architecture.md`).
+    CheckDomain(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +101,8 @@ pub enum Response {
     Config(ConfigView),
     /// Reply to [`Request::ListInterfaces`].
     Interfaces(Vec<InterfaceInfo>),
+    /// Reply to [`Request::CheckDomain`].
+    DomainCheck(DomainCheckInfo),
     /// The request failed; the string is a human-readable reason.
     Error(String),
 }
@@ -167,6 +177,49 @@ pub struct AppliedInfo {
     pub domains: Vec<String>,
     /// The VPN DNS servers the domains are routed to.
     pub dns_servers: Vec<String>,
+}
+
+/// The result of a [`Request::CheckDomain`] route-check: whether a configured
+/// routing domain covers the host, plus the live-resolution result and enough
+/// context for a client to phrase the verdict without over-claiming. Reports
+/// coverage and which resolver answered — **not** reachability (Splitway governs
+/// DNS, not IP routing; see `docs/architecture.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainCheckInfo {
+    /// The normalized host that was checked (a pasted URL is reduced to its host).
+    pub host: String,
+    /// Whether a configured routing domain covers `host` (suffix-aware).
+    pub covered: bool,
+    /// The configured domain that covers `host`, when `covered`.
+    pub matched_domain: Option<String>,
+    /// The configured VPN interface (`vpn_name`), so a client can tell whether
+    /// the link that answered is the VPN's. Empty when no interface is configured.
+    pub vpn_interface: String,
+    /// The live-resolution result, or `None` when resolution was not attempted,
+    /// failed, or is unsupported on this platform (never an `Error` reply).
+    pub resolution: Option<ResolutionInfo>,
+    /// Whether rule application is enabled — context so a client can say
+    /// "covered, but disabled" rather than implying it routes right now.
+    pub enabled: bool,
+    /// Whether the configured VPN interface is currently up — context so a client
+    /// can say "covered, but the VPN is down" rather than implying live routing.
+    pub vpn_up: bool,
+}
+
+/// The live-resolution result for one host. `via_interface` / `via_dns` are
+/// best-effort attribution: Linux (systemd-resolved) reports the answering link;
+/// the resolver IP is usually absent from `resolvectl query`, and macOS cannot
+/// attribute either — so both are `Option`. Addresses are the resolved IP(s).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolutionInfo {
+    /// The resolved IP address(es), as text.
+    pub addresses: Vec<String>,
+    /// The link that answered, when the platform can attribute it (Linux-strong;
+    /// typically `None` on macOS).
+    pub via_interface: Option<String>,
+    /// The resolver that answered, when known (often `None` — `resolvectl query`
+    /// does not report it).
+    pub via_dns: Option<String>,
 }
 
 /// Why DNS routing is — or is not — active right now, mapped from the daemon's
@@ -492,6 +545,30 @@ mod tests {
                     vpn_like: false,
                 },
             ]),
+            // Covered + resolved (Linux-strong: a link is attributed).
+            Response::DomainCheck(DomainCheckInfo {
+                host: "vault.sub.example.com".to_string(),
+                covered: true,
+                matched_domain: Some("sub.example.com".to_string()),
+                vpn_interface: "tun0".to_string(),
+                resolution: Some(ResolutionInfo {
+                    addresses: vec!["10.0.0.1".to_string(), "2001:db8::1".to_string()],
+                    via_interface: Some("tun0".to_string()),
+                    via_dns: None,
+                }),
+                enabled: true,
+                vpn_up: true,
+            }),
+            // Not covered + resolution unavailable (the other shape of each field).
+            Response::DomainCheck(DomainCheckInfo {
+                host: "example.org".to_string(),
+                covered: false,
+                matched_domain: None,
+                vpn_interface: String::new(),
+                resolution: None,
+                enabled: false,
+                vpn_up: false,
+            }),
         ];
         for response in responses {
             let json = serde_json::to_string(&response).unwrap();
@@ -507,6 +584,20 @@ mod tests {
         let parsed: RequestEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.version, PROTOCOL_VERSION);
         assert_eq!(parsed.request, Request::ListInterfaces);
+    }
+
+    #[test]
+    fn check_domain_verb_round_trips_in_envelope() {
+        let env = RequestEnvelope::new(Request::CheckDomain(
+            "https://vault.sub.example.com/x".to_string(),
+        ));
+        let json = serde_json::to_string(&env).unwrap();
+        let parsed: RequestEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.version, PROTOCOL_VERSION);
+        assert_eq!(
+            parsed.request,
+            Request::CheckDomain("https://vault.sub.example.com/x".to_string())
+        );
     }
 
     #[test]
