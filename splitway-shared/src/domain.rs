@@ -26,11 +26,15 @@ pub enum DomainError {
 }
 
 /// Fold a host for case-insensitive, trailing-dot-insensitive comparison:
-/// trim, strip a single trailing dot, lowercase ASCII. `to_ascii_lowercase`
-/// deliberately leaves non-ASCII bytes untouched — see the IDN note on
-/// [`normalize_host`].
+/// trim, strip a *single* trailing dot (the valid FQDN root form), lowercase
+/// ASCII. Stripping only one dot leaves a doubled trailing dot (`example.com..`)
+/// as an empty label that [`validate_host`] then rejects, rather than silently
+/// folding to the parent. `to_ascii_lowercase` deliberately leaves non-ASCII
+/// bytes untouched — see the IDN note on [`normalize_host`].
 fn fold(host: &str) -> String {
-    host.trim().trim_end_matches('.').to_ascii_lowercase()
+    let host = host.trim();
+    let host = host.strip_suffix('.').unwrap_or(host);
+    host.to_ascii_lowercase()
 }
 
 /// Normalize a pasted URL or a bare host into a bare, lowercased host.
@@ -216,6 +220,12 @@ mod tests {
         // Whitespace inside the host.
         assert!(matches!(
             normalize_host("has space.com"),
+            Err(DomainError::InvalidHost(_))
+        ));
+        // A doubled trailing dot leaves an empty label and is rejected (only a
+        // single trailing dot is the valid FQDN root form).
+        assert!(matches!(
+            normalize_host("example.com.."),
             Err(DomainError::InvalidHost(_))
         ));
     }

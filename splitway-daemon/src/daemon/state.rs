@@ -829,6 +829,10 @@ impl StateMachine {
         let vpn_interface = self.config.vpn_name.clone();
         let enabled = self.config.enabled;
         let vpn_up = self.vpn_up;
+        // The daemon's belief about whether usable split-DNS is actually installed
+        // (covers VPN-up-but-no-DNS and apply-failed, which `enabled && vpn_up`
+        // would miss). The client keys its "routed right now" verdict on this.
+        let routing_state = self.routing_state();
 
         // Detached: resolve (blocking I/O on the blocking pool) and reply here, so
         // the actor returns immediately. A failure (NXDOMAIN, unsupported
@@ -857,6 +861,7 @@ impl StateMachine {
                 resolution,
                 enabled,
                 vpn_up,
+                routing_state,
             }));
         });
     }
@@ -867,15 +872,22 @@ impl StateMachine {
         // dot) removes the stored `example.com` rather than no-op'ing while it
         // stays configured. Existing entries may be un-normalized; `same_host`
         // folds both sides.
-        let host = match normalize_host(&domain) {
-            Ok(host) => host,
-            Err(e) => return Response::Error(format!("invalid domain: {e}")),
+        //
+        // Fallback: if the input does NOT normalize, match it by exact string
+        // instead of erroring. A config that predates normalization (the old CLI
+        // persisted arbitrary `AddDomain` strings) may hold entries the current
+        // normalizer rejects — e.g. `192.0.2.1` or `example.com/path` — and the
+        // user must be able to remove exactly that bad entry without hand-editing.
+        let normalized = normalize_host(&domain).ok();
+        let is_target = |d: &String| match &normalized {
+            Some(host) => domain::same_host(d, host),
+            None => d == &domain,
         };
         let mut next = match self.load_fresh() {
             Ok(config) => config,
             Err(e) => return config_unreadable_reply(e),
         };
-        if !next.vpn_hosts.iter().any(|d| domain::same_host(d, &host)) {
+        if !next.vpn_hosts.iter().any(&is_target) {
             // Absent on disk: nothing to remove. Adopt the freshly-loaded config
             // and reconcile anyway (mirroring the no-change `set_enabled` path):
             // an external edit may already have removed the domain, and its rules
@@ -886,7 +898,7 @@ impl StateMachine {
                 Err(e) => Response::Error(format!("failed to apply current state: {e}")),
             };
         }
-        next.vpn_hosts.retain(|d| !domain::same_host(d, &host));
+        next.vpn_hosts.retain(|d| !is_target(d));
         self.commit(next).await
     }
 
@@ -3012,5 +3024,38 @@ mod tests {
             "the stored domain must be removed, not left configured"
         );
         assert!(sm.config_store.load().unwrap().vpn_hosts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_legacy_unnormalizable_entry_via_exact_match() {
+        // A config that predates normalization may hold an entry the current
+        // normalizer rejects (here an IP literal). Removal must fall back to an
+        // exact-string match so the user can clean it up without hand-editing.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend, config(true, &["192.0.2.1"]), "remove-legacy");
+
+        let resp = sm
+            .on_request(Request::RemoveDomain("192.0.2.1".to_string()))
+            .await;
+
+        assert_eq!(resp, Response::Ok);
+        assert!(
+            sm.config.vpn_hosts.is_empty(),
+            "a legacy un-normalizable entry must be removable by exact match"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_surfaces_routing_state() {
+        // VPN up with usable DNS → routing_state Applied is carried in the check,
+        // so a client does not have to infer routing from enabled && vpn_up alone.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(backend, config(true, &["example.com"]), "check-routing");
+        sm.on_event(vpn_up("wg0")).await;
+        assert!(sm.applied.is_some());
+
+        let info = domain_check(check_via(&sm, "example.com").await);
+        assert!(info.covered);
+        assert_eq!(info.routing_state, RoutingState::Applied);
     }
 }

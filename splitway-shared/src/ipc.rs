@@ -204,6 +204,12 @@ pub struct DomainCheckInfo {
     /// Whether the configured VPN interface is currently up — context so a client
     /// can say "covered, but the VPN is down" rather than implying live routing.
     pub vpn_up: bool,
+    /// The daemon's overall routing state (its *belief*: whether usable split-DNS
+    /// rules are actually installed). A client must key the "routed right now"
+    /// verdict on this — `enabled && vpn_up` is not enough, since the VPN can be
+    /// up while pushing no DNS (`NoDnsFromVpn`) or an apply can have failed
+    /// (`ApplyFailed`), in which case nothing is routed.
+    pub routing_state: RoutingState,
 }
 
 /// The live-resolution result for one host. `via_interface` / `via_dns` are
@@ -558,6 +564,7 @@ mod tests {
                 }),
                 enabled: true,
                 vpn_up: true,
+                routing_state: RoutingState::Applied,
             }),
             // Not covered + resolution unavailable (the other shape of each field).
             Response::DomainCheck(DomainCheckInfo {
@@ -568,6 +575,7 @@ mod tests {
                 resolution: None,
                 enabled: false,
                 vpn_up: false,
+                routing_state: RoutingState::NoDomains,
             }),
         ];
         for response in responses {

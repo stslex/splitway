@@ -175,20 +175,42 @@ fn print_domain_check(info: &splitway_shared::ipc::DomainCheckInfo) {
             Some(domain) => println!("coverage:  covered by the configured domain `{domain}`"),
             None => println!("coverage:  covered"),
         }
-        // Coverage means "configured to route"; whether it routes *right now*
-        // depends on enabled + the VPN being up.
-        if !info.enabled {
-            println!("routing:   configured to route, but rule application is disabled — not routed right now");
-        } else if !info.vpn_up {
-            let iface = if info.vpn_interface.is_empty() {
-                "the VPN".to_string()
-            } else {
-                format!("the VPN ({})", info.vpn_interface)
-            };
-            println!("routing:   configured to route, but {iface} is down — not routed right now");
+        // Coverage means "configured to route"; whether it is routed *right now*
+        // is the daemon's routing_state (its belief about whether usable
+        // split-DNS rules are installed) — not just enabled && vpn_up, which the
+        // VPN-up-but-no-DNS and apply-failed states would falsely read as routed.
+        use splitway_shared::ipc::RoutingState;
+        let iface = if info.vpn_interface.is_empty() {
+            "the VPN".to_string()
         } else {
-            println!("routing:   rule application is enabled and the VPN is up");
-        }
+            format!("the VPN ({})", info.vpn_interface)
+        };
+        let routing = match info.routing_state {
+            RoutingState::Applied => "routed through the VPN's DNS".to_string(),
+            RoutingState::Disabled => {
+                "configured to route, but rule application is disabled — not routed right now"
+                    .to_string()
+            }
+            RoutingState::VpnDown => {
+                format!("configured to route, but {iface} is down — not routed right now")
+            }
+            RoutingState::NoDnsFromVpn => {
+                format!("configured to route, but {iface} is up and pushes no DNS — not routed right now")
+            }
+            RoutingState::ApplyFailed => {
+                "configured to route, but applying the rules failed (out of sync) — not routed right now"
+                    .to_string()
+            }
+            RoutingState::ConfigInvalid => {
+                "the config file on disk is invalid; routing reflects the last-good config".to_string()
+            }
+            // Coverage implies a configured domain exists, so NoDomains is not
+            // expected here; render defensively rather than claim it is routed.
+            RoutingState::NoDomains => {
+                "configured to route, but no domains are configured — not routed right now".to_string()
+            }
+        };
+        println!("routing:   {routing}");
     } else {
         println!("coverage:  NOT covered by any configured domain");
         println!("           add it with:  splitway add {}", info.host);
