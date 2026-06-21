@@ -227,12 +227,109 @@ nix build      # build both binaries into ./result/bin/
 nix develop    # dev shell with cargo, rustc, rustfmt, clippy, rust-analyzer
 ```
 
-The flake also exposes `nixosModules.default`. On a NixOS host, import it and
-set `services.splitway.enable = true;` to install the package and run the daemon
-as a systemd service (`splitway-daemon run`). The service runs as root
-(privileged `resolvectl` changes), gets a `RuntimeDirectory` for its `0600`
-control socket, restarts on failure, and reverts DNS rules on `SIGTERM` so a
-stop never leaves the system half-configured.
+The flake also exposes `nixosModules.default` for installing Splitway as a
+systemd service on a NixOS host — see [Install (NixOS)](#install-nixos) below.
+
+## Install (NixOS)
+
+On NixOS the flake's `nixosModules.default` takes you from zero to a running
+daemon: it installs the package and runs `splitway-daemon run` as a systemd
+service, with no manual `install`/`systemctl enable` steps (contrast the by-hand
+systemd setup in [packaging/](packaging/README.md)).
+
+### Add the flake input
+
+Add Splitway as a flake input and import its NixOS module into the host. The
+input's **default branch is the stable channel**; append `/dev` for the latest
+development channel:
+
+```nix
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    splitway.url = "github:stslex/splitway";      # latest dev channel: github:stslex/splitway/dev
+  };
+
+  outputs = { nixpkgs, splitway, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [
+        splitway.nixosModules.default
+        {
+          services.splitway.enable = true;
+
+          # Prerequisites — the daemon shells out to nmcli + resolvectl,
+          # so the host must provide both:
+          networking.networkmanager.enable = true;
+          services.resolved.enable = true;
+        }
+      ];
+    };
+  };
+}
+```
+
+The module deliberately does **not** pull in NetworkManager or systemd-resolved
+itself — the daemon resolves `nmcli` and `resolvectl` by bare name from the
+host's PATH, so you enable those services yourself (above). Then rebuild:
+
+```sh
+sudo nixos-rebuild switch --flake .#myhost
+```
+
+The service runs as **root** (privileged `resolvectl` changes), gets a `0700`
+`RuntimeDirectory` for its `0600` control socket, restarts on failure, and
+reverts DNS rules on `SIGTERM` so a stop never leaves the system half-configured.
+
+### Where the config lives on NixOS
+
+The NixOS service runs as root and owns a **writable** config at
+**`/var/lib/splitway/config.json`**, provisioned by systemd's `StateDirectory`
+(a `0700` directory owned by the service). This is **not**
+`~/.config/splitway/config.json` — that default applies only to a by-hand
+`splitway-daemon run`. The daemon creates the file empty on first start; on
+upgrade from an older module that ran without `--config`, the module's systemd
+`preStart` seeds it once from a pre-existing `/root/.config/splitway/config.json`
+so an existing `vpn_name`/domains are not silently dropped.
+
+Prefer changing it through the CLI or GUI, which mutate it through the daemon's
+single-writer state actor; a direct `sudo`-edit works too, and external edits are
+picked up live. See [Config](#config) for the field reference (`vpn_name`,
+`vpn_hosts`, `vpn_backend`, `openvpn`).
+
+### Using it under niri (Wayland)
+
+niri is a tiling Wayland compositor with **no system tray**, so Splitway is a
+normal CLI plus an ordinary GUI window.
+
+**CLI** — talks to the root daemon over its root-owned socket, so it needs root:
+
+```sh
+sudo splitway status
+sudo splitway add corp.example.com
+sudo splitway check https://corp.example.com
+sudo splitway verify
+```
+
+**GUI** — with no tray, run `splitway-gui` as a plain window, bound to a niri
+keybind (or launched with `spawn-at-startup`):
+
+```kdl
+# ~/.config/niri/config.kdl
+binds {
+    Mod+Shift+S { spawn "splitway-gui"; }
+}
+```
+
+**Honest caveat — the GUI cannot reach a root daemon unprivileged yet.** The
+control socket is `0600` and root-owned, so `splitway-gui` launched as your
+normal desktop user gets "permission denied" — it surfaces the daemon's own
+guidance and never escalates (see [GUI](#gui)). Running a Wayland GUI as root is
+not a good answer. Until Splitway grows a **group-accessible socket** (a `0660`
+socket owned by a dedicated group you join — a tracked follow-up), the working
+path under niri is the CLI via `sudo`. For why `0600` is the default, see the
+socket threat model in
+[packaging/README.md](packaging/README.md#socket-security-model).
 
 ## Roadmap
 
