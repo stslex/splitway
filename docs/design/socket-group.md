@@ -61,16 +61,26 @@ in-group caller could point `password_file` at a root-only secret (e.g.
 file's first line with root's read privilege. That exceeds the intended grant
 ("control of split-DNS routing").
 
-So when the socket is group-accessible, the `SetConfig` handler **refuses to
-change** those two fields (only *changes* are rejected, so a client that
-round-trips the current values while editing `vpn_name`/backend still works).
-They stay settable by editing the root-owned config file
+So when the socket is group-accessible, the `SetConfig` handler makes the OpenVPN
+backend **root-config-file-only**. It rejects, over the socket:
+
+- **changing** `openvpn.management` or `openvpn.management_password_file`, and
+- **activating** the OpenVPN backend (flipping `vpn_backend` to `OpenVpn` from
+  something else) — even reusing root's existing field values. Activation alone
+  arms the detector, and the configured `management` may be a localhost port a
+  non-root caller can squat while real OpenVPN is down, capturing the configured
+  password file's first line. (Without this, the field lock would be bypassable
+  by reusing leftover root-configured values and just toggling the backend.)
+
+Only genuine changes are rejected, so a client that round-trips the current values
+(e.g. a GUI editing `vpn_name` while OpenVPN stays active) still works. The fields
+and activation stay settable by editing the root-owned config file
 (`/var/lib/splitway/config.json`, `0700` root) — which an in-group user cannot
 write. This is a deliberately blunt instrument: without per-peer identity the
-daemon cannot tell a root caller from an in-group one, so it locks the fields for
-*all* IPC callers while a group is configured. It is removable once per-peer
-`SO_PEERCRED` auth (Phase 8) can authorize the dangerous fields for a root peer
-specifically.
+daemon cannot tell a root caller from an in-group one, so it locks these for *all*
+IPC callers while a group is configured. It is removable once per-peer
+`SO_PEERCRED` auth (Phase 8) can authorize the dangerous operations for a root
+peer specifically.
 
 ### Defense in depth
 

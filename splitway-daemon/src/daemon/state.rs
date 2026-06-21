@@ -1083,25 +1083,34 @@ impl StateMachine {
             Ok(config) => config,
             Err(e) => return config_unreadable_reply(e),
         };
-        // Security: when the socket is group-accessible, the OpenVPN management
-        // endpoint and password-file are not IPC-mutable. The root daemon reads the
-        // password file and sends its first line to the management endpoint (see
-        // the OpenVPN detector), so an in-group (non-root) caller could otherwise
-        // point `password_file` at a root-only secret (e.g. /etc/shadow) and
-        // `management` at a listener they control, exfiltrating the file's first
-        // line. Only *changes* are rejected, so a GUI that round-trips the current
-        // values still works; the fields stay settable by editing the root-owned
-        // config file. (Removable once per-peer SO_PEERCRED auth lands — Phase 8.)
-        if self.socket_group_locked
-            && (view.openvpn_management != next.openvpn.management
-                || view.openvpn_management_password_file != next.openvpn.management_password_file)
-        {
-            return Response::Error(
-                "openvpn.management and openvpn.management_password_file cannot be changed over \
-                 the group-accessible control socket (they make the root daemon read a file and \
-                 connect to an endpoint); edit the root-owned config file to change them"
-                    .to_string(),
-            );
+        // Security: when the socket is group-accessible, the OpenVPN backend is
+        // root-config-file-only. Arming the OpenVPN detector makes the *root*
+        // daemon read `management_password_file` and send its first line to the
+        // `management` endpoint (see the detector). So an in-group (non-root)
+        // caller must not be able to (a) change those fields — else point
+        // `password_file` at a root-only secret (e.g. /etc/shadow) and `management`
+        // at a listener they control — nor (b) *activate* the backend, even reusing
+        // root's existing values: the configured endpoint may be a localhost port
+        // the caller can squat while real OpenVPN is down, capturing the configured
+        // password file's first line. Both are rejected. Only genuine changes are
+        // blocked, so a client that round-trips the current values (e.g. a GUI
+        // editing vpn_name while OpenVPN stays active) still works; the fields and
+        // activation stay settable by editing the root-owned config file.
+        // (Removable once per-peer SO_PEERCRED auth lands — Phase 8.)
+        if self.socket_group_locked {
+            let openvpn_fields_changed = view.openvpn_management != next.openvpn.management
+                || view.openvpn_management_password_file != next.openvpn.management_password_file;
+            let activates_openvpn = view.vpn_backend == config::VpnBackend::OpenVpn
+                && next.vpn_backend != config::VpnBackend::OpenVpn;
+            if openvpn_fields_changed || activates_openvpn {
+                return Response::Error(
+                    "the OpenVPN backend is root-config-file-only while the control socket is \
+                     group-accessible: changing its management endpoint or password file, or \
+                     activating it, makes the root daemon read a file and connect to an endpoint \
+                     — edit the root-owned config file to change them"
+                        .to_string(),
+                );
+            }
         }
         next.vpn_name = view.vpn_name;
         next.vpn_backend = view.vpn_backend;
@@ -2345,6 +2354,40 @@ mod tests {
         assert_eq!(resp, Response::Ok);
         assert_eq!(sm.config.vpn_name, "tun9");
         assert_eq!(sm.config.openvpn.management, "/run/ovpn.sock");
+    }
+
+    #[tokio::test]
+    async fn set_config_over_group_socket_rejects_activating_openvpn_with_existing_fields() {
+        // Even without *changing* the OpenVPN fields, an in-group caller must not
+        // be able to *activate* the backend by flipping vpn_backend to OpenVpn and
+        // reusing root's leftover values: the configured endpoint may be a
+        // localhost port the caller can squat while real OpenVPN is down, so the
+        // root daemon would read the password file and send its first line to them.
+        let backend = Arc::new(MockBackend::default());
+        let mut cfg = config(true, &["a.com"]);
+        // Backend is NetworkManager, but openvpn fields are populated (left over
+        // from a prior OpenVPN setup) — the exact precondition for the attack.
+        cfg.vpn_backend = config::VpnBackend::NetworkManager;
+        cfg.openvpn = config::OpenVpnConfig {
+            management: "127.0.0.1:7505".to_string(),
+            management_password_file: Some("/etc/splitway/mgmt.pass".to_string()),
+        };
+        let mut sm = machine(backend.clone(), cfg, "group-lock-activate");
+        sm.socket_group_locked = true;
+
+        let view = ConfigView {
+            vpn_name: "wg0".to_string(),
+            // Activate OpenVpn while resending the *unchanged* leftover fields.
+            vpn_backend: config::VpnBackend::OpenVpn,
+            openvpn_management: "127.0.0.1:7505".to_string(),
+            openvpn_management_password_file: Some("/etc/splitway/mgmt.pass".to_string()),
+            config_path: String::new(),
+        };
+        let resp = sm.on_request(Request::SetConfig(view)).await;
+
+        // Rejected: activation is blocked even though no field value changed.
+        assert!(matches!(resp, Response::Error(_)), "got: {resp:?}");
+        assert_eq!(sm.config.vpn_backend, config::VpnBackend::NetworkManager);
     }
 
     // --- Phase 5: re-arm decision, routing-state mapping, generation guard ---
