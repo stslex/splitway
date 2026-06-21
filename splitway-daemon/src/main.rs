@@ -32,7 +32,10 @@ mod interfaces;
 fn main() {
     env_logger::init();
     match env::args().parse_command() {
-        Ok(Command::Run { config }) => daemon::run(config),
+        Ok(Command::Run {
+            config,
+            socket_group,
+        }) => daemon::run(config, socket_group),
         Ok(Command::Status) => status(),
         Ok(Command::Revert { config }) => revert(config),
         Err(message) => {

@@ -23,15 +23,22 @@ tokio = { version = "1", features = [
 # enable the cross-platform backends; no extra system dependency is pulled in.
 notify = "6"
 
+# `libc` for the socket-group setup (`--socket-group`): resolve a group name to
+# a gid (`getgrnam_r`) and `chown` the runtime dir + socket to it, without
+# shelling out. The shared `bind_socket` lives in `daemon/ipc.rs`, compiled for
+# every Unix target, so this is a `cfg(unix)` dependency even though only the
+# Linux/systemd deployment sets the flag today. On macOS the same crate also
+# supplies `getifaddrs` for the read-only interface enumeration (`ListInterfaces`);
+# Linux uses `/sys/class/net` instead, so that path needs no `libc`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 # SCDynamicStore VPN/DNS event source. core-foundation is pinned to 0.9 to match
 # system-configuration 0.7's own dependency — 0.10 would resolve to a second,
 # incompatible core_foundation and break the CFArray/CFRunLoop types.
-# libc supplies `getifaddrs` for the read-only interface enumeration
-# (`ListInterfaces`); Linux uses `/sys/class/net` instead, so it needs no dep.
 [target.'cfg(target_os = "macos")'.dependencies]
 system-configuration = "0.7"
 core-foundation = "0.9"
-libc = "0.2"
