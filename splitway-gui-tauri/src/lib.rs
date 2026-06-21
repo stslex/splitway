@@ -8,7 +8,7 @@
 //! the *boundary*: instead of an in-process egui render loop, the view-model
 //! crosses a serialization boundary to a web frontend.
 //!
-//! The read path (this phase is read-only — mutations are Phase 7c):
+//! The read path (Phase 7b):
 //!
 //! 1. A dedicated **poll thread** ([`bridge::poll_loop`]) owns the `GuiCore` and
 //!    the blocking IPC client. Each cycle it drives one whole poll round to
@@ -25,6 +25,16 @@
 //! poll; doing it on the Rust side with full-VM events keeps the frontend a pure
 //! renderer and makes update races benign (last-wins). See `bridge` for the
 //! testable pieces.
+//!
+//! The write path (Phase 7c) keeps the same shape: mutations are command →
+//! daemon → re-poll → event, never command → screen. A mutation command
+//! (`set_enabled` / `add_domain` / `remove_domain` / `set_config` / `reload`)
+//! round-trips the daemon on the blocking pool and returns a per-action `Result`,
+//! then fires the [`bridge::RefreshSignal`] **refresh-now** wake so the poll
+//! thread re-polls immediately — the poll thread stays the *sole* producer of
+//! view-models, so no mutation can write displayed state (the truth contract).
+//! `check_domain` is a one-shot route-check returning its own result; it is never
+//! folded into the VM. See [`docs/design/tauri-mutations.md`](../../docs/design/tauri-mutations.md).
 
 pub mod bridge;
 
@@ -45,18 +55,33 @@ pub fn run() {
     // left to the caller's environment, mirroring the daemon/CLI/egui binaries.
     env_logger::init();
 
+    // The refresh-now channel: mutation commands hold the sender (via the managed
+    // `RefreshSignal`); the poll thread holds the receiver and waits on it between
+    // cycles, so a mutation collapses the action→truth latency to ~one poll cycle.
+    let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<()>();
+
     tauri::Builder::default()
         .manage(bridge::SharedVm::default())
-        .invoke_handler(tauri::generate_handler![bridge::get_view_model])
-        .setup(|app| {
+        .manage(bridge::RefreshSignal::new(refresh_tx))
+        .invoke_handler(tauri::generate_handler![
+            bridge::get_view_model,
+            bridge::set_enabled,
+            bridge::add_domain,
+            bridge::remove_domain,
+            bridge::set_config,
+            bridge::reload,
+            bridge::check_domain,
+        ])
+        .setup(move |app| {
             // Clone the Arc to the shared VM and an AppHandle into the poll
             // thread. AppHandle::clone is cheap (Arc-based); the thread outlives
-            // setup and pushes events for the app's lifetime.
+            // setup and pushes events for the app's lifetime. The refresh receiver
+            // moves in too (the matching sender lives in the managed RefreshSignal).
             let shared = app.state::<bridge::SharedVm>().inner().clone();
             let handle = app.handle().clone();
             std::thread::Builder::new()
                 .name("splitway-gui-poll".to_string())
-                .spawn(move || bridge::poll_loop(handle, shared))
+                .spawn(move || bridge::poll_loop(handle, shared, refresh_rx))
                 .expect("failed to spawn the splitway-gui poll thread");
             Ok(())
         })

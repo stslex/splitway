@@ -107,3 +107,38 @@ export interface ViewModel {
   verify: VerifyView;
   message: MessageView | null;
 }
+
+// --- Command-path types (Phase 7c) ------------------------------------------
+//
+// These are NOT part of the polled view-model — they are the return type of the
+// one-shot `check_domain` command. A parameterized query result is not ambient
+// config truth, so it is never folded into `ViewModel` (see
+// docs/design/tauri-mutations.md). Mirrors `splitway_gui_core::CheckOutcome` and
+// the `splitway_shared::ipc::DomainCheckInfo` it embeds; the gui-core
+// `check_outcome_serializes_internally_tagged_on_state` test locks the Rust shape.
+
+// The live-resolution result for one host (best-effort attribution).
+export interface ResolutionInfo {
+  addresses: string[];
+  via_interface: string | null;
+  via_dns: string | null;
+}
+
+// The daemon's route-check: coverage + best-effort live resolution. Reports
+// which resolver answered, NOT reachability (Splitway governs DNS, not IP routing).
+export interface DomainCheckInfo {
+  host: string;
+  covered: boolean;
+  matched_domain: string | null;
+  vpn_interface: string;
+  resolution: ResolutionInfo | null;
+  enabled: boolean;
+  vpn_up: boolean;
+  routing_state: RoutingState;
+}
+
+// CheckOutcome: internally tagged on "state" (a gui-core type we control), like
+// VerifyView. `Checked` carries the daemon result; `Error` carries a reason.
+export type CheckOutcome =
+  | { state: "Checked"; result: DomainCheckInfo }
+  | { state: "Error"; message: string };

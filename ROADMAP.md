@@ -193,8 +193,18 @@ reimplemented per frontend:
   landed ahead of it as the opt-in socket group (`--socket-group` /
   `services.splitway.unprivilegedGui`); see
   [`docs/design/socket-group.md`](docs/design/socket-group.md).
-- **7c — mutations through the contract**: enable/disable, domain add/remove, and
-  config save driven through `GuiCore`'s intents.
+- **7c — mutations through the contract** (done): the Tauri GUI mutates
+  config/routing at parity with the daemon's existing write verbs
+  (enable/disable, domain add/remove, config save, resync) plus the interactive
+  `CheckDomain` one-shot — all **daemon-first, no optimistic UI**. A mutation
+  command round-trips the daemon off the poll thread and fires a **refresh-now**
+  wake; the poll thread stays the *sole* producer of view-models, so the change
+  reaches the screen only via `view-model-changed` (the truth contract, enforced
+  by construction). Pending/error/check are a distinct frontend request-lifecycle
+  store. Frozen-on-malformed mutations are rejected with an on-disk-fix message
+  and the frozen state is shown prominently. No protocol change (the verbs already
+  exist at v6); egui stays a read/write reference, untouched. See
+  [`docs/design/tauri-mutations.md`](design/tauri-mutations.md).
 - **7d — visual design + window behavior + bundling**: the full-window layout,
   Wayland/niri window behavior, and packaging.
 

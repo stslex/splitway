@@ -102,3 +102,87 @@ ul.interfaces {
 .message-Error {
   background: color-mix(in srgb, #c83c3c 18%, transparent);
 }
+
+/* --- interactive controls (Phase 7c) --- */
+
+.control {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-top: 0.4rem;
+  flex-wrap: wrap;
+}
+
+input[type="text"],
+select {
+  font: inherit;
+  padding: 0.25rem 0.4rem;
+  border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, currentColor 4%, transparent);
+  color: inherit;
+}
+
+.control input[type="text"] {
+  flex: 1;
+  min-width: 12rem;
+}
+
+.row .value input[type="text"] {
+  width: 100%;
+}
+
+button {
+  font: inherit;
+  padding: 0.25rem 0.7rem;
+  border: 1px solid color-mix(in srgb, currentColor 35%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  color: inherit;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: color-mix(in srgb, currentColor 16%, transparent);
+}
+
+button:disabled,
+input:disabled,
+select:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button.remove {
+  padding: 0 0.4rem;
+  line-height: 1.4;
+}
+
+ul.domains li {
+  margin-bottom: 0.2rem;
+}
+
+/* A per-action error sits tight under its control, distinct from the VM's own
+   transient message. */
+.action-error {
+  margin: 0.3rem 0 0;
+  font-size: 0.9rem;
+}
+
+.check-result {
+  margin-top: 0.5rem;
+}
+
+.footnote {
+  font-size: 0.85rem;
+  margin-top: 0.4rem;
+}
+
+/* The frozen-on-malformed banner: prominent, since every mutation is rejected
+   until the config is fixed on disk. */
+.frozen-banner {
+  padding: 0.5rem 0.7rem;
+  border-radius: 4px;
+  background: color-mix(in srgb, #c83c3c 22%, transparent);
+  border: 1px solid color-mix(in srgb, #c83c3c 45%, transparent);
+}
