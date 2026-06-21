@@ -98,6 +98,9 @@ async fn run_async(config: LocalConfig, config_path: PathBuf, socket_group: Opti
         config,
         config_store,
         state_tx.clone(),
+        // A group-accessible socket (--socket-group) locks the file-reading
+        // OpenVPN config fields against IPC mutation; see `StateMachine`.
+        socket_group.is_some(),
     );
     // `run_state` arms the watch before entering its command loop. That happens
     // here — after the socket bind and signal handlers above (so a fatal startup

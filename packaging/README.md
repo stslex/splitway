@@ -67,7 +67,11 @@ unchanged (`0600`, root-only).
 > privileged split-DNS operations (`resolvectl`/`nmcli`) — adding a user to the
 > group ≈ granting them control of system split-DNS routing. That is why it is
 > **not** the default and the group is empty until you opt in. (Stronger per-peer
-> authentication via `SO_PEERCRED` is a later phase.) See
+> authentication via `SO_PEERCRED` is a later phase.) To keep the grant *to that*
+> and no more, while a socket group is configured the daemon refuses to change the
+> file-reading OpenVPN fields (`openvpn.management` / `…password_file`) over IPC —
+> they make the root daemon read a file and connect to an endpoint, so they stay
+> root-config-file-only. See
 > [docs/design/socket-group.md](../docs/design/socket-group.md).
 
 `SIGTERM` (systemd stop / `kill`) makes the daemon revert active DNS rules
