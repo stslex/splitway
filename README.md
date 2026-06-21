@@ -202,7 +202,9 @@ Reachability matches the CLI: it tries the per-user socket
 Linux, `/var/run/splitway` on macOS), so a login-session GUI can reach a system
 daemon. If the daemon runs as root with its default `0600` socket, an
 unprivileged GUI sees "permission denied" and shows the daemon's own guidance
-(run as the daemon's user/group) — it never escalates. A daemon that is not
+(run as the daemon's user/group) — it never escalates. To let it connect as your
+normal user, enable the opt-in socket group (see
+[Using it under niri](#using-it-under-niri-wayland)). A daemon that is not
 running shows a non-fatal banner and the GUI recovers on the next poll once it
 is back.
 
@@ -321,15 +323,35 @@ binds {
 }
 ```
 
-**Honest caveat — the GUI cannot reach a root daemon unprivileged yet.** The
-control socket is `0600` and root-owned, so `splitway-gui` launched as your
-normal desktop user gets "permission denied" — it surfaces the daemon's own
-guidance and never escalates (see [GUI](#gui)). Running a Wayland GUI as root is
-not a good answer. Until Splitway grows a **group-accessible socket** (a `0660`
-socket owned by a dedicated group you join — a tracked follow-up), the working
-path under niri is the CLI via `sudo`. For why `0600` is the default, see the
-socket threat model in
-[packaging/README.md](packaging/README.md#socket-security-model).
+**Unprivileged access (opt-in).** By default the control socket is `0600` and
+root-owned, so a CLI or GUI launched as your normal desktop user gets "permission
+denied" — it surfaces the daemon's own guidance and never escalates (see
+[GUI](#gui)) — and the working path is the CLI via `sudo` above. Running a Wayland
+GUI as root is not a good answer, so the daemon supports an **opt-in
+group-accessible socket**: a `0660` socket owned by a dedicated group, inside a
+`0750 root:<group>` runtime dir, that you join to connect without `sudo`. On NixOS
+enable it via the module:
+
+```nix
+services.splitway = {
+  enable = true;
+  unprivilegedGui = {
+    enable = true;
+    users = [ "your-username" ];   # added to the "splitway" group
+  };
+};
+```
+
+After a rebuild, `splitway status` and `splitway-gui` work as your normal user —
+no `sudo`. (Other init systems: add `--socket-group splitway` to the daemon's
+`ExecStart`, set the runtime dir to `0750`, and create + join the group; see
+[packaging/README.md](packaging/README.md#socket-security-model).)
+
+> **Security note.** Membership in this group grants the ability to drive the
+> daemon's privileged split-DNS operations — **adding a user to the group ≈
+> granting them control of system split-DNS routing.** That is why it is opt-in
+> and the group is empty by default. For why `0600` is the default, and the full
+> threat model, see [packaging/README.md](packaging/README.md#socket-security-model).
 
 ## Roadmap
 

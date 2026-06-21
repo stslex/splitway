@@ -17,6 +17,13 @@
         "aarch64-linux"
         "aarch64-darwin"
       ];
+      # The nixosTest (socket-group) is a Linux-only VM build; darwin cannot run
+      # it. Kept separate from `systems` so the test attrset is only defined where
+      # it can evaluate/build.
+      linuxSystems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
       pkgsFor = system: nixpkgs.legacyPackages.${system};
 
@@ -112,6 +119,24 @@
       checks = forAllSystems (system: {
         package = self.packages.${system}.default;
       });
+
+      # The socket-group nixosTest lives under `legacyPackages` (not `checks`) on
+      # purpose: it boots a VM and so needs /dev/kvm, which GitHub's default CI
+      # runners do not reliably expose. `nix flake check` does not build
+      # `legacyPackages`, so keeping it here keeps CI green while leaving the test
+      # runnable locally (the author daily-drives NixOS, where KVM is available):
+      #   nix build .#legacyPackages.x86_64-linux.tests.socketGroup -L
+      # See docs/design/socket-group.md for why this is the "real proof" of the
+      # in-group-connect / out-of-group-denied contract.
+      legacyPackages = nixpkgs.lib.genAttrs linuxSystems (
+        system:
+        let
+          pkgs = pkgsFor system;
+        in
+        {
+          tests.socketGroup = import ./nix/tests/socket-group.nix { inherit self pkgs; };
+        }
+      );
 
       nixosModules.default = import ./nix/module.nix self;
     };

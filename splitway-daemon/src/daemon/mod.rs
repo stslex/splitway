@@ -27,7 +27,13 @@ use state::{
 /// `--config <PATH>` override; `None` uses the default config location. The
 /// resolved path is the daemon's active config file for its whole lifetime —
 /// the file `GetConfig`/`SetConfig` read and write.
-pub fn run(config_path: Option<PathBuf>) {
+///
+/// `socket_group` is the optional `--socket-group <NAME>` (set by the systemd
+/// unit for the unprivileged-GUI deployment): when present, the control socket
+/// and its runtime dir are owned by that group (`0660`/`0750`) so an in-group
+/// user can connect without `sudo`. It is a deployment concern, not routing
+/// state, so it is a CLI flag rather than a field of the live-watched config.
+pub fn run(config_path: Option<PathBuf>, socket_group: Option<String>) {
     let config_path = config_path.unwrap_or_else(config::config_file_path);
     let config = load_or_init_config(&config_path);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -40,10 +46,10 @@ pub fn run(config_path: Option<PathBuf>) {
             exit(1);
         }
     };
-    runtime.block_on(run_async(config, config_path));
+    runtime.block_on(run_async(config, config_path, socket_group));
 }
 
-async fn run_async(config: LocalConfig, config_path: PathBuf) {
+async fn run_async(config: LocalConfig, config_path: PathBuf, socket_group: Option<String>) {
     // Captured for the startup log only; the watch lifecycle (including the
     // empty-vpn_name case) is owned by the state machine's `arm_watch`.
     let interface = config.vpn_name.clone();
@@ -58,7 +64,7 @@ async fn run_async(config: LocalConfig, config_path: PathBuf) {
     // strand those rules with no daemon left to revert them. Serving the bound
     // socket is deferred until `state_tx` exists (below).
     let socket = socket_path();
-    let listener = match ipc::bind_socket(&socket) {
+    let listener = match ipc::bind_socket(&socket, socket_group.as_deref()) {
         Ok(listener) => listener,
         Err(e) => {
             log::error!("failed to bind IPC socket {}: {e}", socket.display());
@@ -92,6 +98,9 @@ async fn run_async(config: LocalConfig, config_path: PathBuf) {
         config,
         config_store,
         state_tx.clone(),
+        // A group-accessible socket (--socket-group) locks the file-reading
+        // OpenVPN config fields against IPC mutation; see `StateMachine`.
+        socket_group.is_some(),
     );
     // `run_state` arms the watch before entering its command loop. That happens
     // here — after the socket bind and signal handlers above (so a fatal startup

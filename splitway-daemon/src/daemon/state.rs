@@ -169,6 +169,16 @@ pub struct StateMachine {
     /// The only path the actor reads or writes the config through. Injected for
     /// testability (see [`ConfigStore`]).
     config_store: Arc<dyn ConfigStore>,
+    /// Set when the control socket is group-accessible (`--socket-group`). It
+    /// makes the IPC `SetConfig` path refuse to *change* the OpenVPN management
+    /// endpoint and password-file fields. Those make the **root** daemon read a
+    /// config-named file and send its first line to a config-named endpoint, so
+    /// leaving them IPC-mutable would let a non-root in-group caller point
+    /// `password_file` at a root-only secret (e.g. `/etc/shadow`) and `management`
+    /// at a listener they control, exfiltrating the file's first line. They stay
+    /// settable only by editing the root-owned config file. (A blunt instrument
+    /// until per-peer `SO_PEERCRED` auth can tell a root caller apart — Phase 8.)
+    socket_group_locked: bool,
     /// Set when the last load (an RMW read or a watcher reload) failed to parse,
     /// so the daemon froze on the last-good `config`. Drives the
     /// highest-precedence [`RoutingState::ConfigInvalid`]; cleared on the next
@@ -213,6 +223,7 @@ impl StateMachine {
         config: LocalConfig,
         config_store: Arc<dyn ConfigStore>,
         state_tx: mpsc::Sender<StateCommand>,
+        socket_group_locked: bool,
     ) -> Self {
         Self {
             backend,
@@ -220,6 +231,7 @@ impl StateMachine {
             state_tx,
             config,
             config_store,
+            socket_group_locked,
             config_invalid: false,
             vpn_up: false,
             last_info: None,
@@ -1071,6 +1083,35 @@ impl StateMachine {
             Ok(config) => config,
             Err(e) => return config_unreadable_reply(e),
         };
+        // Security: when the socket is group-accessible, the OpenVPN backend is
+        // root-config-file-only. Arming the OpenVPN detector makes the *root*
+        // daemon read `management_password_file` and send its first line to the
+        // `management` endpoint (see the detector). So an in-group (non-root)
+        // caller must not be able to (a) change those fields — else point
+        // `password_file` at a root-only secret (e.g. /etc/shadow) and `management`
+        // at a listener they control — nor (b) *activate* the backend, even reusing
+        // root's existing values: the configured endpoint may be a localhost port
+        // the caller can squat while real OpenVPN is down, capturing the configured
+        // password file's first line. Both are rejected. Only genuine changes are
+        // blocked, so a client that round-trips the current values (e.g. a GUI
+        // editing vpn_name while OpenVPN stays active) still works; the fields and
+        // activation stay settable by editing the root-owned config file.
+        // (Removable once per-peer SO_PEERCRED auth lands — Phase 8.)
+        if self.socket_group_locked {
+            let openvpn_fields_changed = view.openvpn_management != next.openvpn.management
+                || view.openvpn_management_password_file != next.openvpn.management_password_file;
+            let activates_openvpn = view.vpn_backend == config::VpnBackend::OpenVpn
+                && next.vpn_backend != config::VpnBackend::OpenVpn;
+            if openvpn_fields_changed || activates_openvpn {
+                return Response::Error(
+                    "the OpenVPN backend is root-config-file-only while the control socket is \
+                     group-accessible: changing its management endpoint or password file, or \
+                     activating it, makes the root daemon read a file and connect to an endpoint \
+                     — edit the root-owned config file to change them"
+                        .to_string(),
+                );
+            }
+        }
         next.vpn_name = view.vpn_name;
         next.vpn_backend = view.vpn_backend;
         next.openvpn = OpenVpnConfig {
@@ -1638,7 +1679,14 @@ mod tests {
         cfg: LocalConfig,
     ) -> StateMachine {
         let (state_tx, _state_rx) = mpsc::channel(16);
-        StateMachine::new(backend, Arc::new(NoopDetectorFactory), cfg, store, state_tx)
+        StateMachine::new(
+            backend,
+            Arc::new(NoopDetectorFactory),
+            cfg,
+            store,
+            state_tx,
+            false,
+        )
     }
 
     fn config(enabled: bool, hosts: &[&str]) -> LocalConfig {
@@ -1664,7 +1712,14 @@ mod tests {
         // dropped. The Noop factory never produces events anyway.
         let (state_tx, _state_rx) = mpsc::channel(16);
         let store = file_store(tag, &cfg);
-        StateMachine::new(backend, Arc::new(NoopDetectorFactory), cfg, store, state_tx)
+        StateMachine::new(
+            backend,
+            Arc::new(NoopDetectorFactory),
+            cfg,
+            store,
+            state_tx,
+            false,
+        )
     }
 
     /// Build a machine wired to a [`MockDetectorFactory`], keeping the command
@@ -1679,7 +1734,7 @@ mod tests {
         let (state_tx, state_rx) = mpsc::channel(16);
         let factory = Arc::new(MockDetectorFactory { shared });
         let store = file_store(tag, &cfg);
-        let sm = StateMachine::new(backend, factory, cfg, store, state_tx);
+        let sm = StateMachine::new(backend, factory, cfg, store, state_tx, false);
         (sm, state_rx)
     }
 
@@ -2239,6 +2294,100 @@ mod tests {
         assert!(matches!(resp, Response::Error(_)));
         assert_eq!(sm.config.vpn_backend, config::VpnBackend::NetworkManager);
         assert!(sm.config.openvpn.management.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_config_over_group_socket_rejects_openvpn_file_field_changes() {
+        // With a group-accessible socket, a non-root in-group caller must not be
+        // able to repoint the OpenVPN management endpoint or password file: the
+        // root daemon reads that file and sends its first line to that endpoint,
+        // so allowing it would be an arbitrary-root-file exfiltration primitive
+        // (point password_file at /etc/shadow + management at one's own listener).
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "group-lock-reject",
+        );
+        sm.socket_group_locked = true;
+
+        let view = ConfigView {
+            vpn_name: "tun0".to_string(),
+            vpn_backend: config::VpnBackend::OpenVpn,
+            openvpn_management: "/tmp/attacker.sock".to_string(),
+            openvpn_management_password_file: Some("/etc/shadow".to_string()),
+            config_path: String::new(),
+        };
+        let resp = sm.on_request(Request::SetConfig(view)).await;
+
+        // Rejected before commit: nothing adopted, nothing persisted.
+        assert!(matches!(resp, Response::Error(_)), "got: {resp:?}");
+        assert_eq!(sm.config.vpn_backend, config::VpnBackend::NetworkManager);
+        assert!(sm.config.openvpn.management.is_empty());
+        assert!(sm.config.openvpn.management_password_file.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_config_over_group_socket_allows_unchanged_openvpn_fields() {
+        // The lock rejects only *changes* to those fields, so a client that
+        // round-trips the current values (while editing vpn_name) still works.
+        let backend = Arc::new(MockBackend::default());
+        let mut cfg = config(true, &["a.com"]);
+        cfg.vpn_backend = config::VpnBackend::OpenVpn;
+        cfg.openvpn = config::OpenVpnConfig {
+            management: "/run/ovpn.sock".to_string(),
+            management_password_file: Some("/etc/splitway/mgmt.pass".to_string()),
+        };
+        let mut sm = machine(backend.clone(), cfg, "group-lock-allow");
+        sm.socket_group_locked = true;
+
+        let view = ConfigView {
+            vpn_name: "tun9".to_string(),
+            vpn_backend: config::VpnBackend::OpenVpn,
+            // The OpenVPN fields are resent unchanged; only vpn_name differs.
+            openvpn_management: "/run/ovpn.sock".to_string(),
+            openvpn_management_password_file: Some("/etc/splitway/mgmt.pass".to_string()),
+            config_path: String::new(),
+        };
+        let resp = sm.on_request(Request::SetConfig(view)).await;
+
+        assert_eq!(resp, Response::Ok);
+        assert_eq!(sm.config.vpn_name, "tun9");
+        assert_eq!(sm.config.openvpn.management, "/run/ovpn.sock");
+    }
+
+    #[tokio::test]
+    async fn set_config_over_group_socket_rejects_activating_openvpn_with_existing_fields() {
+        // Even without *changing* the OpenVPN fields, an in-group caller must not
+        // be able to *activate* the backend by flipping vpn_backend to OpenVpn and
+        // reusing root's leftover values: the configured endpoint may be a
+        // localhost port the caller can squat while real OpenVPN is down, so the
+        // root daemon would read the password file and send its first line to them.
+        let backend = Arc::new(MockBackend::default());
+        let mut cfg = config(true, &["a.com"]);
+        // Backend is NetworkManager, but openvpn fields are populated (left over
+        // from a prior OpenVPN setup) — the exact precondition for the attack.
+        cfg.vpn_backend = config::VpnBackend::NetworkManager;
+        cfg.openvpn = config::OpenVpnConfig {
+            management: "127.0.0.1:7505".to_string(),
+            management_password_file: Some("/etc/splitway/mgmt.pass".to_string()),
+        };
+        let mut sm = machine(backend.clone(), cfg, "group-lock-activate");
+        sm.socket_group_locked = true;
+
+        let view = ConfigView {
+            vpn_name: "wg0".to_string(),
+            // Activate OpenVpn while resending the *unchanged* leftover fields.
+            vpn_backend: config::VpnBackend::OpenVpn,
+            openvpn_management: "127.0.0.1:7505".to_string(),
+            openvpn_management_password_file: Some("/etc/splitway/mgmt.pass".to_string()),
+            config_path: String::new(),
+        };
+        let resp = sm.on_request(Request::SetConfig(view)).await;
+
+        // Rejected: activation is blocked even though no field value changed.
+        assert!(matches!(resp, Response::Error(_)), "got: {resp:?}");
+        assert_eq!(sm.config.vpn_backend, config::VpnBackend::NetworkManager);
     }
 
     // --- Phase 5: re-arm decision, routing-state mapping, generation guard ---
