@@ -173,6 +173,21 @@ compositors) have **no system tray**, and the simultaneous-multi-VPN north-star
 (see [Later](#later)) scales in a windowed / sidebar layout. The GUI must be
 Wayland-native (egui and Tauri both are).
 
+Decomposed into one-PR sub-phases so the truth contract is shared, not
+reimplemented per frontend:
+
+- **7a — `splitway-gui-core`** (done): extract the framework-agnostic GUI logic
+  (the pure view-model **and** the truth-contract orchestration) into a crate
+  depending on `splitway-shared` only, so both egui and the future Tauri backend
+  drive one `GuiCore`. See [`docs/design/gui-core-extraction.md`](design/gui-core-extraction.md).
+- **7b — Tauri shell + read-only view**: the backend hosts `GuiCore`; a thin web
+  frontend renders the pushed view-model. The web-framework choice is a 7b,
+  low-stakes decision (the frontend is a thin renderer; the logic stays in Rust).
+- **7c — mutations through the contract**: enable/disable, domain add/remove, and
+  config save driven through `GuiCore`'s intents.
+- **7d — visual design + window behavior + bundling**: the full-window layout,
+  Wayland/niri window behavior, and packaging.
+
 ### Phase 8 — feature freeze + hardening
 
 Fix issues surfaced while designing the earlier phases and correct decisions that

@@ -2980,6 +2980,14 @@ dependencies = [
  "env_logger",
  "log",
  "rfd",
+ "splitway-gui-core",
+ "splitway-shared",
+]
+
+[[package]]
+name = "splitway-gui-core"
+version = "0.0.1"
+dependencies = [
  "splitway-shared",
 ]
 

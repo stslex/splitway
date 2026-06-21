@@ -13,6 +13,9 @@ path = "src/main.rs"
 # matches how `splitway-cli` / `splitway-daemon` guard their Unix-only paths.
 [target.'cfg(unix)'.dependencies]
 splitway-shared = { path = "../splitway-shared" }
+# All the truth-contract state + view-model logic lives here, framework-agnostic
+# and unit-tested; this crate is now egui rendering + socket plumbing only.
+splitway-gui-core = { path = "../splitway-gui-core" }
 # Pin the lighter glow (OpenGL) renderer instead of the default wgpu/Vulkan
 # backend: fewer native deps to install in CI (just GL + windowing) and it
 # matches the roadmap's "fastest to ship" intent.

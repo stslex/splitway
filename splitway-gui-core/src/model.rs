@@ -1,8 +1,10 @@
-//! Pure view-model logic for the GUI: it turns daemon replies and client
-//! errors into what the widgets display, and validates user input before a
-//! request is sent. No egui, no IPC, no threads live here, so it is unit-tested
-//! in isolation — mirroring the repo's split of pure logic (tested) from thin
-//! plumbing (`app.rs`/`worker.rs`, untested).
+//! Pure view-model helpers for the GUI: they turn daemon replies and client
+//! errors into what the widgets display, and validate user input before a
+//! request is sent. No egui, no IPC, no threads live here, so they are
+//! unit-tested in isolation. Stateless functions only — the stateful
+//! orchestration that drives them (the truth contract) lives alongside in
+//! [`crate::GuiCore`]; the egui rendering + socket plumbing that consume both
+//! live in the separate `splitway-gui` crate.
 
 use splitway_shared::config::VpnBackend;
 use splitway_shared::ipc::client::ClientError;

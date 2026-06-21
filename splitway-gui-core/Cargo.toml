@@ -1,0 +1,14 @@
+[package]
+name = "splitway-gui-core"
+version = "0.0.1"
+edition = "2021"
+
+# Framework-agnostic GUI logic: the view-model and the truth-contract
+# orchestration (connection state, reconnect-edge refetch, reply folding,
+# unsaved-edit preservation) that every client driving the daemon socket shares.
+# It depends on `splitway-shared` ONLY — deliberately no egui/eframe and no
+# Tauri, so both the interim egui harness and the future Tauri backend can drive
+# the same core and the truth contract is implemented once. Keep this boundary
+# clean: a `cargo tree -p splitway-gui-core` must not show egui.
+[dependencies]
+splitway-shared = { path = "../splitway-shared" }
