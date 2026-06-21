@@ -411,14 +411,16 @@ impl GuiCore {
                     // so a later reconnect/poll refresh can adopt any daemon-side
                     // normalization without it being seen as an edit.
                     //
-                    // TODO(7c): latent edge, faithfully preserved from the
+                    // Latent edge (egui path only), faithfully preserved from the
                     // pre-refactor app.rs — this snapshots the *live* buffers at
                     // reply time, so edits made between clicking Save and the reply
                     // landing are silently marked "synced" and a later refresh
-                    // won't restore the daemon's value over them. Out of scope for
-                    // this pure refactor; when 7c reworks mutations, snapshot the
-                    // `ConfigView` that was actually sent rather than re-reading the
-                    // live buffers.
+                    // won't restore the daemon's value over them. 7c did not rework
+                    // this fold: the Tauri command path (docs/design/tauri-mutations.md)
+                    // sidesteps the edge instead — it disables the editor while a
+                    // save is in flight and re-adopts the daemon's value on the next
+                    // VM event. A future egui fix would snapshot the `ConfigView`
+                    // actually sent rather than re-reading the live buffers.
                     self.loaded = Some(self.current_snapshot());
                 }
             }

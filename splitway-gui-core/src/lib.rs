@@ -7,6 +7,11 @@
 //! - [`model`] — the pure view-model helpers: classify a client error, reduce a
 //!   `Status` round-trip to a connection banner, validate user input, build the
 //!   interface picker. Stateless functions, unit-tested in isolation.
+//! - [`command`] — the command-response mutation path for a request/response
+//!   frontend (the Tauri shell): [`run_mutation`] issues one of the daemon's
+//!   existing write verbs ([`Mutation`]) and returns a per-action `Result`;
+//!   [`run_check`] issues the one-shot route-check and returns a [`CheckOutcome`].
+//!   Stateless, so a mutation/query result can never become displayed state.
 //! - [`GuiCore`] — the stateful orchestration that implements the **GUI mutation
 //!   truth contract** (`docs/architecture.md` §2) once, for all frontends:
 //!   connection state plus the (re)connection-edge refetch policy, reply folding
@@ -30,12 +35,16 @@
 //! this crate (as empty), mirroring how `splitway-gui` guards its egui stack.
 
 #[cfg(unix)]
+pub mod command;
+#[cfg(unix)]
 pub mod model;
 #[cfg(unix)]
 pub mod snapshot;
 #[cfg(unix)]
 mod state;
 
+#[cfg(unix)]
+pub use command::{run_check, run_mutation, CheckOutcome, Mutation};
 #[cfg(unix)]
 pub use snapshot::{ConfigFields, MessageView, VerifyView, ViewModelSnapshot};
 #[cfg(unix)]

@@ -1,7 +1,7 @@
-//! The Tauri ↔ `GuiCore` bridge: the testable pieces of the read path.
+//! The Tauri ↔ `GuiCore` bridge: the testable pieces of the read **and** write
+//! paths.
 //!
-//! Three things live here, kept free of Tauri-runtime coupling so they unit-test
-//! without spinning up a webview:
+//! Read path (7b) — these unit-test without spinning up a webview:
 //!
 //! - [`SharedVm`] — the current [`ViewModelSnapshot`] behind a mutex, shared
 //!   between the poll thread (writer) and the [`get_view_model`] command (reader).
@@ -11,20 +11,43 @@
 //! - [`should_emit`] — the emit-on-change decision (full-VM, last-wins; never
 //!   deltas), so identical snapshots do not spam the frontend with events.
 //!
-//! [`poll_loop`] composes them with the actual socket client, the `AppHandle`
-//! event push, and the timer — that wiring is thin and, like the egui worker, is
-//! not unit-tested (it has no decision logic).
+//! Write path (7c) — mutations are daemon-first with **no optimistic UI**, and
+//! the truth-contract invariant is enforced *by construction*: the poll thread is
+//! the **only** producer of view-models, and a mutation/query command has no
+//! access to the `GuiCore` or the [`SharedVm`] at all (it only round-trips the
+//! daemon). So a mutation can never write displayed state — that changes solely
+//! when the poll thread re-polls and emits.
+//!
+//! - [`RefreshSignal`] — the **refresh-now** trigger. A successful (or failed)
+//!   mutation fires it; the poll thread waits on it with a timeout, so the action
+//!   → truth latency collapses to ~one poll cycle instead of up to [`POLL_INTERVAL`].
+//! - [`run_mutation_and_refresh`] — run one mutating round-trip via
+//!   `splitway_gui_core::run_mutation`, then fire refresh-now. Returns the
+//!   per-action `Result` for the frontend's request-lifecycle store. Unit-tested
+//!   with a fake daemon + a fake refresh sink.
+//! - The `#[tauri::command]` wrappers ([`set_enabled`], [`add_domain`],
+//!   [`remove_domain`], [`set_config`], [`reload`], [`check_domain`]) run the
+//!   blocking round-trip on the async runtime's blocking pool so the webview's
+//!   main thread never stalls. [`check_domain`] is the one-shot route-check; it
+//!   does **not** refresh (a query result is not VM truth).
+//!
+//! [`poll_loop`] composes the read-path helpers with the actual socket client,
+//! the `AppHandle` event push, and the refresh-now wait — that wiring is thin
+//! and, like the egui worker, is not unit-tested (it has no decision logic).
 
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, State};
 
+use splitway_shared::config::VpnBackend;
 use splitway_shared::ipc::client::{self, ClientError};
-use splitway_shared::ipc::{Request, Response};
+use splitway_shared::ipc::{ConfigView, Request, Response};
 
-use splitway_gui_core::{GuiCore, ViewModelSnapshot};
+use splitway_gui_core::{
+    run_check, run_mutation, CheckOutcome, GuiCore, Mutation, ViewModelSnapshot,
+};
 
 /// The event name carrying a full view-model snapshot to the frontend. Lowercase
 /// with a dash, per Tauri's event-name charset (`[a-z0-9-/:_]`); the frontend
@@ -75,6 +98,159 @@ pub fn get_view_model(state: State<'_, SharedVm>) -> ViewModelSnapshot {
     state.current()
 }
 
+// --- write path: refresh-now + mutation/check commands ------------------
+
+/// The **refresh-now** trigger: a wake the poll thread waits on (with a timeout)
+/// so a mutation's effect appears within ~one poll cycle instead of up to
+/// [`POLL_INTERVAL`]. gui-core decides *what* a refresh fetches (`GuiCore::poll`);
+/// this decides *when* — the same "core decides what, driver decides when" split
+/// the read path uses, here driven by a mutation rather than the timer.
+///
+/// A cheap-to-clone handle (Tauri-managed; cloned into each command). The `Mutex`
+/// makes it `Sync` for Tauri state and serializes the (trivial) sends. `fire` is
+/// best-effort: a closed channel (poll thread gone / app shutting down) is ignored.
+#[derive(Clone)]
+pub struct RefreshSignal {
+    tx: Arc<Mutex<Sender<()>>>,
+}
+
+impl RefreshSignal {
+    /// Build a signal over `tx`; the poll thread holds the matching `Receiver`.
+    pub fn new(tx: Sender<()>) -> Self {
+        RefreshSignal {
+            tx: Arc::new(Mutex::new(tx)),
+        }
+    }
+
+    /// Request an immediate poll cycle. Best-effort and never blocks meaningfully
+    /// (the channel is unbounded); a send error means the poll thread is gone.
+    pub fn fire(&self) {
+        let _ = self.tx.lock().unwrap_or_else(|e| e.into_inner()).send(());
+    }
+}
+
+/// The editable config a `set_config` command carries from the frontend — the
+/// wire-facing half of [`ConfigView`] minus the daemon-owned `config_path` (fixed
+/// at launch, ignored on write). Deserialized from the single `view` command arg.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ConfigInput {
+    pub vpn_name: String,
+    pub vpn_backend: VpnBackend,
+    pub openvpn_management: String,
+    pub openvpn_management_password_file: Option<String>,
+}
+
+impl From<ConfigInput> for ConfigView {
+    fn from(input: ConfigInput) -> ConfigView {
+        ConfigView {
+            vpn_name: input.vpn_name,
+            vpn_backend: input.vpn_backend,
+            openvpn_management: input.openvpn_management,
+            openvpn_management_password_file: input.openvpn_management_password_file,
+            // The daemon ignores this on SetConfig (the active path is fixed at
+            // launch); send empty rather than echoing a value the GUI must not set.
+            config_path: String::new(),
+        }
+    }
+}
+
+/// Run one mutating round-trip and fire refresh-now, returning the per-action
+/// `Result` for the frontend's lifecycle store. The truth contract holds because
+/// this touches **no** view-model: it round-trips the daemon, then asks the poll
+/// thread to re-poll — the VM (not this command) carries the new truth.
+///
+/// Refresh-now fires on *every* outcome, not only `Ok`: a rejected write may
+/// still have reconciled daemon state (e.g. a duplicate-add that adopts a
+/// concurrent external edit), and a transport failure must move the VM to the
+/// disconnected variant. [`should_emit`] dedups a genuine no-op, so an extra poll
+/// is harmless.
+pub fn run_mutation_and_refresh<F>(
+    mutation: Mutation,
+    send: F,
+    refresh: &RefreshSignal,
+) -> Result<(), String>
+where
+    F: FnOnce(Request) -> Result<Response, ClientError>,
+{
+    let result = run_mutation(mutation, send);
+    refresh.fire();
+    result
+}
+
+/// Map `enabled` to the enable/disable verb and run it daemon-first.
+#[tauri::command]
+pub async fn set_enabled(enabled: bool, refresh: State<'_, RefreshSignal>) -> Result<(), String> {
+    let mutation = if enabled {
+        Mutation::Enable
+    } else {
+        Mutation::Disable
+    };
+    dispatch_mutation(mutation, refresh.inner().clone()).await
+}
+
+/// Add a routing domain (the daemon normalizes + validates the raw input).
+#[tauri::command]
+pub async fn add_domain(domain: String, refresh: State<'_, RefreshSignal>) -> Result<(), String> {
+    dispatch_mutation(Mutation::AddDomain(domain), refresh.inner().clone()).await
+}
+
+/// Remove a routing domain.
+#[tauri::command]
+pub async fn remove_domain(
+    domain: String,
+    refresh: State<'_, RefreshSignal>,
+) -> Result<(), String> {
+    dispatch_mutation(Mutation::RemoveDomain(domain), refresh.inner().clone()).await
+}
+
+/// Update the editable config projection (interface / backend / OpenVPN).
+#[tauri::command]
+pub async fn set_config(
+    view: ConfigInput,
+    refresh: State<'_, RefreshSignal>,
+) -> Result<(), String> {
+    dispatch_mutation(Mutation::SetConfig(view.into()), refresh.inner().clone()).await
+}
+
+/// Resync: ask the daemon to re-read its config from disk and reconcile.
+#[tauri::command]
+pub async fn reload(refresh: State<'_, RefreshSignal>) -> Result<(), String> {
+    dispatch_mutation(Mutation::Reload, refresh.inner().clone()).await
+}
+
+/// Run a mutation on the async runtime's **blocking** pool (the IPC client is a
+/// blocking socket round-trip), so the webview's main thread never stalls.
+async fn dispatch_mutation(mutation: Mutation, refresh: RefreshSignal) -> Result<(), String> {
+    match tauri::async_runtime::spawn_blocking(move || {
+        run_mutation_and_refresh(mutation, client::send_request, &refresh)
+    })
+    .await
+    {
+        Ok(result) => result,
+        // The blocking task panicked or was cancelled — surface it rather than a
+        // silent hang; the frontend clears its pending state on this resolution.
+        Err(e) => Err(format!("internal error: mutation task failed: {e}")),
+    }
+}
+
+/// The one-shot route-check ([`Request::CheckDomain`]). Returns its own
+/// [`CheckOutcome`] for an **ephemeral** result area — it is never folded into the
+/// polled view-model and never triggers refresh-now (a parameterized query result
+/// is not ambient config truth). Runs on the blocking pool because a live
+/// resolution can be slow; keeping it off the poll thread means a slow resolver
+/// never stalls the live status display.
+#[tauri::command]
+pub async fn check_domain(domain: String) -> CheckOutcome {
+    match tauri::async_runtime::spawn_blocking(move || run_check(domain, client::send_request))
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => CheckOutcome::Error {
+            message: format!("internal error: check task failed: {e}"),
+        },
+    }
+}
+
 /// Drive `core` through one whole poll cycle and return the resulting snapshot.
 ///
 /// `send` performs a single request→reply round-trip (the real thread uses the
@@ -110,7 +286,14 @@ pub fn should_emit(last_emitted: &Option<ViewModelSnapshot>, current: &ViewModel
 /// `shared` and emitting a full-VM event whenever it changed. Composes [`step`],
 /// [`SharedVm::set`], and [`should_emit`] with the real socket client and the
 /// `AppHandle` event push. Thin plumbing — the decisions are in the helpers above.
-pub fn poll_loop(app: AppHandle, shared: SharedVm) {
+///
+/// This thread is the **sole** producer of view-models (the truth-contract
+/// anchor): every mutation routes its effect back here via a re-poll, never by
+/// touching the VM directly. Between cycles it waits on `refresh_rx` for up to
+/// [`POLL_INTERVAL`] — a mutation's refresh-now wake collapses that wait so the
+/// new truth appears promptly, while the scheduled timeout keeps the display live
+/// (and picks up out-of-band edits) when nothing is mutating.
+pub fn poll_loop(app: AppHandle, shared: SharedVm, refresh_rx: Receiver<()>) {
     let mut core = GuiCore::new();
     let mut last_emitted: Option<ViewModelSnapshot> = None;
     loop {
@@ -139,13 +322,27 @@ pub fn poll_loop(app: AppHandle, shared: SharedVm) {
             core = GuiCore::new();
             last_emitted = None;
         }
-        thread::sleep(POLL_INTERVAL);
+        // Wait for a refresh-now wake or the poll interval, whichever comes first.
+        match refresh_rx.recv_timeout(POLL_INTERVAL) {
+            // A mutation asked for an immediate re-poll: coalesce a burst (several
+            // quick mutations) into this one cycle, then loop straight into it.
+            Ok(()) => while refresh_rx.try_recv().is_ok() {},
+            // No wake within the interval: the ordinary scheduled poll.
+            Err(RecvTimeoutError::Timeout) => {}
+            // Every `RefreshSignal` sender dropped — the app is shutting down.
+            Err(RecvTimeoutError::Disconnected) => {
+                log::debug!("refresh channel closed; stopping the splitway poll thread");
+                break;
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+
     use splitway_gui_core::model::Health;
     use splitway_gui_core::VerifyView;
     use splitway_shared::config::VpnBackend;
@@ -312,6 +509,155 @@ mod tests {
             "view-model shape changed — regenerate the fixture (UPDATE_VIEW_MODEL_FIXTURE=1 \
              cargo test -p splitway-gui-tauri --lib fixture) and update \
              ui/src/bindings/view-model.ts to match"
+        );
+    }
+
+    // --- write path: mutation + refresh-now (7c) --------------------------
+
+    #[test]
+    fn run_mutation_and_refresh_returns_ok_issues_the_verb_and_fires_refresh() {
+        let (tx, rx) = mpsc::channel();
+        let refresh = RefreshSignal::new(tx);
+        let seen = std::cell::Cell::new(None);
+        let result = run_mutation_and_refresh(
+            Mutation::AddDomain("corp.example.com".to_string()),
+            |request| {
+                seen.set(Some(request));
+                Ok(Response::Ok)
+            },
+            &refresh,
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            seen.into_inner(),
+            Some(Request::AddDomain("corp.example.com".to_string()))
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "a successful mutation must fire refresh-now"
+        );
+    }
+
+    #[test]
+    fn run_mutation_and_refresh_surfaces_a_daemon_error_and_still_refreshes() {
+        let (tx, rx) = mpsc::channel();
+        let refresh = RefreshSignal::new(tx);
+        let result = run_mutation_and_refresh(
+            Mutation::AddDomain("dup.example.com".to_string()),
+            |_| {
+                Ok(Response::Error(
+                    "domain already present: dup.example.com".to_string(),
+                ))
+            },
+            &refresh,
+        );
+        assert_eq!(
+            result,
+            Err("domain already present: dup.example.com".to_string())
+        );
+        // Still fires: a rejected write may have reconciled daemon state, and the
+        // VM (not the command) is the source of truth.
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn run_mutation_and_refresh_fires_on_transport_failure_for_the_disconnected_variant() {
+        let (tx, rx) = mpsc::channel();
+        let refresh = RefreshSignal::new(tx);
+        let result = run_mutation_and_refresh(Mutation::Disable, down_daemon, &refresh);
+        assert!(result.is_err());
+        assert!(
+            rx.try_recv().is_ok(),
+            "refresh-now must fire so the VM moves to the disconnected variant"
+        );
+    }
+
+    #[test]
+    fn config_input_drops_the_daemon_owned_config_path() {
+        let view: ConfigView = ConfigInput {
+            vpn_name: "tun0".to_string(),
+            vpn_backend: VpnBackend::NetworkManager,
+            openvpn_management: String::new(),
+            openvpn_management_password_file: None,
+        }
+        .into();
+        assert_eq!(view.vpn_name, "tun0");
+        // The active path is fixed at daemon launch; the GUI must not set it.
+        assert!(view.config_path.is_empty());
+    }
+
+    /// The central truth-contract check: a mutation never changes the displayed
+    /// state itself — only the refresh-now re-poll does. Proven with a stateful
+    /// fake daemon whose `Status` reflects a committed add: the mutation returns
+    /// `Ok` and fires refresh, but the poll thread's snapshot is unchanged until
+    /// the next `step` (the re-poll) surfaces the daemon's new truth.
+    #[test]
+    fn the_vm_changes_only_via_the_re_poll_after_a_mutation_never_the_command() {
+        use std::cell::Cell;
+        let added = Cell::new(false);
+        let daemon = |request: Request| -> Result<Response, ClientError> {
+            match request {
+                Request::AddDomain(_) => {
+                    added.set(true);
+                    Ok(Response::Ok)
+                }
+                Request::Status => Ok(Response::Status(StatusInfo {
+                    enabled: true,
+                    interface: "tun0".to_string(),
+                    vpn_up: true,
+                    applied: None,
+                    routing_state: RoutingState::VpnDown,
+                    detector_health: DetectorHealth::Active,
+                    domains: if added.get() {
+                        vec!["corp.example.com".to_string()]
+                    } else {
+                        vec![]
+                    },
+                })),
+                Request::GetConfig => Ok(Response::Config(ConfigView {
+                    vpn_name: "tun0".to_string(),
+                    vpn_backend: VpnBackend::NetworkManager,
+                    openvpn_management: String::new(),
+                    openvpn_management_password_file: None,
+                    config_path: "/etc/splitway/config.json".to_string(),
+                })),
+                Request::ListInterfaces => Ok(Response::Interfaces(vec![])),
+                Request::Verify => Ok(Response::Verify(VerifyInfo {
+                    live: LinkDnsState::default(),
+                    drift: DriftVerdict::NotApplicable,
+                })),
+                other => Ok(Response::Error(format!("unexpected: {other:?}"))),
+            }
+        };
+
+        let mut core = GuiCore::new();
+        // Connect: the snapshot starts with no domains.
+        let snap = step(&mut core, daemon);
+        assert!(snap.status.as_ref().unwrap().domains.is_empty());
+
+        // Run the mutation exactly as the command would — off the core, via the
+        // daemon round-trip only. It returns Ok and fires refresh, but it has no
+        // access to the core/VM, so the snapshot cannot change here.
+        let (tx, rx) = mpsc::channel();
+        let refresh = RefreshSignal::new(tx);
+        let result = run_mutation_and_refresh(
+            Mutation::AddDomain("corp.example.com".to_string()),
+            daemon,
+            &refresh,
+        );
+        assert_eq!(result, Ok(()));
+        assert!(rx.try_recv().is_ok());
+        assert!(
+            core.snapshot().status.as_ref().unwrap().domains.is_empty(),
+            "the mutation must not change the displayed state"
+        );
+
+        // Only the refresh-now re-poll surfaces the daemon's new truth.
+        let snap = step(&mut core, daemon);
+        assert_eq!(
+            snap.status.as_ref().unwrap().domains,
+            vec!["corp.example.com".to_string()],
+            "the new domain must arrive via the re-poll, not the command"
         );
     }
 }
