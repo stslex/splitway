@@ -6,6 +6,8 @@
 //! [`crate::GuiCore`]; the egui rendering + socket plumbing that consume both
 //! live in the separate `splitway-gui` crate.
 
+use serde::Serialize;
+
 use splitway_shared::config::VpnBackend;
 use splitway_shared::ipc::client::ClientError;
 use splitway_shared::ipc::{
@@ -15,7 +17,7 @@ use splitway_shared::ipc::{
 /// Health of the link to the daemon, classified from the most recent
 /// round-trip. Drives the connection banner and whether the live status block
 /// is trustworthy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Health {
     /// No round-trip has completed yet.
     Unknown,
@@ -35,7 +37,7 @@ pub enum Health {
 
 /// The connection banner the UI renders, reduced from one round-trip result.
 /// `message` is `None` only when healthy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConnectionState {
     pub health: Health,
     pub message: Option<String>,

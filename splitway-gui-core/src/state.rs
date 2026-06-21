@@ -33,18 +33,23 @@
 
 use std::collections::VecDeque;
 
+use serde::Serialize;
+
 use splitway_shared::config::VpnBackend;
 use splitway_shared::ipc::client::ClientError;
-use splitway_shared::ipc::{ConfigView, InterfaceInfo, Request, Response, StatusInfo};
+use splitway_shared::ipc::{
+    compare_drift, ConfigView, InterfaceInfo, LinkDnsState, Request, Response, StatusInfo,
+};
 
 use crate::model::{
     classify_client_error, is_version_mismatch, reduce_action_result, reduce_status_result,
     refresh_requests, validate_config_fields, validate_domain, ConnectionState, Health,
 };
+use crate::snapshot::{ConfigFields, MessageView, VerifyView, ViewModelSnapshot};
 
 /// Severity of a transient, dismissable message shown to the user. A frontend
 /// maps this to its own styling (the egui harness picks a colour).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MessageKind {
     Info,
     Error,
@@ -101,6 +106,24 @@ pub struct ViewModel<'a> {
     pub message: Option<(MessageKind, &'a str)>,
 }
 
+/// The folded outcome of the last `Verify` round-trip — the live DNS read-back,
+/// kept *raw* so the drift verdict can be computed at snapshot time against the
+/// `applied` belief in the same snapshot (see [`GuiCore::snapshot`]). A failed
+/// round-trip degrades only this — the rest of the snapshot stays valid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VerifyState {
+    /// No `Verify` round-trip has completed yet.
+    Unknown,
+    /// The last `Verify` succeeded; this is the live per-link DNS read-back. The
+    /// drift verdict is *not* stored — it is derived from this plus the snapshot's
+    /// own `status.applied`, so a frontend never sees drift from one poll cycle
+    /// paired with belief from another.
+    Live(LinkDnsState),
+    /// The last `Verify` round-trip failed (daemon down, version skew, or an
+    /// unexpected reply); the string is a short, user-facing reason.
+    Unavailable(String),
+}
+
 /// The framework-agnostic GUI state machine. Holds the connection state, the
 /// reconnect-refetch policy, the request queue, reply folding, unsaved-edit
 /// preservation, and the view-model — everything a frontend needs apart from
@@ -132,6 +155,11 @@ pub struct GuiCore {
     /// The daemon's effective config path (read-only, from `GetConfig`).
     cfg_path: String,
 
+    // --- live DNS read-back (from Verify polls) ---
+    /// The last `Verify` outcome — see [`VerifyState`]. Polled alongside `Status`
+    /// so the snapshot's drift verdict and `applied` belief stay same-cycle.
+    verify: VerifyState,
+
     // --- transient message ---
     message: Option<(MessageKind, String)>,
 }
@@ -159,6 +187,7 @@ impl GuiCore {
             editor: ConfigEditor::default(),
             loaded: None,
             cfg_path: String::new(),
+            verify: VerifyState::Unknown,
             message: None,
         };
         core.enqueue(Request::Status);
@@ -202,13 +231,17 @@ impl GuiCore {
     }
 
     /// Enqueue the periodic refresh a frontend's timer drives: `Status` +
-    /// `ListInterfaces` always, plus `GetConfig` while the editor is clean so an
-    /// external change over the *same* connection (`splitway reload` or another
-    /// client's `SetConfig`) is picked up without a reconnect. `GetConfig` is
-    /// skipped while there are unsaved edits so the user's in-progress changes
-    /// are never clobbered. A frontend calls this only while [`is_idle`].
+    /// `ListInterfaces` + `Verify` always, plus `GetConfig` while the editor is
+    /// clean so an external change over the *same* connection (`splitway reload`
+    /// or another client's `SetConfig`) is picked up without a reconnect.
+    /// `GetConfig` is skipped while there are unsaved edits so the user's
+    /// in-progress changes are never clobbered. A frontend calls this only while
+    /// [`is_idle`], then drives the whole resulting cycle to completion before
+    /// reading [`snapshot`] — so `Status` (belief) and `Verify` (reality) in one
+    /// snapshot are from the same cycle.
     ///
     /// [`is_idle`]: GuiCore::is_idle
+    /// [`snapshot`]: GuiCore::snapshot
     pub fn poll(&mut self) {
         // The plain `enqueue` (not `enqueue_unique`) below is correct only on the
         // documented precondition that the caller polls while idle, so a stacked
@@ -221,6 +254,10 @@ impl GuiCore {
         );
         self.enqueue(Request::Status);
         self.enqueue(Request::ListInterfaces);
+        // Verify reads the live per-link DNS state back from the system (the
+        // `reality` check). Polled every cycle alongside Status so the snapshot's
+        // drift verdict is computed against the same-cycle `applied` belief.
+        self.enqueue(Request::Verify);
         // The poll's GetConfig is the in-connection refresh; skip it while the
         // editor is dirty (the reconnect edge always refetches anyway, going
         // through the same dirty guard in `load_config_view`).
@@ -398,11 +435,30 @@ impl GuiCore {
                 // interval and a per-poll banner/message would flap.
                 other => self.note_connection_from(&other),
             },
-            // The GUI never issues these (they belong to the CLI and the
-            // future 7b/7c render paths); fold as no-ops.
+            // Verify is polled every cycle: store the live read-back so the
+            // snapshot can compute drift against the same-cycle `applied`. A
+            // failed round-trip degrades ONLY the verify section — the connection
+            // banner is owned by the Status poll alongside it, so Verify never
+            // touches `connection` / `last_health` (unlike GetConfig /
+            // ListInterfaces, it is not a connection authority).
+            Request::Verify => {
+                self.verify = match result {
+                    Ok(Response::Verify(info)) => VerifyState::Live(info.live),
+                    Err(err) => VerifyState::Unavailable(format!("verify unavailable: {err}")),
+                    Ok(Response::Error(msg)) => {
+                        VerifyState::Unavailable(format!("verify unavailable: {msg}"))
+                    }
+                    Ok(other) => VerifyState::Unavailable(format!(
+                        "verify unavailable: unexpected reply: {other:?}"
+                    )),
+                };
+            }
+            // The GUI never issues these here: ListDomains belongs to the CLI, and
+            // CheckDomain is a parameterized one-shot query whose interactive home
+            // is 7c — it must NOT be folded into the polled snapshot (ambient state
+            // only; see docs/design/tauri-read-only.md). Fold as no-ops.
             Request::ListDomains => {}
             Request::CheckDomain(_) => {}
-            Request::Verify => {}
         }
     }
 
@@ -560,6 +616,72 @@ impl GuiCore {
         }
     }
 
+    /// The owned, serializable [`ViewModelSnapshot`] a frontend across a
+    /// serialization boundary (Tauri) renders. Same field set as [`view`], plus
+    /// the loaded config projection (read-only display) and the verify section.
+    ///
+    /// The drift verdict is computed *here*, from the live read-back stored on
+    /// the last `Verify` and the `applied` belief in `status` — i.e. against the
+    /// belief carried in this very snapshot. A driver that drains a whole poll
+    /// cycle before snapshotting therefore never pairs one cycle's belief with
+    /// another's reality (the "full view-model per event" coherence rule the
+    /// Tauri read path relies on).
+    ///
+    /// [`view`]: GuiCore::view
+    pub fn snapshot(&self) -> ViewModelSnapshot {
+        ViewModelSnapshot {
+            connection: self.connection.clone(),
+            connected: self.connection.health == Health::Connected,
+            working: self.inflight,
+            status: self.status.clone(),
+            interfaces: self.interfaces.clone(),
+            config_loaded: self.loaded.is_some(),
+            config: self.loaded.is_some().then(|| self.config_fields()),
+            config_path: self.cfg_path.clone(),
+            verify: self.verify_view(),
+            message: self.message.as_ref().map(|(kind, text)| MessageView {
+                kind: *kind,
+                text: text.clone(),
+            }),
+        }
+    }
+
+    /// The loaded config projection for read-only display, from the editor
+    /// buffers — which equal the daemon's last-synced config while the editor is
+    /// clean (7b is read-only, so they are never edited; 7c revisits this when it
+    /// adds the edit path). Fields are shown **as held** (the displayed value
+    /// reflects the buffer); only the empty password file is folded to `None` for
+    /// a clean "(none)". This deliberately does *not* trim like
+    /// `current_config_view` does — that trims what it *sends*, whereas this shows
+    /// what is *there*. In 7b it is moot (the values come daemon-normalized from
+    /// `GetConfig`); the distinction matters once 7c lets the user edit.
+    fn config_fields(&self) -> ConfigFields {
+        let trimmed_password = self.editor.openvpn_password_file.trim();
+        ConfigFields {
+            vpn_name: self.editor.vpn_name.clone(),
+            vpn_backend: self.editor.backend,
+            openvpn_management: self.editor.openvpn_management.clone(),
+            openvpn_management_password_file: (!trimmed_password.is_empty())
+                .then(|| trimmed_password.to_string()),
+        }
+    }
+
+    /// Build the verify section: pair the live read-back with a drift verdict
+    /// computed against this snapshot's own `status.applied` (so belief and
+    /// reality are always same-cycle), or surface the unknown / unavailable state.
+    fn verify_view(&self) -> VerifyView {
+        match &self.verify {
+            VerifyState::Unknown => VerifyView::Unknown,
+            VerifyState::Unavailable(message) => VerifyView::Unavailable {
+                message: message.clone(),
+            },
+            VerifyState::Live(live) => VerifyView::Available {
+                live: live.clone(),
+                drift: compare_drift(live, self.status.as_ref().and_then(|s| s.applied.as_ref())),
+            },
+        }
+    }
+
     /// The editable config buffers, for reading (e.g. to build the interface
     /// picker from the current `vpn_name`).
     pub fn editor(&self) -> &ConfigEditor {
@@ -578,7 +700,9 @@ impl GuiCore {
 mod tests {
     use super::*;
     use splitway_shared::ipc::VERSION_MISMATCH_PREFIX;
-    use splitway_shared::ipc::{DetectorHealth, RoutingState};
+    use splitway_shared::ipc::{
+        AppliedInfo, DetectorHealth, DriftVerdict, RoutingState, VerifyInfo,
+    };
     use std::io;
 
     // --- fixtures ---------------------------------------------------------
@@ -937,5 +1061,284 @@ mod tests {
         // Nothing sent; the validation error is shown.
         assert!(core.pending.is_empty());
         assert_eq!(core.view().message.unwrap().0, MessageKind::Error);
+    }
+
+    // --- Verify folding + snapshot coherence ------------------------------
+
+    /// A `Status` whose `applied` belief installs `domains` via `servers` on
+    /// `tun0` — so a `Verify` read-back has something to drift against.
+    fn applied_status(servers: &[&str], domains: &[&str]) -> StatusInfo {
+        StatusInfo {
+            enabled: true,
+            interface: "tun0".to_string(),
+            vpn_up: true,
+            applied: Some(AppliedInfo {
+                interface: "tun0".to_string(),
+                domains: domains.iter().map(|d| d.to_string()).collect(),
+                dns_servers: servers.iter().map(|s| s.to_string()).collect(),
+            }),
+            routing_state: RoutingState::Applied,
+            detector_health: DetectorHealth::Active,
+            domains: domains.iter().map(|d| d.to_string()).collect(),
+        }
+    }
+
+    /// A `Verify` reply carrying the live read-back. The daemon-computed `drift`
+    /// is set to a deliberately wrong `NotApplicable` to prove the client ignores
+    /// it and recomputes drift against the snapshot's own `applied`.
+    fn verify_reply(servers: &[&str], domains: &[&str]) -> Result<Response, ClientError> {
+        Ok(Response::Verify(VerifyInfo {
+            live: LinkDnsState {
+                servers: servers.iter().map(|s| s.to_string()).collect(),
+                routing_domains: domains.iter().map(|d| d.to_string()).collect(),
+            },
+            drift: DriftVerdict::NotApplicable,
+        }))
+    }
+
+    #[test]
+    fn poll_includes_verify() {
+        let mut core = connected_core("tun0");
+        core.poll();
+        assert!(core.pending.contains(&Request::Status));
+        assert!(core.pending.contains(&Request::ListInterfaces));
+        assert!(core.pending.contains(&Request::Verify));
+        assert!(core.pending.contains(&Request::GetConfig));
+    }
+
+    #[test]
+    fn verify_unknown_until_a_reply_lands() {
+        // connected_core drains the reconnect edge (GetConfig + ListInterfaces)
+        // but not Verify (it is only in poll()), so verify is still Unknown.
+        let core = connected_core("tun0");
+        assert_eq!(core.snapshot().verify, VerifyView::Unknown);
+    }
+
+    #[test]
+    fn verify_reply_folds_live_and_snapshot_computes_in_sync_drift() {
+        let mut core = connected_core("tun0");
+        // Belief: tun0 routes example.com via 10.0.0.1.
+        core.apply_reply(
+            Request::Status,
+            Ok(Response::Status(applied_status(
+                &["10.0.0.1"],
+                &["example.com"],
+            ))),
+        );
+        // Reality matches belief.
+        core.apply_reply(
+            Request::Verify,
+            verify_reply(&["10.0.0.1"], &["example.com"]),
+        );
+        match core.snapshot().verify {
+            VerifyView::Available { live, drift } => {
+                assert_eq!(live.servers, vec!["10.0.0.1".to_string()]);
+                // Computed against THIS snapshot's applied (InSync) — not the
+                // deliberately-wrong NotApplicable the daemon reply carried.
+                assert_eq!(drift, DriftVerdict::InSync);
+            }
+            other => panic!("expected Available, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_drift_is_recomputed_against_this_snapshots_applied() {
+        let mut core = connected_core("tun0");
+        // One live read-back: only 10.0.0.1, routing example.com.
+        core.apply_reply(
+            Request::Verify,
+            verify_reply(&["10.0.0.1"], &["example.com"]),
+        );
+
+        // Belief A matches the live state → InSync.
+        core.apply_reply(
+            Request::Status,
+            Ok(Response::Status(applied_status(
+                &["10.0.0.1"],
+                &["example.com"],
+            ))),
+        );
+        assert!(matches!(
+            core.snapshot().verify,
+            VerifyView::Available {
+                drift: DriftVerdict::InSync,
+                ..
+            }
+        ));
+
+        // Belief B (same stored read-back, a new Status this cycle) believes a
+        // second server AND a domain the live state does not cover (other.org is
+        // not a suffix of the live example.com) → the SAME read-back now reads as
+        // Drifted, because drift is computed at snapshot time against the current
+        // applied — never paired with a stale belief.
+        core.apply_reply(
+            Request::Status,
+            Ok(Response::Status(applied_status(
+                &["10.0.0.1", "10.0.0.2"],
+                &["example.com", "other.org"],
+            ))),
+        );
+        match core.snapshot().verify {
+            VerifyView::Available {
+                drift:
+                    DriftVerdict::Drifted {
+                        missing_servers,
+                        unrouted_domains,
+                    },
+                ..
+            } => {
+                assert_eq!(missing_servers, vec!["10.0.0.2".to_string()]);
+                // example.com stays covered (live routes it); only other.org is unrouted.
+                assert_eq!(unrouted_domains, vec!["other.org".to_string()]);
+            }
+            other => panic!("expected Drifted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_not_applicable_when_nothing_is_applied() {
+        let mut core = connected_core("tun0");
+        // connected_core's status has applied: None; a live read-back with no
+        // belief to compare against is NotApplicable — a healthy verdict, not
+        // an Unavailable (transport) failure.
+        core.apply_reply(
+            Request::Verify,
+            verify_reply(&["10.0.0.1"], &["example.com"]),
+        );
+        assert!(matches!(
+            core.snapshot().verify,
+            VerifyView::Available {
+                drift: DriftVerdict::NotApplicable,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn verify_transport_error_degrades_only_the_verify_section() {
+        let mut core = connected_core("tun0");
+        core.apply_reply(
+            Request::Status,
+            Ok(Response::Status(applied_status(
+                &["10.0.0.1"],
+                &["example.com"],
+            ))),
+        );
+        core.apply_reply(
+            Request::Verify,
+            verify_reply(&["10.0.0.1"], &["example.com"]),
+        );
+        assert!(matches!(
+            core.snapshot().verify,
+            VerifyView::Available { .. }
+        ));
+
+        // The daemon goes down, seen by a Verify round-trip.
+        core.apply_reply(Request::Verify, not_running());
+        let snap = core.snapshot();
+        // Verify is now Unavailable…
+        assert!(matches!(snap.verify, VerifyView::Unavailable { .. }));
+        // …but the connection banner stays Connected (Status owns it, not Verify)…
+        assert_eq!(snap.connection.health, Health::Connected);
+        assert!(snap.connected);
+        // …and the rest of the snapshot is intact.
+        assert!(snap.status.is_some());
+        assert!(snap.config_loaded);
+    }
+
+    #[test]
+    fn verify_daemon_error_is_unavailable_not_a_connection_problem() {
+        let mut core = connected_core("tun0");
+        core.apply_reply(
+            Request::Verify,
+            Ok(Response::Error("read-back failed".to_string())),
+        );
+        match core.snapshot().verify {
+            VerifyView::Unavailable { message } => assert!(message.contains("read-back failed")),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        // A Verify daemon-level error is not a transport/version problem.
+        assert_eq!(core.snapshot().connection.health, Health::Connected);
+    }
+
+    #[test]
+    fn snapshot_mirrors_the_borrowed_view_fields() {
+        let mut core = connected_core("tun0");
+        core.apply_reply(
+            Request::Status,
+            Ok(Response::Status(applied_status(&["10.0.0.1"], &["a.com"]))),
+        );
+        let snap = core.snapshot();
+        let view = core.view();
+        assert_eq!(snap.connected, view.connected);
+        assert_eq!(snap.working, view.working);
+        assert_eq!(snap.config_loaded, view.config_loaded);
+        assert_eq!(snap.config_path, view.config_path);
+        assert_eq!(snap.connection.health, view.connection.health);
+        assert_eq!(
+            snap.status.as_ref().map(|s| &s.domains),
+            view.status.map(|s| &s.domains)
+        );
+        // The config projection is populated once config has loaded.
+        let cfg = snap.config.expect("config should be loaded");
+        assert_eq!(cfg.vpn_name, "tun0");
+    }
+
+    #[test]
+    fn snapshot_serializes_with_the_expected_verify_and_drift_shape() {
+        use serde_json::Value;
+        let mut core = connected_core("tun0");
+        core.apply_reply(
+            Request::Status,
+            Ok(Response::Status(applied_status(
+                &["10.0.0.1"],
+                &["example.com"],
+            ))),
+        );
+        // Live read-back: a different server, no routing domains → drifted.
+        core.apply_reply(Request::Verify, verify_reply(&["198.51.100.1"], &[]));
+        let json = serde_json::to_value(core.snapshot()).unwrap();
+
+        // The top-level keys the TypeScript mirror depends on.
+        for key in [
+            "connection",
+            "connected",
+            "working",
+            "status",
+            "interfaces",
+            "config_loaded",
+            "config",
+            "config_path",
+            "verify",
+            "message",
+        ] {
+            assert!(json.get(key).is_some(), "missing top-level key {key}");
+        }
+        // VerifyView is internally tagged on `state`.
+        assert_eq!(
+            json["verify"]["state"],
+            Value::String("Available".to_string())
+        );
+        assert!(json["verify"]["live"].is_object());
+        // DriftVerdict::Drifted is externally tagged: { "Drifted": { .. } }.
+        let drifted = &json["verify"]["drift"]["Drifted"];
+        assert!(
+            drifted.is_object(),
+            "drift should be externally-tagged Drifted, got {:?}",
+            json["verify"]["drift"]
+        );
+        assert_eq!(
+            drifted["missing_servers"][0],
+            Value::String("10.0.0.1".to_string())
+        );
+        assert_eq!(
+            drifted["unrouted_domains"][0],
+            Value::String("example.com".to_string())
+        );
+        // Health serializes as a bare string (externally-tagged unit variant).
+        assert_eq!(
+            json["connection"]["health"],
+            Value::String("Connected".to_string())
+        );
     }
 }

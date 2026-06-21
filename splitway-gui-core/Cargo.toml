@@ -6,9 +6,18 @@ edition = "2021"
 # Framework-agnostic GUI logic: the view-model and the truth-contract
 # orchestration (connection state, reconnect-edge refetch, reply folding,
 # unsaved-edit preservation) that every client driving the daemon socket shares.
-# It depends on `splitway-shared` ONLY — deliberately no egui/eframe and no
+# It depends on `splitway-shared` (+ `serde` for the wire-serializable view-model
+# snapshot a non-egui frontend consumes) — deliberately no egui/eframe and no
 # Tauri, so both the interim egui harness and the future Tauri backend can drive
 # the same core and the truth contract is implemented once. Keep this boundary
-# clean: a `cargo tree -p splitway-gui-core` must not show egui.
+# clean: a `cargo tree -p splitway-gui-core` must not show egui or tauri.
 [dependencies]
 splitway-shared = { path = "../splitway-shared" }
+# Only `Serialize` is needed: the owned `ViewModelSnapshot` is produced here and
+# serialized out to a frontend (Tauri); nothing deserializes it back into Rust.
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Test-only: assert the snapshot's serialized JSON shape (the contract the Tauri
+# crate's TypeScript mirror must match) — never used in non-test builds.
+serde_json = "1"

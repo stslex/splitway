@@ -1,0 +1,104 @@
+/* Deliberately plain and functional — visual design is Phase 7d. Just enough to
+   make the read-only view-model legible. */
+
+:root {
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+  color-scheme: light dark;
+}
+
+body {
+  margin: 0;
+  padding: 1rem 1.25rem;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+header .banner {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-weight: 600;
+}
+
+.banner .dot {
+  font-size: 0.8rem;
+}
+
+.health-Connected .dot {
+  color: #3ca03c;
+}
+.health-Unknown .dot {
+  color: #888;
+}
+.health-NotRunning .dot,
+.health-TransientError .dot {
+  color: #c88c00;
+}
+.health-PermissionDenied .dot,
+.health-VersionMismatch .dot {
+  color: #c83c3c;
+}
+
+.banner-message {
+  margin: 0.25rem 0 0;
+  color: #b35a00;
+}
+
+section {
+  border-top: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+  padding-top: 0.5rem;
+}
+
+section h2 {
+  font-size: 0.95rem;
+  margin: 0 0 0.35rem;
+}
+
+.row {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.row .label {
+  flex: 0 0 12rem;
+  color: color-mix(in srgb, currentColor 65%, transparent);
+}
+
+.row .value {
+  flex: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+ul.domains,
+ul.interfaces {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+
+.muted {
+  color: color-mix(in srgb, currentColor 55%, transparent);
+  margin: 0;
+}
+
+.working {
+  font-style: italic;
+  color: color-mix(in srgb, currentColor 65%, transparent);
+}
+
+.message {
+  padding: 0.4rem 0.6rem;
+  border-radius: 4px;
+}
+
+.message-Info {
+  background: color-mix(in srgb, #3ca03c 18%, transparent);
+}
+
+.message-Error {
+  background: color-mix(in srgb, #c83c3c 18%, transparent);
+}

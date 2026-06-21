@@ -1,0 +1,41 @@
+[package]
+name = "splitway-gui-tauri"
+version = "0.0.1"
+edition = "2021"
+description = "Tauri desktop shell for Splitway — a thin, read-only renderer of splitway-gui-core's view-model."
+
+# Deliberately excluded from the workspace `default-members` (see the root
+# Cargo.toml): this crate links webkit2gtk and embeds a pre-built frontend, so it
+# is built locally inside `nix develop` (which provides the native deps), not by
+# the default `nix build` / `nix flake check`. Packaging it for Nix is Phase 7d.
+
+# A library target holds the testable bridge (the command + the poll-cycle step
+# + the emit-on-change decision), so that logic is unit-tested without a Tauri
+# runtime. `main.rs` is a thin binary that sets the Wayland workaround and calls
+# `run()`.
+[lib]
+name = "splitway_gui_tauri"
+path = "src/lib.rs"
+
+[[bin]]
+name = "splitway-gui-tauri"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# All the truth-contract state + view-model logic lives in gui-core; this crate
+# is the Tauri adapter (poll thread + event push + command) only — the same
+# `GuiCore` the egui harness drives.
+splitway-shared = { path = "../splitway-shared" }
+splitway-gui-core = { path = "../splitway-gui-core" }
+
+# `custom-protocol` makes the build embed `frontendDist` (the pre-built `ui/dist`)
+# rather than load `devUrl`, so `cargo build` + running the binary serves the
+# real frontend. Phase 7d will adopt the CLI-driven feature gating for bundling.
+tauri = { version = "2", features = ["custom-protocol"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4.20"
+env_logger = "0.11"

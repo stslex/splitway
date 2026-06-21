@@ -6,4 +6,21 @@ members = [
     "splitway-shared",
     "splitway-gui-core",
     "splitway-gui",
+    "splitway-gui-tauri",
+]
+
+# The Tauri shell links webkit2gtk and embeds a pre-built web frontend, so it is
+# NOT part of the default build set: `cargo build` / `cargo test` (and the
+# `nix build` / `nix flake check` that wrap them) operate on `default-members`,
+# keeping the daemon/CLI/egui build free of the webkit toolchain. Build it
+# explicitly inside `nix develop` (which provides the native deps):
+#   npm --prefix splitway-gui-tauri/ui ci && npm --prefix splitway-gui-tauri/ui run build
+#   cargo build -p splitway-gui-tauri
+# Packaging it for Nix (frontend vendoring + bundling) is Phase 7d.
+default-members = [
+    "splitway-daemon",
+    "splitway-cli",
+    "splitway-shared",
+    "splitway-gui-core",
+    "splitway-gui",
 ]

@@ -180,10 +180,15 @@ reimplemented per frontend:
   (the pure view-model **and** the truth-contract orchestration) into a crate
   depending on `splitway-shared` only, so both egui and the future Tauri backend
   drive one `GuiCore`. See [`docs/design/gui-core-extraction.md`](design/gui-core-extraction.md).
-- **7b — Tauri shell + read-only view**: the backend hosts `GuiCore`; a thin web
-  frontend renders the pushed view-model. The web-framework choice is a 7b,
-  low-stakes decision (the frontend is a thin renderer; the logic stays in Rust).
-  Its prerequisite — letting an unprivileged in-group user reach the root daemon
+- **7b — Tauri shell + read-only view** (done): the `splitway-gui-tauri` backend
+  hosts `GuiCore` and pushes the full view-model to a vanilla-TS frontend that
+  renders it read-only (no mutations — those are 7c). gui-core gained `Verify`
+  (live DNS read-back + same-cycle drift) and an owned, serializable
+  `ViewModelSnapshot`; the protocol is unchanged. Built locally on niri (the
+  webkit2gtk blank-window gotcha is resolved); the crate is kept out of the Nix
+  default build until packaging in 7d. See
+  [`docs/design/tauri-read-only.md`](docs/design/tauri-read-only.md). Its
+  prerequisite — letting an unprivileged in-group user reach the root daemon
   without `sudo` (niri has no system tray, so the GUI runs as a normal user) —
   landed ahead of it as the opt-in socket group (`--socket-group` /
   `services.splitway.unprivilegedGui`); see
