@@ -1,8 +1,8 @@
 //! `splitway-gui-core`: the framework-agnostic GUI logic shared by every client
 //! that drives the daemon's control socket.
 //!
-//! It holds two things and **no UI framework** (no egui/eframe, no Tauri — only
-//! `splitway-shared`):
+//! It holds these and **no UI framework** (no egui/eframe, no Tauri — only
+//! `splitway-shared`, plus `serde` for the serializable snapshot):
 //!
 //! - [`model`] — the pure view-model helpers: classify a client error, reduce a
 //!   `Status` round-trip to a connection banner, validate user input, build the
@@ -13,11 +13,15 @@
 //!   (no optimistic UI — displayed state only ever changes from a daemon reply),
 //!   the post-mutation/resync refresh, unsaved-edit preservation, and the
 //!   read-only [`ViewModel`] a frontend renders.
+//! - [`snapshot`] — the owned, `Serialize` [`ViewModelSnapshot`] for a frontend
+//!   that lives across a serialization boundary (Tauri): same field set as the
+//!   borrowed [`ViewModel`], produced by [`GuiCore::snapshot`].
 //!
 //! A frontend (the interim egui harness today, the Tauri backend in Phase 7b)
 //! owns only rendering and the socket plumbing: it feeds each reply to
-//! [`GuiCore::apply_reply`], renders [`GuiCore::view`], binds its config inputs
-//! to [`GuiCore::editor_mut`], and sends exactly the requests
+//! [`GuiCore::apply_reply`], renders [`GuiCore::view`] (egui) or serializes
+//! [`GuiCore::snapshot`] (Tauri), binds its config inputs to
+//! [`GuiCore::editor_mut`], and sends exactly the requests
 //! [`GuiCore::take_next_request`] hands it. The blocking IPC client itself stays
 //! in `splitway_shared::ipc::client`.
 //!
@@ -28,7 +32,11 @@
 #[cfg(unix)]
 pub mod model;
 #[cfg(unix)]
+pub mod snapshot;
+#[cfg(unix)]
 mod state;
 
+#[cfg(unix)]
+pub use snapshot::{ConfigFields, MessageView, VerifyView, ViewModelSnapshot};
 #[cfg(unix)]
 pub use state::{ConfigEditor, GuiCore, MessageKind, ViewModel};

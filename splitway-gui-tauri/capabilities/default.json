@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Read-only main window: invoke the get_view_model command and listen for view-model-changed events. Nothing else is granted (no fs, shell, http, etc.).",
+  "windows": ["main"],
+  "permissions": ["core:default", "core:event:default"]
+}

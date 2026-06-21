@@ -1,0 +1,7 @@
+{
+  "name": "splitway-gui-tauri-ui",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Read-only web frontend for the Splitway Tauri shell (vanilla TypeScript). Built with tsc + esbuild via ./build.sh (no npm registry dependency); Tauri's invoke/listen come from withGlobalTauri. See docs/design/tauri-read-only.md."
+}
