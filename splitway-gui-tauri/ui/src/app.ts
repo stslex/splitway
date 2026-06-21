@@ -459,14 +459,23 @@ export function start(root: HTMLElement): void {
     removeDomain: (domain) => void runMutation(`remove:${domain}`, () => api.removeDomain(domain)),
     saveConfig: () =>
       void runMutation("config", async () => {
-        await api.setConfig({
+        const sent = {
           vpn_name: lc.config.vpn_name.trim(),
           vpn_backend: lc.config.vpn_backend,
           openvpn_management: lc.config.openvpn_management.trim(),
           openvpn_management_password_file: emptyToNull(lc.config.openvpn_management_password_file),
-        });
-        // Saved → mark clean so the next VM event re-adopts the daemon-normalized
-        // values (resolving the "live buffer vs sent value" drift at the source).
+        };
+        await api.setConfig(sent);
+        // Adopt the exact values we persisted, then mark clean. The daemon stores
+        // SetConfig's fields verbatim, so the buffers now match disk. We must NOT
+        // rely on the next VM event to correct an unnormalized buffer: when the
+        // trimmed value equals what the daemon already had (e.g. the user only
+        // added whitespace), the snapshot is unchanged and `should_emit` fires no
+        // event — leaving the editor showing a value the daemon never persisted.
+        lc.config.vpn_name = sent.vpn_name;
+        lc.config.openvpn_management = sent.openvpn_management;
+        lc.config.openvpn_management_password_file =
+          sent.openvpn_management_password_file ?? "";
         lc.config.dirty = false;
       }),
     resync: () => void runMutation("reload", () => api.reload()),

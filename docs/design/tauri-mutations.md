@@ -101,9 +101,12 @@ We clear on resolution and rely on refresh-now to make the VM catch up.
 
 **Config editor dirty-guard.** The form is pre-filled from `vm.config` only while
 clean and no save is in flight, so a background poll cannot clobber an in-progress
-edit (the same guard gui-core's egui editor uses). A successful save clears dirty,
-so the next VM event re-adopts the daemon-normalized values — which also resolves
-the egui `TODO(7c)` "live buffer vs sent value" drift at the source for this path.
+edit (the same guard gui-core's egui editor uses). On a successful save the editor
+adopts the **exact values it sent** (trimmed; the daemon stores SetConfig's fields
+verbatim) and then marks clean — it does *not* rely on the next VM event to correct
+an unnormalized buffer, because when the trimmed value equals what the daemon
+already had the snapshot is unchanged and `should_emit` fires no event. This is the
+"snapshot the `ConfigView` actually sent" fix the egui `TODO` still wants.
 
 ## Validation: the daemon is the authoritative validator
 
