@@ -194,6 +194,11 @@ function configSection(vm: ViewModel, lc: Lifecycle, actions: Actions): HTMLElem
   const cfg = lc.config;
   const rows: Node[] = [];
 
+  // Active-file-changed-under-an-unsaved-edit warning (parity with the egui editor).
+  if (lc.configPathWarning) {
+    rows.push(el("p", { class: "message message-Error config-path-warning", text: lc.configPathWarning }));
+  }
+
   // Interface (vpn_name): free text with a datalist of enumerated interfaces.
   const nameInput = textInput(
     "config-vpn-name",
@@ -422,12 +427,28 @@ export function start(root: HTMLElement): void {
 
   // The ONLY writer of lastVm.
   function applyVm(vm: ViewModel): void {
+    const prevPath = lastVm?.config_path ?? null;
     lastVm = vm;
-    // Adopt the daemon's config into the editor buffers while the user is not
-    // mid-edit and no save is in flight, so the form tracks current truth without
-    // clobbering an in-progress edit (mirrors gui-core's editor dirty-guard).
     if (vm.config_loaded && vm.config && !lc.config.dirty && !isPending(lc, "config")) {
+      // Clean (and no save in flight): adopt the daemon's config so the form
+      // tracks current truth without clobbering an in-progress edit (mirrors
+      // gui-core's editor dirty-guard). The buffers now match the active file, so
+      // any stale path-change warning is moot.
       adoptConfig(lc.config, vm.config);
+      lc.configPathWarning = null;
+    } else if (
+      lc.config.dirty &&
+      prevPath !== null &&
+      vm.config_path !== "" &&
+      vm.config_path !== prevPath
+    ) {
+      // The daemon's active config file changed under an unsaved edit. Keep the
+      // buffers (don't clobber the edit) but warn: Save writes to the daemon's
+      // *current* file, so saving old-file buffers would overwrite the new file's
+      // editable fields without notice. Parity with GuiCore::load_config_view.
+      lc.configPathWarning =
+        `The daemon's active config file changed to ${vm.config_path} while you have ` +
+        `unsaved edits — re-check before saving (Save writes to the daemon's current file).`;
     }
     rerender();
   }
@@ -477,6 +498,9 @@ export function start(root: HTMLElement): void {
         lc.config.openvpn_management_password_file =
           sent.openvpn_management_password_file ?? "";
         lc.config.dirty = false;
+        // The edits are now persisted to the daemon's current file, so the
+        // active-file-changed warning (if any) no longer applies.
+        lc.configPathWarning = null;
       }),
     resync: () => void runMutation("reload", () => api.reload()),
     check: () => {

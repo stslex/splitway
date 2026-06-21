@@ -47,6 +47,11 @@ export interface Lifecycle {
   check: CheckState;
   /** The config editor buffers + dirty flag. */
   config: ConfigForm;
+  /** A warning shown when the daemon's active config file changed (its
+   *  `config_path`) while the editor has unsaved edits: a Save would write those
+   *  old-file buffers onto the daemon's *new* current file. Parity with gui-core's
+   *  egui editor (`GuiCore::load_config_view`). `null` = no warning. */
+  configPathWarning: string | null;
 }
 
 export function newLifecycle(): Lifecycle {
@@ -63,6 +68,7 @@ export function newLifecycle(): Lifecycle {
       openvpn_management_password_file: "",
       dirty: false,
     },
+    configPathWarning: null,
   };
 }
 
