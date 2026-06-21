@@ -187,7 +187,7 @@ reimplemented per frontend:
   without `sudo` (niri has no system tray, so the GUI runs as a normal user) —
   landed ahead of it as the opt-in socket group (`--socket-group` /
   `services.splitway.unprivilegedGui`); see
-  [`docs/design/socket-group.md`](design/socket-group.md).
+  [`docs/design/socket-group.md`](docs/design/socket-group.md).
 - **7c — mutations through the contract**: enable/disable, domain add/remove, and
   config save driven through `GuiCore`'s intents.
 - **7d — visual design + window behavior + bundling**: the full-window layout,

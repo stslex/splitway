@@ -172,6 +172,6 @@ is emitted — no group, no flag, socket stays root-only.
 - [`../../packaging/README.md`](../../packaging/README.md) — socket security model
   / threat model.
 - `splitway-daemon/src/daemon/ipc.rs` — `bind_socket` and the perms helpers.
+- `splitway-daemon/src/daemon/state.rs` — the `SetConfig` group-lock for the
+  file-reading OpenVPN fields.
 - `nix/module.nix`, `nix/tests/socket-group.nix` — module option + nixosTest.
-</content>
-</invoke>
