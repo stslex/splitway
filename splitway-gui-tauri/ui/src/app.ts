@@ -468,7 +468,6 @@ export function start(root: HTMLElement): void {
     if (
       vm.config_loaded &&
       vm.config &&
-      !isPending(lc, "config") &&
       (!lc.config.dirty || configMatchesDaemon(vm.config, lc.config))
     ) {
       // Adopt the daemon's config when it is safe: the editor is clean, OR the
@@ -480,6 +479,15 @@ export function start(root: HTMLElement): void {
       // persist/validation/frozen failure leaves the daemon's config unchanged
       // (!= the edit), so the editor stays dirty for a fix-and-retry. Adopting
       // also clears any stale path-change warning (the buffers now match the file).
+      //
+      // Deliberately NOT gated on the config-save pending flag: the refresh-now
+      // re-poll can deliver the post-save VM *before* the command's rejection
+      // clears pending, and a pending-gate would skip adoption then — leaving the
+      // editor stranded dirty once the next (identical) snapshot is deduped. The
+      // dirty+matches test is sufficient on its own: while a save is genuinely
+      // in flight and unlanded the daemon's config still != the edit (no adopt,
+      // no clobber); once it lands, daemon == sent so it adopts regardless of the
+      // VM-event vs rejection ordering.
       adoptConfig(lc.config, vm.config);
       lc.configPathWarning = null;
     } else if (
