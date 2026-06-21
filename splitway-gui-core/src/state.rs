@@ -178,6 +178,20 @@ impl GuiCore {
     /// `None` while a request is already in flight (at most one at a time) or the
     /// queue is empty. The frontend performs the actual socket round-trip and
     /// feeds the reply back via [`GuiCore::apply_reply`].
+    ///
+    /// The in-flight flag stays set until the *matching* [`apply_reply`] clears
+    /// it — that is the core's only un-wedge path. A frontend whose send can fail
+    /// while the app stays alive must therefore route that failure back through
+    /// [`apply_reply`] (the same `request`, with the transport `Err`): that clears
+    /// the flag and folds the error back into state — into the connection banner,
+    /// and (for a mutation or `GetConfig`) the per-action message too. Dropping a
+    /// failed send instead would strand the single in-flight slot and silently
+    /// halt all further requests. The egui frontend may drop a failed send only
+    /// because its worker channel closes solely on teardown (window closing), so a
+    /// wedge can never outlive the process; a frontend without that guarantee (7b)
+    /// must feed the error back.
+    ///
+    /// [`apply_reply`]: GuiCore::apply_reply
     pub fn take_next_request(&mut self) -> Option<Request> {
         if self.inflight {
             return None;
@@ -196,6 +210,15 @@ impl GuiCore {
     ///
     /// [`is_idle`]: GuiCore::is_idle
     pub fn poll(&mut self) {
+        // The plain `enqueue` (not `enqueue_unique`) below is correct only on the
+        // documented precondition that the caller polls while idle, so a stacked
+        // poll can never form a duplicate. That gate now lives in the frontend, a
+        // crate away; assert it here so any future driver that polls non-idle
+        // trips in debug/tests rather than silently double-queuing.
+        debug_assert!(
+            self.is_idle(),
+            "poll() must be called only while the core is idle (see is_idle)"
+        );
         self.enqueue(Request::Status);
         self.enqueue(Request::ListInterfaces);
         // The poll's GetConfig is the in-connection refresh; skip it while the
@@ -350,6 +373,15 @@ impl GuiCore {
                     // The save synced the buffers to the daemon; mark them clean
                     // so a later reconnect/poll refresh can adopt any daemon-side
                     // normalization without it being seen as an edit.
+                    //
+                    // TODO(7c): latent edge, faithfully preserved from the
+                    // pre-refactor app.rs — this snapshots the *live* buffers at
+                    // reply time, so edits made between clicking Save and the reply
+                    // landing are silently marked "synced" and a later refresh
+                    // won't restore the daemon's value over them. Out of scope for
+                    // this pure refactor; when 7c reworks mutations, snapshot the
+                    // `ConfigView` that was actually sent rather than re-reading the
+                    // live buffers.
                     self.loaded = Some(self.current_snapshot());
                 }
             }
