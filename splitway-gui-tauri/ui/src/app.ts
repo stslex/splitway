@@ -303,6 +303,21 @@ function checkResult(check: CheckState): HTMLElement {
   }
 
   const info = check.result;
+  const live = info.resolution;
+  // Live attribution is authoritative over belief: if the daemon believes the
+  // host is routed (`Applied`) but the name actually resolved via a non-VPN link
+  // (out-of-band DNS drift), don't reassure "routed through the VPN" — say the
+  // live result disagrees and is the one to trust (mirrors the CLI's drift line).
+  const answeredElsewhere =
+    live?.via_interface != null &&
+    info.vpn_interface !== "" &&
+    live.via_interface !== info.vpn_interface;
+  const routingVerdict =
+    info.covered && info.routing_state === "Applied" && answeredElsewhere
+      ? `the daemon believes it is routed, but the name resolved via ${live!.via_interface}, ` +
+        `not the VPN (${info.vpn_interface}) — trust the live result`
+      : checkRoutingText(info.routing_state, info.covered);
+
   const rows: Node[] = [
     row("host", info.host),
     row(
@@ -313,16 +328,21 @@ function checkResult(check: CheckState): HTMLElement {
           : "covered"
         : "NOT covered by any configured domain",
     ),
-    row("routing", checkRoutingText(info.routing_state, info.covered)),
+    row("routing", routingVerdict),
   ];
-  if (info.resolution) {
-    rows.push(
-      row(
-        "resolved",
-        info.resolution.addresses.length ? info.resolution.addresses.join(", ") : "(none)",
-      ),
-    );
-    if (info.resolution.via_interface) rows.push(row("via link", info.resolution.via_interface));
+  if (live) {
+    rows.push(row("resolved", live.addresses.length ? live.addresses.join(", ") : "(none)"));
+    if (live.via_interface) {
+      // Attribute the answering link relative to the configured VPN interface.
+      let viaNote = live.via_interface;
+      if (info.vpn_interface !== "") {
+        viaNote =
+          live.via_interface === info.vpn_interface
+            ? `${live.via_interface} — the VPN's link`
+            : `${live.via_interface} — not the VPN link (${info.vpn_interface})`;
+      }
+      rows.push(row("via link", viaNote));
+    }
   } else {
     rows.push(row("resolved", "(live resolution unavailable)"));
   }
@@ -399,6 +419,22 @@ function emptyToNull(value: string): string | null {
   return trimmed === "" ? null : trimmed;
 }
 
+/** Whether the daemon's reported config already equals what the editor would
+ *  send (trimmed; the daemon stores SetConfig's fields verbatim). True after a
+ *  save *landed* — including the architecture-§2 "saved-but-apply-failed" case,
+ *  where the config was persisted but reconciling it failed and the command still
+ *  rejected. Lets the editor tell that apart from a persist/validation/frozen
+ *  failure (where the daemon's config is unchanged) using daemon truth, not the
+ *  opaque error string. */
+function configMatchesDaemon(daemon: ConfigFields, form: ConfigForm): boolean {
+  return (
+    daemon.vpn_name === form.vpn_name.trim() &&
+    daemon.vpn_backend === form.vpn_backend &&
+    daemon.openvpn_management === form.openvpn_management.trim() &&
+    (daemon.openvpn_management_password_file ?? "") === form.openvpn_management_password_file.trim()
+  );
+}
+
 /** Boot the app into `root`: subscribe, fetch once, render, and wire controls. */
 export function start(root: HTMLElement): void {
   let lastVm: ViewModel | null = null; // the ONLY authoritative state; written only in applyVm
@@ -429,11 +465,21 @@ export function start(root: HTMLElement): void {
   function applyVm(vm: ViewModel): void {
     const prevPath = lastVm?.config_path ?? null;
     lastVm = vm;
-    if (vm.config_loaded && vm.config && !lc.config.dirty && !isPending(lc, "config")) {
-      // Clean (and no save in flight): adopt the daemon's config so the form
-      // tracks current truth without clobbering an in-progress edit (mirrors
-      // gui-core's editor dirty-guard). The buffers now match the active file, so
-      // any stale path-change warning is moot.
+    if (
+      vm.config_loaded &&
+      vm.config &&
+      !isPending(lc, "config") &&
+      (!lc.config.dirty || configMatchesDaemon(vm.config, lc.config))
+    ) {
+      // Adopt the daemon's config when it is safe: the editor is clean, OR the
+      // daemon's config already equals what the editor would send. The latter
+      // covers a *saved-but-apply-failed* save (architecture §2) — the write
+      // landed (daemon == sent) even though the command rejected — so the editor
+      // goes clean and Save disables, rather than showing the saved edit as
+      // unsaved (the next action is Resync, not another write). A
+      // persist/validation/frozen failure leaves the daemon's config unchanged
+      // (!= the edit), so the editor stays dirty for a fix-and-retry. Adopting
+      // also clears any stale path-change warning (the buffers now match the file).
       adoptConfig(lc.config, vm.config);
       lc.configPathWarning = null;
     } else if (
