@@ -166,7 +166,7 @@ function hero(
   line.id = "statusLine";
   const statusBox = el("div", { class: "status" }, [line]);
 
-  const chip = chipFor(mode, driftOf(vm));
+  const chip = chipFor(mode, vm.verify);
   if (chip) {
     const cls = chip.tone === "ok" ? "chip" : `chip ${chip.tone}`;
     const chipEl = el("span", { class: cls });

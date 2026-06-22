@@ -10,7 +10,7 @@
 // it that way.) These helpers derive everything from the pushed view-model; they
 // hold no authoritative state.
 
-import type { DriftVerdict, Health, StatusInfo, ViewModel } from "./bindings/view-model";
+import type { DriftVerdict, Health, StatusInfo, VerifyView, ViewModel } from "./bindings/view-model";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -271,9 +271,13 @@ export interface ChipView {
   text: string;
 }
 
-/** The hero status chip, or null when no chip is shown (off / empty). Drift-aware
- *  in the healthy mode: a drifted verify turns the in-sync chip amber. */
-export function chipFor(mode: MainMode, drift: DriftVerdict | null): ChipView | null {
+/** The hero status chip, or null when no chip is shown (off / empty). Healthy-mode
+ *  copy reflects the live verify state honestly: the checked "in sync" chip is
+ *  claimed ONLY on a successful read-back that matched (`Available` + `InSync`).
+ *  Before the first read-back lands (`Unknown`) or after one fails (`Unavailable`)
+ *  the chip says routing is active without asserting a sync that was never
+ *  verified — see the P2 review note. */
+export function chipFor(mode: MainMode, verify: VerifyView): ChipView | null {
   switch (mode) {
     case "off":
     case "empty":
@@ -285,10 +289,23 @@ export function chipFor(mode: MainMode, drift: DriftVerdict | null): ChipView | 
     case "apply-failed":
       return { tone: "bad", check: false, text: "Rules out of sync" };
     case "healthy":
-      if (drift && typeof drift === "object" && "Drifted" in drift) {
-        return { tone: "warn", check: false, text: "Some domains have drifted" };
+      if (verify.state === "Available") {
+        const drift = verify.drift;
+        if (typeof drift === "object" && "Drifted" in drift) {
+          return { tone: "warn", check: false, text: "Some domains have drifted" };
+        }
+        if (drift === "InSync") {
+          return { tone: "ok", check: true, text: "In sync with system DNS" };
+        }
+        // NotApplicable: nothing was believed-installed to compare against, so
+        // routing is active but there is no sync to claim.
+        return { tone: "ok", check: false, text: "Routing active" };
       }
-      return { tone: "ok", check: true, text: "In sync with system DNS" };
+      if (verify.state === "Unavailable") {
+        return { tone: "ok", check: false, text: "Routing active · live DNS check unavailable" };
+      }
+      // Unknown: the first connected poll has not read DNS back yet.
+      return { tone: "ok", check: false, text: "Routing active · checking system DNS…" };
   }
 }
 

@@ -570,12 +570,14 @@ select.sel:disabled {
   background: var(--amber-dim);
   border-color: var(--amber-line);
 }
-/* Dim the domain list when routing is not carrying it (off / waiting / no DNS). */
+/* Dim the domain list when routing is not carrying it (off / waiting / no DNS) —
+   a purely VISUAL cue. Pointer events stay enabled: removing a domain is a daemon
+   write that works regardless of routing state, so the delete controls must remain
+   clickable when routing is paused (matching the always-available Add). */
 .app[data-on="false"] .domains,
 .app[data-mode="waiting"] .domains,
 .app[data-mode="dns-missing"] .domains {
   opacity: 0.4;
-  pointer-events: none;
   filter: saturate(0.4);
 }
 
