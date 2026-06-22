@@ -28,10 +28,14 @@ export type ActionKey = "toggle" | "add" | "iface" | "reload" | `remove:${string
 export type CheckState = "idle" | "pending" | CheckOutcome;
 
 /** The ephemeral undo snackbar over a *completed* domain delete. `domain` is what
- *  was removed; Undo re-adds it (another daemon write). The auto-commit timer
+ *  was removed; Undo re-adds it (another daemon write). `undoable` is false when
+ *  the value cannot be faithfully re-added via `AddDomain` (a legacy/odd entry —
+ *  see `canUndoReadd`), in which case the snackbar omits the Undo affordance rather
+ *  than offer a restore that would fail or change the value. The auto-commit timer
  *  handle lives in the controller closure, not here. */
 export interface UndoState {
   domain: string;
+  undoable: boolean;
 }
 
 export interface Lifecycle {

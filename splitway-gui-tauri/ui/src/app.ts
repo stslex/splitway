@@ -49,6 +49,7 @@ import {
   type Lifecycle,
 } from "./lifecycle";
 import { configInputForInterface } from "./config-input";
+import { canUndoReadd } from "./domain-undo";
 import * as api from "./api";
 import type { DomainCheckInfo, InterfaceInfo, StatusInfo, ViewModel } from "./bindings/view-model";
 
@@ -612,7 +613,7 @@ function undoToast(lc: Lifecycle, actions: Actions): HTMLElement {
   // nothing is lost by not keeping them in the DOM).
   if (!lc.undo) return toast;
 
-  const domain = lc.undo.domain;
+  const { domain, undoable } = lc.undo;
   // The undo re-add runs under the `remove:<domain>` key. Its outcome is surfaced
   // HERE, in the toast, because on the undo path the domain is absent from the VM
   // (the delete already landed) so there is no domain card to render its
@@ -625,6 +626,18 @@ function undoToast(lc: Lifecycle, actions: Actions): HTMLElement {
     x.addEventListener("click", () => actions.dismissUndo());
     return x;
   };
+
+  // Legacy/odd value that AddDomain can't round-trip (IP, host:port, …): report the
+  // delete but don't offer an Undo that would fail or restore a different host.
+  if (!undoable) {
+    msg.append(
+      document.createTextNode("Removed "),
+      el("code", { text: domain }),
+      document.createTextNode(" · re-add it manually to restore"),
+    );
+    toast.append(dismiss());
+    return toast;
+  }
 
   if (isPending(lc, key)) {
     msg.append(
@@ -802,8 +815,13 @@ export function start(root: HTMLElement): void {
 
   function showUndo(domain: string): void {
     clearUndoTimer();
-    lc.undo = { domain };
-    announce(`Removed ${domain}. Press Undo to restore it.`);
+    const undoable = canUndoReadd(domain);
+    lc.undo = { domain, undoable };
+    announce(
+      undoable
+        ? `Removed ${domain}. Press Undo to restore it.`
+        : `Removed ${domain}. Re-add it manually to restore it.`,
+    );
     undoTimer = setTimeout(() => {
       undoTimer = null;
       lc.undo = null;
@@ -863,8 +881,8 @@ export function start(root: HTMLElement): void {
         showUndo(domain); // ephemeral; the delete already landed daemon-side
       }),
     undoRemove: () => {
-      const domain = lc.undo?.domain;
-      if (!domain) return;
+      if (!lc.undo?.undoable) return; // only undoable deletes re-add (button is gated too)
+      const domain = lc.undo.domain;
       clearUndoTimer(); // stop the auto-commit; keep the toast up through the re-add
       // Keep `lc.undo` set so the toast stays visible and can surface a re-add
       // failure (the domain has no card to render its per-action error on). It is
