@@ -16,7 +16,14 @@ function test(name: string, fn: () => void): void {
 }
 
 test("canonical lowercase hostnames are undoable", () => {
-  for (const d of ["corp.example.com", "vpn.example.org", "a.b.c.example", "host-1.example.net"]) {
+  for (const d of [
+    "corp.example.com",
+    "vpn.example.org",
+    "a.b.c.example",
+    "host-1.example.net",
+    "my-host.example.com", // interior hyphen ok
+    "xn--caf-dma.example.com", // punycode (xn--…) ok
+  ]) {
     assert.equal(canUndoReadd(d), true, d);
   }
 });
@@ -28,6 +35,8 @@ test("non-round-trippable legacy/odd values are NOT undoable", () => {
     "Example.COM", // uppercase (would be lowercased)
     "example.com.", // trailing dot (would be stripped)
     "~corp.example.com", // routing-only marker
+    "-corp.example", // leading-hyphen label (validate_host rejects)
+    "corp-.example", // trailing-hyphen label (validate_host rejects)
     "under_score.example", // underscore
     "has space.example", // whitespace
     "https://example.com", // scheme/path

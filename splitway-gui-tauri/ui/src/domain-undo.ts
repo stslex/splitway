@@ -20,7 +20,10 @@ export function canUndoReadd(domain: string): boolean {
   if (/[\s/:~_]/.test(domain)) return false;
   if (domain.startsWith(".") || domain.endsWith(".") || domain.includes("..")) return false;
   const labels = domain.split(".");
-  if (!labels.every((label) => /^[a-z0-9-]+$/.test(label))) return false;
+  // Each label: [a-z0-9] with interior hyphens allowed, but NOT a leading or
+  // trailing hyphen — matching splitway-shared/src/domain.rs::validate_host, which
+  // AddDomain enforces (interior hyphens and `xn--` punycode are fine).
+  if (!labels.every((label) => /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(label))) return false;
   // All-numeric labels read as an IPv4 literal, which AddDomain does not round-trip.
   if (labels.every((label) => /^[0-9]+$/.test(label))) return false;
   return true;
