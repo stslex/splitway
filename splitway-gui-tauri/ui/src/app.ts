@@ -121,7 +121,9 @@ function topbar(stage: Stage): HTMLElement {
   ]);
   return el("div", { class: "topbar reveal d1" }, [
     brandMark(),
-    el("span", { class: "wordmark", text: "Splitway" }),
+    // The app's main heading (h1) so the blocker h2s sit under a level-1 heading
+    // rather than starting heading order at h3.
+    el("h1", { class: "wordmark", text: "Splitway" }),
     el("span", { class: "grow" }),
     connEl,
   ]);
@@ -564,17 +566,50 @@ function undoToast(lc: Lifecycle, actions: Actions): HTMLElement {
   // keyboard tab trap). Conditional render keeps them out of the tab order when
   // hidden (the full-rebuild model already precludes a slide-out animation, so
   // nothing is lost by not keeping them in the DOM).
-  if (lc.undo) {
-    msg.append(document.createTextNode("Removed "), el("code", { text: lc.undo.domain }));
-    const undo = el("button", { class: "undo", text: "Undo" }) as HTMLButtonElement;
-    undo.type = "button";
-    undo.addEventListener("click", () => actions.undoRemove());
-    const dismiss = el("button", { class: "x", text: "✕" }) as HTMLButtonElement;
-    dismiss.type = "button";
-    dismiss.setAttribute("aria-label", "Dismiss");
-    dismiss.addEventListener("click", () => actions.dismissUndo());
-    toast.append(undo, dismiss);
+  if (!lc.undo) return toast;
+
+  const domain = lc.undo.domain;
+  // The undo re-add runs under the `remove:<domain>` key. Its outcome is surfaced
+  // HERE, in the toast, because on the undo path the domain is absent from the VM
+  // (the delete already landed) so there is no domain card to render its
+  // per-action error on — without this the re-add failure would be silent.
+  const key: ActionKey = `remove:${domain}`;
+  const dismiss = (): HTMLButtonElement => {
+    const x = el("button", { class: "x", text: "✕" }) as HTMLButtonElement;
+    x.type = "button";
+    x.setAttribute("aria-label", "Dismiss");
+    x.addEventListener("click", () => actions.dismissUndo());
+    return x;
+  };
+
+  if (isPending(lc, key)) {
+    msg.append(
+      el("span", { class: "spinner" }),
+      document.createTextNode(" Restoring "),
+      el("code", { text: domain }),
+    );
+    return toast; // no buttons while the re-add is in flight
   }
+
+  const restoreError = errorFor(lc, key);
+  if (restoreError) {
+    msg.append(
+      document.createTextNode("Couldn't restore "),
+      el("code", { text: domain }),
+      document.createTextNode(` — ${restoreError}`),
+    );
+    const retry = el("button", { class: "undo", text: "Retry" }) as HTMLButtonElement;
+    retry.type = "button";
+    retry.addEventListener("click", () => actions.undoRemove());
+    toast.append(retry, dismiss());
+    return toast;
+  }
+
+  msg.append(document.createTextNode("Removed "), el("code", { text: domain }));
+  const undo = el("button", { class: "undo", text: "Undo" }) as HTMLButtonElement;
+  undo.type = "button";
+  undo.addEventListener("click", () => actions.undoRemove());
+  toast.append(undo, dismiss());
   return toast;
 }
 
@@ -593,7 +628,7 @@ function blockerNode(blocker: BlockerView): HTMLElement {
   }
   const blk = el("div", { class: `blk ${blocker.tone}` }, [
     icon,
-    el("h3", { text: blocker.title }),
+    el("h2", { text: blocker.title }),
     body,
   ]);
   if (blocker.command) blk.appendChild(el("code", { class: "cmd", text: blocker.command }));
@@ -711,9 +746,20 @@ export function start(root: HTMLElement): void {
     rerender();
   }
 
+  // Update a persistent visually-hidden polite live region (in index.html, a
+  // SIBLING of #app so the full-rebuild replaceChildren never wipes it). The
+  // rebuild model precludes putting aria-live on a rebuilt node (it would
+  // re-announce on every render), so dynamic changes (a removed domain, a check
+  // result) are announced by setting this region's text explicitly.
+  function announce(message: string): void {
+    const live = document.getElementById("a11y-live");
+    if (live) live.textContent = message;
+  }
+
   function showUndo(domain: string): void {
     clearUndoTimer();
     lc.undo = { domain };
+    announce(`Removed ${domain}. Press Undo to restore it.`);
     undoTimer = setTimeout(() => {
       undoTimer = null;
       lc.undo = null;
@@ -768,14 +814,22 @@ export function start(root: HTMLElement): void {
     undoRemove: () => {
       const domain = lc.undo?.domain;
       if (!domain) return;
-      clearUndoTimer();
-      lc.undo = null;
-      // Re-add through a real daemon write; the VM re-poll restores the list.
-      void runMutation(`remove:${domain}`, () => api.addDomain(domain));
+      clearUndoTimer(); // stop the auto-commit; keep the toast up through the re-add
+      // Keep `lc.undo` set so the toast stays visible and can surface a re-add
+      // failure (the domain has no card to render its per-action error on). It is
+      // cleared only when the re-add succeeds; the VM re-poll then restores the row.
+      void runMutation(`remove:${domain}`, async () => {
+        await api.addDomain(domain);
+        lc.undo = null;
+        announce(`Restored ${domain}.`);
+      });
     },
     dismissUndo: () => {
+      const domain = lc.undo?.domain;
       clearUndoTimer();
       lc.undo = null;
+      // Drop any failed-restore error so a later delete of the same domain starts clean.
+      if (domain) lc.errors.delete(`remove:${domain}`);
       rerender();
     },
 
@@ -793,9 +847,19 @@ export function start(root: HTMLElement): void {
         .checkDomain(host)
         .then((outcome) => {
           lc.check = outcome;
+          if (outcome.state === "Error") {
+            announce(`Check failed: ${outcome.message}`);
+          } else {
+            announce(
+              outcome.result.covered
+                ? `${outcome.result.host} matches a routed domain.`
+                : `${outcome.result.host} is not routed; it goes direct.`,
+            );
+          }
         })
         .catch((err: unknown) => {
           lc.check = { state: "Error", message: String(err) };
+          announce(`Check failed: ${String(err)}`);
         })
         .finally(() => rerender());
     },

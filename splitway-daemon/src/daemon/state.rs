@@ -1847,6 +1847,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detected_dns_ignores_a_non_configured_interface() {
+        // The other half of the gate: a `last_info` reading for an interface other
+        // than the configured `vpn_name` (config uses "wg0") must not leak through
+        // as detected DNS, even while that other interface is up.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "detected-dns-iface",
+        );
+
+        sm.on_event(vpn_up("eth9")).await; // up, but not the configured interface
+        assert!(sm.vpn_up);
+        assert!(
+            sm.status().detected_dns.is_empty(),
+            "detected DNS must be attributed only to the configured interface"
+        );
+    }
+
+    #[tokio::test]
     async fn dns_server_change_reapplies() {
         let backend = Arc::new(MockBackend::default());
         let mut sm = machine(backend.clone(), config(true, &["a.com"]), "dns-rotate");

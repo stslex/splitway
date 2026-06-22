@@ -35,9 +35,12 @@ export function svgEl(tag: string, attrs: Record<string, string>, children: SVGE
   return node;
 }
 
-/** The bare brand mark, inline in the topbar (matches assets/icon/splitway-icon-mark.svg
- *  and the mockup): a split path — one branch routed through the accent (VPN), one
- *  to slate (direct). Built with createElementNS, not innerHTML. */
+/** The bare brand mark, inline in the topbar: the same logo *concept* as the
+ *  distribution asset (assets/icon/splitway-icon-mark.svg) — a split path, one
+ *  branch routed through the accent (VPN), one to slate (direct) — but with its
+ *  own geometry, hand-tuned for this 40-viewBox / 25px inline render (the mockup's
+ *  mark) rather than a scaled-down copy of the 512-viewBox asset. Built with
+ *  createElementNS, not innerHTML. */
 export function brandMark(): SVGElement {
   return svgEl("svg", { class: "logo", viewBox: "0 0 40 40", width: "25", height: "25", fill: "none", "aria-label": "Splitway" }, [
     svgEl("path", {
