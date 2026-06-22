@@ -76,6 +76,35 @@ in
           declared elsewhere in the configuration.
         '';
       };
+
+      # The native Tauri GUI is a user-launched app, not a service — so it is a
+      # `packages` output, optionally installed here for convenience. Off by
+      # default: enabling the socket group (e.g. for unprivileged CLI access)
+      # must not force the webkit2gtk GUI closure onto a host that does not want
+      # the window. Only meaningful with {option}`unprivilegedGui.enable`, since
+      # without the group socket the GUI cannot reach the root daemon unprivileged.
+      installGui = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        example = true;
+        description = ''
+          Also install the native Tauri GUI ({command}`splitway-gui-tauri`) into
+          {option}`environment.systemPackages`, so an in-group desktop user can
+          launch it (e.g. under niri). Off by default — it pulls the webkit2gtk
+          closure, which a CLI-only host does not need. See the README "GUI
+          (native Tauri)" section. Linux only.
+        '';
+      };
+
+      guiPackage = lib.mkOption {
+        type = lib.types.package;
+        default = self.packages.${pkgs.system}.splitway-gui;
+        defaultText = lib.literalExpression "splitway.packages.\${system}.splitway-gui";
+        description = ''
+          The Splitway GUI package installed when {option}`unprivilegedGui.installGui`
+          is set. Defaults to this flake's `splitway-gui` output.
+        '';
+      };
     };
   };
 
@@ -107,6 +136,15 @@ in
           to the "${gui.group}" group, it does not create them.
         '';
       }) gui.users;
+    })
+
+    # Convenience install of the native Tauri GUI (opt-in). A separate,
+    # installGui-gated branch so enabling the socket group alone never pulls the
+    # webkit2gtk closure onto a CLI-only host. Also gated on gui.enable: without
+    # the group socket the unprivileged GUI cannot reach the root daemon, so
+    # installing it without the group is not a useful state.
+    (lib.mkIf (gui.enable && gui.installGui) {
+      environment.systemPackages = [ gui.guiPackage ];
     })
 
     {

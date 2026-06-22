@@ -11,10 +11,54 @@
  * destructive); IBM Plex Sans for human text, IBM Plex Mono for machine data;
  * restrained motion behind prefers-reduced-motion; rounded focus rings.
  *
- * Fonts: the IBM Plex stacks fall back to the platform sans/mono, so the
- * machine→human typographic split holds even before the OFL woff2 files are
- * bundled (that bundling + @font-face lands with packaging in 7d-2). No webfont
- * CDN — the CSP is self-only. */
+ * Fonts: IBM Plex Sans/Mono glyphs ship as local subset woff2 in the bundle,
+ * renamed to the "Splitway Sans"/"Splitway Mono" families (OFL reserved-name
+ * compliance — see the @font-face block below and fonts/README.md) and loaded
+ * same-origin — the self-only CSP blocks any webfont CDN. The platform sans/mono
+ * stay in the stacks as a fallback for glyphs IBM Plex lacks (e.g. ✕, ⚠) and for
+ * an unbundled dev run. */
+
+/* Bundled fonts (fonts/README.md): IBM Plex glyph subsets, RENAMED to the
+   "Splitway Sans"/"Splitway Mono" families. The OFL reserves the name "Plex"
+   for modified versions and a glyph subset is a modified version, so the family
+   is renamed off the reserved name; IBM's copyright + the OFL license still
+   travel with the files. Mono is weight 400 only; every heavier weight here is
+   Sans — five faces cover the whole UI. */
+@font-face {
+  font-family: "Splitway Sans";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("assets/fonts/SplitwaySans-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Splitway Sans";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("assets/fonts/SplitwaySans-Medium.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Splitway Sans";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("assets/fonts/SplitwaySans-SemiBold.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Splitway Sans";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("assets/fonts/SplitwaySans-Bold.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Splitway Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("assets/fonts/SplitwayMono-Regular.woff2") format("woff2");
+}
 
 :root {
   --bg: #0e1217;
@@ -37,8 +81,8 @@
   --amber-line: rgba(224, 162, 78, 0.34);
   --rose: #e8697e;
   --rose-dim: rgba(232, 105, 126, 0.14);
-  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --mono: "IBM Plex Mono", "SF Mono", ui-monospace, monospace;
+  --sans: "Splitway Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: "Splitway Mono", "SF Mono", ui-monospace, monospace;
   --r: 14px;
   --spring: cubic-bezier(0.34, 1.25, 0.5, 1);
 }
@@ -268,6 +312,11 @@ body {
 }
 .status-line .if {
   font-family: var(--mono);
+  /* Pin to 400: the only var(--mono) element that would otherwise inherit a
+     non-400 weight (500, from .status-line). Only Mono 400 is bundled, and this
+     keeps every mono element at one weight (the "Mono = 400 only" invariant in
+     fonts/README.md) rather than synthesizing a faux-bold from the 400 face. */
+  font-weight: 400;
   font-size: 15px;
   color: var(--text);
 }
