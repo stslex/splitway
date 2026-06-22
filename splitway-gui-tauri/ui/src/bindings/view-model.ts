@@ -56,6 +56,11 @@ export interface StatusInfo {
   vpn_up: boolean;
   applied: AppliedInfo | null;
   routing_state: RoutingState;
+  /** DNS server(s) the configured interface is currently *detected* to expose,
+   *  independent of whether routing is applied (empty when none / interface down /
+   *  no DNS pushed). Drives the read-only "Using <ip> · detected from <iface>"
+   *  readout and the DNS-not-detected state. */
+  detected_dns: string[];
   detector_health: DetectorHealth;
   domains: string[];
 }

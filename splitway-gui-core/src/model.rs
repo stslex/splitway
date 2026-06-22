@@ -296,6 +296,7 @@ mod tests {
             vpn_up: true,
             applied: None,
             routing_state: RoutingState::VpnDown,
+            detected_dns: vec![],
             detector_health: DetectorHealth::Active,
             domains: vec![],
         }));

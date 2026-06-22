@@ -7,7 +7,16 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <main id="app">Connecting…</main>
+    <!-- The whole UI is built from the view-model in TypeScript; this is just the
+         mount point (the full-window root). Fonts come from the CSS stacks
+         (IBM Plex with platform fallbacks) — no webfont CDN, per the self-only CSP. -->
+    <main id="app" class="app">Connecting…</main>
+    <!-- Persistent, visually-hidden polite live region for screen readers. Kept a
+         SIBLING of #app so the app's full-rebuild (replaceChildren on #app) never
+         wipes it; the controller sets its text on dynamic changes (domain removed /
+         undo, check result). aria-live can't live on a rebuilt node (it would
+         re-announce every render). -->
+    <div id="a11y-live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
     <script type="module" src="./assets/main.js"></script>
   </body>
 </html>

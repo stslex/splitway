@@ -112,6 +112,14 @@ fn print_response(response: &splitway_shared::ipc::Response) {
                     None => "(none)".to_string(),
                 }
             );
+            println!(
+                "detected:  {}",
+                if info.detected_dns.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    info.detected_dns.join(", ")
+                }
+            );
             println!("detector:  {}", info.detector_health);
             println!(
                 "domains:   {}",

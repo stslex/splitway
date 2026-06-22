@@ -696,6 +696,22 @@ impl StateMachine {
             // domain → DNS mapping for client-side verification.
             applied: self.applied.as_ref().map(AppliedInfo::from),
             routing_state: self.routing_state(),
+            // The DNS the configured interface is detected to expose right now,
+            // surfaced regardless of *apply* state so a client can show the
+            // interface's resolver read-only (the DNS-auto model). Sourced from
+            // the last detector reading, gated on (a) the interface still being
+            // up and (b) its name matching the configured `vpn_name` — the same
+            // guards `desired()`/`routing_state()` use. The `vpn_up` gate matters
+            // because a `Down` event only flips `vpn_up` and leaves `last_info`
+            // populated, so without it a disconnected VPN would keep reporting its
+            // last DNS as "detected". Empty when no interface is configured, it is
+            // down, or it pushes no DNS.
+            detected_dns: self
+                .last_info
+                .as_ref()
+                .filter(|info| self.vpn_up && info.interface_name == self.config.vpn_name)
+                .map(|info| info.dns_servers.clone())
+                .unwrap_or_default(),
             detector_health: self.detector_health.clone(),
             domains: self.config.vpn_hosts.clone(),
         }
@@ -1784,6 +1800,70 @@ mod tests {
 
         assert_eq!(backend.reverts.lock().unwrap().as_slice(), &["wg0"]);
         assert!(sm.applied.is_none());
+    }
+
+    #[tokio::test]
+    async fn detected_dns_reported_independent_of_apply() {
+        // The configured interface is up and pushing DNS, but routing is disabled
+        // (nothing applied). `detected_dns` must still report the interface's DNS —
+        // that is the field's whole point (the DNS-auto readout the GUI shows in the
+        // off/empty states), distinct from `applied` which is None here.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(
+            backend.clone(),
+            config(false, &["a.com"]),
+            "detected-dns-off",
+        );
+
+        sm.on_event(vpn_up("wg0")).await;
+
+        assert!(sm.applied.is_none(), "disabled: nothing applied");
+        assert_eq!(sm.status().detected_dns, vec!["10.0.0.1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn detected_dns_cleared_when_vpn_goes_down() {
+        // A `Down` event only flips `vpn_up` and leaves `last_info` populated, so
+        // `status()` must gate `detected_dns` on `vpn_up` — otherwise a
+        // disconnected VPN would keep reporting its last DNS as "detected".
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "detected-dns-down",
+        );
+
+        sm.on_event(vpn_up("wg0")).await;
+        assert_eq!(sm.status().detected_dns, vec!["10.0.0.1".to_string()]);
+
+        sm.on_event(VpnEvent::Down {
+            interface_name: "wg0".to_string(),
+        })
+        .await;
+        assert!(
+            sm.status().detected_dns.is_empty(),
+            "a down interface must report no detected DNS (gated on vpn_up)"
+        );
+    }
+
+    #[tokio::test]
+    async fn detected_dns_ignores_a_non_configured_interface() {
+        // The other half of the gate: a `last_info` reading for an interface other
+        // than the configured `vpn_name` (config uses "wg0") must not leak through
+        // as detected DNS, even while that other interface is up.
+        let backend = Arc::new(MockBackend::default());
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "detected-dns-iface",
+        );
+
+        sm.on_event(vpn_up("eth9")).await; // up, but not the configured interface
+        assert!(sm.vpn_up);
+        assert!(
+            sm.status().detected_dns.is_empty(),
+            "detected DNS must be attributed only to the configured interface"
+        );
     }
 
     #[tokio::test]

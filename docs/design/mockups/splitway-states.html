@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Splitway — states</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0E1217;--backdrop:#070A0E;--surface:#171D25;--surface-2:#1E2733;
+    --border:#29333E;--border-soft:#202833;--hi:rgba(255,255,255,.06);
+    --text:#ECF1F7;--text-dim:#9BA7B3;--text-faint:#646E7A;
+    --accent:#7C83F5;--accent-soft:#9AA0FF;--accent-dim:rgba(124,131,245,.14);--accent-line:rgba(124,131,245,.32);
+    --slate:#6F7A8C;--slate-dim:rgba(111,122,140,.13);
+    --amber:#E0A24E;--amber-dim:rgba(224,162,78,.14);--amber-line:rgba(224,162,78,.34);
+    --rose:#E8697E;--rose-dim:rgba(232,105,126,.14);
+    --sans:'IBM Plex Sans',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+    --mono:'IBM Plex Mono','SF Mono',ui-monospace,monospace;
+    --r:14px;--spring:cubic-bezier(.34,1.25,.5,1);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{background:var(--backdrop);color:var(--text);font-family:var(--sans);-webkit-font-smoothing:antialiased;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px 22px;min-height:100%}
+
+  .demo-bar{display:flex;align-items:center;gap:10px;width:100%;max-width:556px;margin:0 auto 16px;padding:0 2px;font-size:12px;color:var(--text-faint)}
+  .demo-bar .tag{font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;border:1px solid var(--border-soft);border-radius:6px;padding:3px 7px;color:var(--text-faint)}
+  .demo-bar select{appearance:none;font-family:var(--sans);font-size:12.5px;color:var(--text);background:var(--surface-2);border:1px solid var(--border);border-radius:9px;padding:6px 28px 6px 11px;cursor:pointer;
+    background-image:linear-gradient(45deg,transparent 50%,var(--text-faint) 50%),linear-gradient(135deg,var(--text-faint) 50%,transparent 50%);background-position:calc(100% - 15px) 52%,calc(100% - 10px) 52%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+  .demo-bar .grow{flex:1}
+
+  .app{position:relative;width:100%;max-width:556px;border-radius:20px;overflow:hidden;background:var(--bg);border:1px solid var(--border);box-shadow:0 36px 80px -34px rgba(0,0,0,.8),inset 0 1px 0 var(--hi)}
+
+  .topbar{display:flex;align-items:center;gap:11px;padding:17px 20px;border-bottom:1px solid var(--border-soft);position:relative;z-index:26}
+  .wordmark{font-size:19px;font-weight:600;letter-spacing:-.01em}
+  .topbar .grow{flex:1}
+  .conn{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--text-faint)}
+  .conn .dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}
+  .conn .dot.ok{background:var(--accent)}.conn .dot.warn{background:var(--amber)}.conn .dot.off{background:var(--text-faint)}
+
+  .hero{padding:28px 20px 20px}
+  .hero-top{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+  .hero-top .pitch{font-size:13px;color:var(--text-faint);max-width:62%;line-height:1.5}
+  .switch{appearance:none;border:none;cursor:pointer;width:80px;height:40px;border-radius:22px;position:relative;flex:none;background:var(--surface-2);border:1px solid var(--border);box-shadow:inset 0 1px 2px rgba(0,0,0,.25);transition:background .28s,border-color .28s}
+  .switch .thumb{position:absolute;top:3px;left:3px;width:32px;height:32px;border-radius:50%;background:#3D4754;transition:transform .4s var(--spring),background .28s;box-shadow:0 2px 5px rgba(0,0,0,.4),inset 0 1px 0 rgba(255,255,255,.12)}
+  .switch .lbl{position:absolute;top:0;height:100%;display:flex;align-items:center;font-size:11px;font-weight:700;letter-spacing:.06em;color:var(--text-faint);transition:opacity .25s}
+  .switch .lbl.on{left:15px;opacity:0}.switch .lbl.off{right:14px;opacity:1}
+  body[data-on="true"] .switch{background:var(--accent-dim);border-color:var(--accent-line)}
+  body[data-on="true"] .switch .thumb{transform:translateX(40px);background:var(--accent);box-shadow:0 2px 6px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.3)}
+  body[data-on="true"] .switch .lbl.on{opacity:1;color:var(--accent-soft)}body[data-on="true"] .switch .lbl.off{opacity:0}
+
+  .status{margin-top:20px;display:flex;flex-direction:column;gap:11px}
+  .status-line{font-size:17.5px;font-weight:500;letter-spacing:-.01em;line-height:1.3}
+  .status-line .n{color:var(--accent-soft);font-weight:600}
+  .status-line .if{font-family:var(--mono);font-size:15px;color:var(--text)}
+  body[data-on="false"] .status-line .n,body[data-on="false"] .status-line .if,
+  body[data-mode="waiting"] .status-line .n,body[data-mode="empty"] .status-line .n,body[data-dns="missing"] .status-line .if{color:var(--text-dim)}
+  .chip{align-self:flex-start;display:inline-flex;align-items:center;gap:7px;font-size:12.5px;font-weight:500;padding:5px 12px 5px 10px;border-radius:9px;color:var(--accent-soft);background:var(--accent-dim);border:1px solid var(--accent-line)}
+  .chip.warn{color:var(--amber);background:var(--amber-dim);border-color:var(--amber-line)}
+  .chip .ic{font-size:12px;line-height:1}
+
+  .panel{background:var(--surface);border:1px solid var(--border-soft);box-shadow:inset 0 1px 0 var(--hi)}
+  .iface-block{margin:6px 20px 0;padding:15px 16px;border-radius:var(--r)}
+  .iface-block .head{display:flex;align-items:center;justify-content:space-between;gap:12px}
+  .iface-block label{font-size:13.5px;color:var(--text);font-weight:500}
+  select.sel{appearance:none;font-family:var(--mono);font-size:13px;color:var(--text);background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:8px 30px 8px 12px;cursor:pointer;
+    background-image:linear-gradient(45deg,transparent 50%,var(--text-faint) 50%),linear-gradient(135deg,var(--text-faint) 50%,transparent 50%);background-position:calc(100% - 16px) 53%,calc(100% - 11px) 53%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+  .dns{margin-top:12px;font-size:12px}
+  .dns-ok{color:var(--text-faint)}.dns-ok .ip{font-family:var(--mono);color:var(--text-dim)}
+  .dns-miss{display:none;flex-direction:column;gap:10px}
+  .dns-miss .warn{display:flex;align-items:center;gap:7px;color:var(--amber);font-size:12.5px}.dns-miss .warn .ic{font-size:12px}
+  .dns-row{display:flex;gap:8px}
+  .dns-row input{flex:1;background:var(--surface-2);border:1px solid var(--amber-line);border-radius:10px;padding:9px 12px;color:var(--text);font-family:var(--mono);font-size:12.5px}
+  .dns-row button{appearance:none;border:none;cursor:pointer;background:var(--amber);color:#241402;font-family:var(--sans);font-weight:600;font-size:12.5px;padding:0 15px;border-radius:10px}
+  body[data-dns="missing"] .dns-ok{display:none}body[data-dns="missing"] .dns-miss{display:flex}
+
+  .section{padding:22px 20px 4px}
+  .eyebrow{display:flex;align-items:center;justify-content:space-between;margin-bottom:13px}
+  .eyebrow .label{font-family:var(--mono);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--text-faint);display:inline-flex;align-items:center;gap:8px}
+  .eyebrow .count{color:var(--text-dim);background:var(--surface-2);border:1px solid var(--border-soft);border-radius:20px;padding:1px 8px;font-size:10.5px;letter-spacing:.04em}
+  .desc{font-size:12.5px;color:var(--text-faint);margin-bottom:13px;line-height:1.5}
+  .add{appearance:none;background:var(--surface-2);border:1px solid var(--border);color:var(--text-dim);font-family:var(--sans);font-size:12.5px;font-weight:500;padding:5px 12px;border-radius:9px;cursor:pointer;transition:.18s;display:inline-flex;align-items:center;gap:6px}
+  .add:hover{border-color:var(--accent-line);color:var(--accent-soft)}.add .plus{font-size:14px;line-height:1}
+
+  .domains{display:flex;flex-direction:column;gap:9px;max-height:264px;overflow-y:auto;padding-right:4px;scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+  .domains::-webkit-scrollbar{width:9px}.domains::-webkit-scrollbar-thumb{background:var(--border);border-radius:9px;border:3px solid var(--bg);background-clip:padding-box}.domains::-webkit-scrollbar-track{background:transparent}
+  .card{border-radius:var(--r);padding:13px 14px;background:var(--surface);border:1px solid var(--border-soft);box-shadow:inset 0 1px 0 var(--hi);transition:background .15s;flex:none}
+  .card:hover{background:var(--surface-2)}
+  .card-row{display:flex;align-items:center;gap:10px}
+  .card .name{font-family:var(--mono);font-size:13.5px;color:var(--text);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .route{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11.5px;color:var(--accent-soft);background:var(--accent-dim);border:1px solid var(--accent-line);padding:3px 9px;border-radius:8px;flex:none}
+  .route .arrow{opacity:.7}
+  .vstate{font-size:13px;flex:none;width:15px;text-align:center}.vstate.ok{color:var(--accent-soft)}.vstate.drift{color:var(--amber)}
+  .del{appearance:none;border:none;background:none;cursor:pointer;color:var(--text-faint);width:24px;height:24px;border-radius:7px;display:grid;place-items:center;font-size:13px;opacity:0;transition:opacity .15s,background .15s,color .15s;flex:none}
+  .card:hover .del,.card:focus-within .del{opacity:1}.del:hover{background:var(--rose-dim);color:var(--rose)}
+  .sub{font-size:11.5px;color:var(--text-faint);margin-top:7px;font-family:var(--mono)}.sub.warn{color:var(--amber)}
+  .card.is-drift{border-color:var(--amber-line)}.card.is-drift .route{color:var(--amber);background:var(--amber-dim);border-color:var(--amber-line)}
+  body[data-on="false"] .domains,body[data-dns="missing"] .domains,body[data-mode="waiting"] .domains{opacity:.4;pointer-events:none;filter:saturate(.4)}
+
+  /* empty domains */
+  .empty{display:none;flex-direction:column;align-items:center;text-align:center;gap:6px;padding:26px 16px;border:1px dashed var(--border);border-radius:var(--r)}
+  .empty .t{font-size:13.5px;color:var(--text-dim);font-weight:500}.empty .s{font-size:12px;color:var(--text-faint);line-height:1.5;max-width:260px}
+  body[data-mode="empty"] .domains{display:none}body[data-mode="empty"] .empty{display:flex}
+
+  .everything{margin:11px 0 0;display:flex;align-items:center;gap:10px;padding:12px 14px;border:1px dashed var(--border);border-radius:var(--r);color:var(--text-dim);font-size:13px}
+  .everything .rest{flex:1}
+  .everything .direct{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11.5px;color:var(--slate);background:var(--slate-dim);padding:3px 9px;border-radius:8px}
+  body[data-mode="empty"] .everything .rest{color:var(--text-dim)}
+
+  .check-row{display:flex;gap:8px}
+  .field{flex:1;background:var(--surface-2);border:1px solid var(--border);border-radius:11px;padding:10px 12px;color:var(--text);font-family:var(--mono);font-size:13px}
+  .field::placeholder{color:var(--text-faint)}
+  .btn{appearance:none;border:none;cursor:pointer;background:var(--accent);color:#0D0F2B;font-family:var(--sans);font-weight:600;font-size:13px;min-width:84px;height:39px;padding:0 17px;border-radius:11px;display:inline-flex;align-items:center;justify-content:center;gap:7px}
+  .result{margin-top:11px;font-size:12.5px;color:var(--text-dim);display:none;align-items:flex-start;gap:8px;line-height:1.45}
+  .result.show{display:flex}.result .pin{color:var(--accent-soft);flex:none}.result code{font-family:var(--mono);color:var(--text)}.result.miss .pin{color:var(--slate)}
+
+  .foot{padding:20px;font-size:10.5px;color:var(--text-faint);font-family:var(--mono);letter-spacing:.03em;border-top:1px solid var(--border-soft);margin-top:18px}
+
+  /* full-window blockers */
+  .blocker{display:none;position:absolute;left:0;right:0;top:58px;bottom:0;z-index:25;background:var(--bg);flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:36px 30px;gap:14px}
+  body[data-mode="disconnected"] .blocker,body[data-mode="no-permission"] .blocker,body[data-mode="frozen"] .blocker{display:flex}
+  .blk{display:none;flex-direction:column;align-items:center;gap:13px;max-width:330px}
+  body[data-mode="disconnected"] .blk[data-for="disconnected"]{display:flex}
+  body[data-mode="no-permission"] .blk[data-for="no-permission"]{display:flex}
+  body[data-mode="frozen"] .blk[data-for="frozen"]{display:flex}
+  .blk .ic{width:50px;height:50px;border-radius:14px;display:grid;place-items:center}
+  .blk .ic svg{width:25px;height:25px}
+  .blk[data-for="disconnected"] .ic{background:rgba(155,167,179,.12);color:var(--text-dim)}
+  .blk[data-for="no-permission"] .ic,.blk[data-for="frozen"] .ic{background:var(--amber-dim);color:var(--amber)}
+  .blk h3{font-size:16px;font-weight:600;letter-spacing:-.01em}
+  .blk p{font-size:13px;color:var(--text-dim);line-height:1.55}
+  .blk code{display:block;font-family:var(--mono);font-size:12px;color:var(--text-dim);background:var(--surface);border:1px solid var(--border-soft);padding:10px 12px;border-radius:9px}
+
+  @media (max-width:380px){.hero-top .pitch{display:none}.conn span:last-child{display:none}}
+</style>
+</head>
+<body data-on="true" data-dns="ok" data-mode="healthy">
+
+  <div class="demo-bar">
+    <span class="tag">mockup</span><span>Preview state</span>
+    <select id="stateSel">
+      <option value="healthy">Healthy — routing</option>
+      <option value="waiting">VPN not connected — waiting</option>
+      <option value="dns-missing">DNS not detected on interface</option>
+      <option value="empty">No domains yet</option>
+      <option value="disconnected">Service unreachable</option>
+      <option value="no-permission">No permission (not in group)</option>
+      <option value="frozen">Config malformed (frozen)</option>
+    </select>
+    <span class="grow"></span>
+  </div>
+
+  <main class="app">
+    <div class="topbar">
+      <svg viewBox="0 0 40 40" width="25" height="25" fill="none" aria-label="Splitway">
+        <path d="M10 20 H18 C23 20 25.5 17 29 11" stroke="var(--accent)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M18 20 C23 20 25.5 23 29 29" stroke="var(--slate)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="10" cy="20" r="3.1" fill="var(--accent)"/><circle cx="30" cy="10" r="3.1" fill="var(--accent)"/><circle cx="30" cy="30" r="2.3" fill="var(--slate)"/>
+      </svg>
+      <span class="wordmark">Splitway</span><span class="grow"></span>
+      <span class="conn"><span class="dot ok" id="connDot"></span><span id="connText">Connected</span></span>
+    </div>
+
+    <section class="hero">
+      <div class="hero-top">
+        <span class="pitch">Send specific domains through the VPN. Everything else stays on your normal connection.</span>
+        <button class="switch" id="sw" role="switch" aria-checked="true" aria-label="Routing"><span class="lbl on">ON</span><span class="lbl off">OFF</span><span class="thumb"></span></button>
+      </div>
+      <div class="status">
+        <p class="status-line" id="statusLine">Routing <span class="n">3 domains</span> through <span class="if">tun0</span></p>
+        <span class="chip" id="chip"><span class="ic">✓</span>In sync with system DNS</span>
+      </div>
+    </section>
+
+    <div class="iface-block panel">
+      <div class="head"><label for="iface">Route DNS through</label>
+        <select class="sel" id="iface" aria-label="Network interface"><option value="tun0" selected>tun0</option><option value="wg0">wg0</option><option value="eth0">eth0</option></select>
+      </div>
+      <div class="dns">
+        <div class="dns-ok">Using <span class="ip" id="dnsIp">192.0.2.53</span> · detected from <span id="dnsIf">tun0</span></div>
+        <div class="dns-miss"><div class="warn"><span class="ic">⚠</span> No DNS server detected on <span id="missIf">eth0</span>. Set one to route through it.</div>
+          <div class="dns-row"><input id="dnsInput" placeholder="e.g. 192.0.2.53"><button id="dnsSet">Set</button></div></div>
+      </div>
+    </div>
+
+    <section class="section">
+      <div class="eyebrow"><span class="label">Domains <span class="count" id="count">3</span></span><button class="add"><span class="plus">+</span> Add domain</button></div>
+      <div class="domains" id="domains">
+        <div class="card"><div class="card-row"><span class="name">corp.example.com</span><span class="route"><span class="arrow">→</span> <span class="ifn">tun0</span></span><span class="vstate ok">✓</span><button class="del" aria-label="Remove">✕</button></div></div>
+        <div class="card"><div class="card-row"><span class="name">vpn.example.org</span><span class="route"><span class="arrow">→</span> <span class="ifn">tun0</span></span><span class="vstate ok">✓</span><button class="del" aria-label="Remove">✕</button></div></div>
+        <div class="card is-drift"><div class="card-row"><span class="name">git.example.net</span><span class="route"><span class="arrow">→</span> <span class="ifn">tun0</span></span><span class="vstate drift">⚠</span><button class="del" aria-label="Remove">✕</button></div><div class="sub warn">expected <span class="ifn">tun0</span> — system currently resolves it direct</div></div>
+      </div>
+      <div class="empty"><div class="t">No domains yet</div><div class="s">Add a domain to start routing it through the VPN. Everything stays direct until you do.</div></div>
+      <div class="everything"><span class="rest">Everything else</span><span class="direct"><span class="arrow">→</span> direct</span></div>
+    </section>
+
+    <section class="section">
+      <div class="eyebrow"><span class="label">Check a domain</span></div>
+      <p class="desc">Test whether a host would route through the VPN or go direct. This only checks — it changes nothing.</p>
+      <div class="check-row"><input class="field" id="checkInput" placeholder="host.example.com"><button class="btn" id="checkBtn">Check</button></div>
+      <div class="result" id="checkResult"><span class="pin">→</span><span id="checkText"></span></div>
+    </section>
+
+    <div class="foot">config /var/lib/splitway/config.json · protocol v6</div>
+
+    <!-- blockers -->
+    <div class="blocker">
+      <div class="blk" data-for="disconnected">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M8 8l8 8" stroke-linecap="round"/></svg></div>
+        <h3>Can't reach Splitway</h3>
+        <p>The background service isn't responding. Make sure it's running, then it'll reconnect on its own.</p>
+        <code>systemctl status splitway</code>
+      </div>
+      <div class="blk" data-for="no-permission">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></div>
+        <h3>No permission to make changes</h3>
+        <p>Your user isn't in the <code style="display:inline;padding:1px 5px;border:none;background:var(--surface-2)">splitway</code> group. Add it, then sign out and back in.</p>
+        <code>sudo usermod -aG splitway $USER</code>
+      </div>
+      <div class="blk" data-for="frozen">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"><path d="M12 4 22 20H2z"/><path d="M12 10v4M12 17h.01"/></svg></div>
+        <h3>Configuration can't be loaded</h3>
+        <p>The config file is malformed, so Splitway kept the last working setup. Fix the file to make changes again.</p>
+        <code>/var/lib/splitway/config.json</code>
+      </div>
+    </div>
+  </main>
+
+<script>
+  const body=document.body,statusLine=document.getElementById('statusLine'),ifaceSel=document.getElementById('iface'),chip=document.getElementById('chip'),countEl=document.getElementById('count'),domainsEl=document.getElementById('domains');
+  const connDot=document.getElementById('connDot'),connText=document.getElementById('connText'),sw=document.getElementById('sw');
+  const dnsMap={tun0:'192.0.2.53',wg0:'198.51.100.53',eth0:null};
+  function nDomains(){return domainsEl.querySelectorAll('.card').length;}
+  function plural(n){return n+' domain'+(n===1?'':'s');}
+
+  function render(){
+    const mode=body.dataset.mode,on=body.dataset.on==='true',dnsOk=body.dataset.dns!=='missing',i=ifaceSel.value,n=nDomains();
+    // status line
+    if(mode==='waiting'){statusLine.innerHTML='Enabled — <span class="n">waiting</span> for the VPN to connect';}
+    else if(mode==='empty'){statusLine.innerHTML='<span class="n">No domains yet</span> — add one to start routing';}
+    else if(!on){statusLine.innerHTML='Routing paused — all traffic goes <span class="if">direct</span>';}
+    else if(!dnsOk){statusLine.innerHTML='Waiting — no DNS on <span class="if">'+i+'</span>';}
+    else{statusLine.innerHTML='Routing <span class="n">'+plural(n)+'</span> through <span class="if">'+i+'</span>';}
+    // chip
+    if(!on||mode==='empty'){chip.style.display='none';}
+    else if(mode==='waiting'){chip.style.display='inline-flex';chip.className='chip warn';chip.innerHTML='Waiting for the VPN';}
+    else if(!dnsOk){chip.style.display='inline-flex';chip.className='chip warn';chip.innerHTML='No DNS — routing paused';}
+    else{chip.style.display='inline-flex';chip.className='chip';chip.innerHTML='<span class="ic">✓</span>In sync with system DNS';}
+  }
+  function syncIface(){
+    const i=ifaceSel.value,dns=dnsMap[i];
+    document.querySelectorAll('.ifn').forEach(e=>e.textContent=i);
+    document.getElementById('dnsIf').textContent=i;document.getElementById('missIf').textContent=i;
+    if(dns){body.dataset.dns='ok';document.getElementById('dnsIp').textContent=dns;}else body.dataset.dns='missing';
+    render();
+  }
+
+  const conn={healthy:['Connected','ok'],waiting:['VPN not connected','warn'],'dns-missing':['Connected','ok'],empty:['Connected','ok'],disconnected:['Disconnected','off'],'no-permission':['No access','warn'],frozen:['Config error','warn']};
+  function setMode(m){
+    body.dataset.mode=m;
+    connText.textContent=conn[m][0];connDot.className='dot '+conn[m][1];
+    if(m==='dns-missing'){ifaceSel.value='eth0';} else if(ifaceSel.value==='eth0'&&m!=='dns-missing'){ifaceSel.value='tun0';}
+    countEl.textContent=(m==='empty'?'0':String(nDomains()));
+    syncIface();
+  }
+  document.getElementById('stateSel').addEventListener('change',e=>setMode(e.target.value));
+
+  sw.addEventListener('click',()=>{const on=body.dataset.on!=='true';body.dataset.on=on?'true':'false';sw.setAttribute('aria-checked',on?'true':'false');render();});
+  ifaceSel.addEventListener('change',()=>{ if(ifaceSel.value!=='eth0'&&body.dataset.mode==='dns-missing'){body.dataset.mode='healthy';connText.textContent='Connected';connDot.className='dot ok';} syncIface(); });
+  document.getElementById('dnsSet').addEventListener('click',()=>{const v=document.getElementById('dnsInput').value.trim();if(!v)return;dnsMap[ifaceSel.value]=v;syncIface();});
+  setMode('healthy');
+</script>
+</body>
+</html>

@@ -26,13 +26,18 @@ use crate::domain;
 /// `CheckDomain` verb / [`Response::DomainCheck`] reply (the domain route-check).
 /// Bumped to `6` in Phase 5d for the additive `Verify` verb /
 /// [`Response::Verify`] reply (live DNS read-back + drift detection — `reality`
-/// alongside `status`'s `belief`). The daemon enforces *strict equality* (see
+/// alongside `status`'s `belief`). Bumped to `7` in Phase 7d for the additive
+/// [`StatusInfo::detected_dns`] field — the DNS server(s) the configured VPN
+/// interface is currently *detected* to expose, surfaced independently of whether
+/// routing is applied so a client can show the interface's resolver read-only
+/// (the interface-centric, DNS-auto model the Tauri GUI renders). The daemon
+/// enforces *strict equality* (see
 /// `daemon::ipc::process_line`): a daemon rejects a client whose version differs,
 /// and vice versa, so there is no silent mixed-version operation. The daemon, CLI
 /// and GUI all build from this one workspace, so they upgrade in lockstep; a
 /// mismatch only happens across separately-updated installs and is surfaced as
 /// actionable "update splitway" guidance, never a raw decode error.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Stable prefix the daemon uses to introduce a protocol-version-mismatch
 /// error reply. Shared so a client (CLI/GUI) can recognize skew and render
@@ -170,6 +175,18 @@ pub struct StatusInfo {
     /// A self-explaining summary of why routing is (or is not) active right now,
     /// mapped from the daemon's own reconcile decision — see [`RoutingState`].
     pub routing_state: RoutingState,
+    /// The DNS server(s) the configured VPN interface is currently *detected* to
+    /// expose, surfaced independently of whether rules are applied. This is the
+    /// last detector reading for `interface` (the `vpn_name`): non-empty whenever
+    /// the configured interface is up and pushing DNS, even while routing is
+    /// disabled or no domains are configured (cases where [`applied`] is `None`).
+    /// Empty when no interface is configured, the interface is down, or it pushes
+    /// no DNS (the [`RoutingState::NoDnsFromVpn`] case). Lets a client show the
+    /// interface's resolver read-only — the interface-centric, DNS-auto model —
+    /// without inferring it from [`applied`] (which only exists once applied).
+    ///
+    /// [`applied`]: StatusInfo::applied
+    pub detected_dns: Vec<String>,
     /// Whether the VPN-detector watch is running, idle, or failed to start.
     pub detector_health: DetectorHealth,
     /// The configured domains.
@@ -702,6 +719,7 @@ mod tests {
                 dns_servers: vec!["10.0.0.1".to_string()],
             }),
             routing_state: RoutingState::Applied,
+            detected_dns: vec!["10.0.0.1".to_string()],
             detector_health: DetectorHealth::Active,
             domains: vec!["a.com".to_string(), "b.com".to_string()],
         }
@@ -722,6 +740,7 @@ mod tests {
                 vpn_up: false,
                 applied: None,
                 routing_state: RoutingState::VpnDown,
+                detected_dns: vec![],
                 detector_health: DetectorHealth::Error("nm absent".to_string()),
                 domains: vec![],
             }),
