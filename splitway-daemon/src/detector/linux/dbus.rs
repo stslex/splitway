@@ -195,17 +195,24 @@ async fn handle_state(
     match t {
         Transition::Up => {
             let iface = interface.to_string();
-            // detect() runs nmcli synchronously; keep it off the async thread.
+            // detect() runs nmcli synchronously (and may briefly block to let
+            // pushed DNS settle); keep it off the async thread.
             let detected = tokio::task::spawn_blocking(move || LinuxDetector.detect(&iface))
                 .await
                 .map_err(|e| PlatformError::CommandFailed(format!("detect task panicked: {e}")))?;
             match detected {
+                // Up-ness is NOT gated on finding pushed DNS: detect() returns
+                // Ok with possibly-empty dns_servers (e.g. a VPN that pushed no
+                // DNS), and we emit Up either way. An Up with empty DNS is a
+                // safe no-op downstream — StateMachine::desired() returns None
+                // for it, so nothing is applied or reverted.
                 Ok(info) => {
                     dedup.record(t);
                     send_event(tx, VpnEvent::Up(info)).await;
                 }
-                // Not recorded in dedup: a later re-emitted ACTIVATED
-                // state gets another chance to detect.
+                // detect() now errors only on a genuine nmcli failure / absent
+                // device, never on empty DNS. Not recorded in dedup: a later
+                // re-emitted ACTIVATED state gets another chance to detect.
                 Err(e) => log::warn!("{interface} reported up but detect failed: {e}"),
             }
         }
