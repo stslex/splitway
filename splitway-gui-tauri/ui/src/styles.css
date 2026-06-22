@@ -353,6 +353,13 @@ select.sel:disabled {
   cursor: default;
   opacity: 0.55;
 }
+/* Free-text interface fallback (when nothing was enumerated). */
+.iface-manual {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
 .dns {
   margin-top: 12px;
   font-size: 12px;

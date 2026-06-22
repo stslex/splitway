@@ -285,12 +285,48 @@ function dnsReadout(vm: ViewModel, mode: MainMode): HTMLElement {
   return el("div", { class: "dns-ok", text: note });
 }
 
+/** Free-text interface entry, used when the daemon enumerated no interfaces
+ *  (enumeration failed, or none are up). The picker alone would leave a fresh
+ *  config — empty vpn_name + empty list — with only a disabled placeholder and no
+ *  way to submit a SetConfig; the daemon tolerates the enumeration failure and
+ *  expects a free-text fallback (parity with the egui editor). Still round-trips
+ *  the hidden config fields via setInterface → configInputForInterface. */
+function interfaceManualEntry(vm: ViewModel, lc: Lifecycle, actions: Actions): HTMLElement {
+  const disabled = !vm.config_loaded || isPending(lc, "iface");
+  const input = el("input", { class: "field" }) as HTMLInputElement;
+  input.id = "iface";
+  input.type = "text";
+  input.value = vm.status?.interface ?? "";
+  input.placeholder = "interface name (e.g. tun0)";
+  input.autocomplete = "off";
+  input.setAttribute("aria-label", "Network interface");
+  input.disabled = disabled;
+  const submit = (): void => {
+    const name = input.value.trim();
+    if (name !== "") actions.setInterface(name);
+  };
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") submit();
+  });
+  const set = el("button", { class: "btn", text: "Set" }) as HTMLButtonElement;
+  set.type = "button";
+  set.disabled = disabled;
+  set.addEventListener("click", submit);
+  return el("div", { class: "iface-manual" }, [input, set]);
+}
+
 function interfaceBlock(vm: ViewModel, lc: Lifecycle, actions: Actions, mode: MainMode): HTMLElement {
   const label = el("label", { text: "Route DNS through" });
   label.setAttribute("for", "iface");
-  const head = el("div", { class: "head" }, [label, interfaceSelect(vm, lc, actions)]);
-  const dns = el("div", { class: "dns" }, [dnsReadout(vm, mode)]);
-  const block = el("div", { class: "iface-block panel reveal d3" }, [head, dns]);
+  const block = el("div", { class: "iface-block panel reveal d3" });
+  if (vm.interfaces.length === 0) {
+    // No enumerated interfaces — free-text fallback so the user is never stuck
+    // unable to set the interface (enumeration-failure / all-down case).
+    block.append(el("div", { class: "head" }, [label]), interfaceManualEntry(vm, lc, actions));
+  } else {
+    block.appendChild(el("div", { class: "head" }, [label, interfaceSelect(vm, lc, actions)]));
+  }
+  block.appendChild(el("div", { class: "dns" }, [dnsReadout(vm, mode)]));
   const err = errorFor(lc, "iface");
   if (err) block.appendChild(actionError(err));
   return block;

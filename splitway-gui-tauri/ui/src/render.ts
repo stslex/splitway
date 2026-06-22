@@ -123,13 +123,21 @@ export interface ConnIndicator {
   level: "ok" | "warn" | "off";
 }
 
-const FROZEN_BLOCKER: BlockerView = {
-  variant: "frozen",
-  tone: "warn",
-  title: "Configuration can't be loaded",
-  body: "The config file is malformed, so Splitway kept the last working setup. Fix the file to make changes again.",
-  command: "/var/lib/splitway/config.json",
-};
+/** The malformed-config blocker. The fix command points at the daemon's ACTUAL
+ *  active config path (from the snapshot), not a hardcoded default — a hand-started
+ *  or `--config` daemon may use `~/.config/splitway/config.json` or a custom path,
+ *  and the blocker returns before the footer, so this is the only path shown in the
+ *  frozen state. Falls back to the NixOS-service default only when the path is
+ *  unknown (empty). */
+function frozenBlocker(configPath: string): BlockerView {
+  return {
+    variant: "frozen",
+    tone: "warn",
+    title: "Configuration can't be loaded",
+    body: "The config file is malformed, so Splitway kept the last working setup. Fix the file to make changes again.",
+    command: configPath || "/var/lib/splitway/config.json",
+  };
+}
 
 /** Map a non-connected (or frozen) condition to its full-window blocker, or null
  *  when the main UI should render. ConfigInvalid is a blocker even while the link
@@ -164,8 +172,9 @@ function blockerFor(vm: ViewModel): BlockerView | null {
       body: vm.connection.message ?? "The app and the background service speak different versions. Update Splitway so they match.",
     };
   }
-  // Connected, but the on-disk config is frozen-invalid: a blocker too.
-  if (vm.status?.routing_state === "ConfigInvalid") return FROZEN_BLOCKER;
+  // Connected, but the on-disk config is frozen-invalid: a blocker too. Show the
+  // daemon's actual active config path so the fix points at the right file.
+  if (vm.status?.routing_state === "ConfigInvalid") return frozenBlocker(vm.config_path);
   return null;
 }
 
