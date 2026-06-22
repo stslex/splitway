@@ -178,7 +178,11 @@ function hero(
   }
 
   // Apply-failed is the one mode with a recovery action the mockup's happy path
-  // doesn't carry: offer a Resync so the user can re-drive reconciliation.
+  // doesn't carry: offer a Resync so the user can re-drive reconciliation. Its
+  // error gets its OWN slot beside the button — a *disable whose revert failed* is
+  // exactly how you reach apply-failed, so errors["toggle"] may already be set;
+  // sharing one slot (the old `toggle ?? reload`) would hide a later Resync
+  // failure behind the stale toggle error.
   if (mode === "apply-failed") {
     const resync = el("button", { class: "add" }) as HTMLButtonElement;
     resync.type = "button";
@@ -187,10 +191,12 @@ function hero(
     resync.disabled = pending;
     resync.addEventListener("click", () => actions.resync());
     statusBox.appendChild(resync);
+    const resyncErr = errorFor(lc, "reload");
+    if (resyncErr) statusBox.appendChild(actionError(resyncErr));
   }
 
-  const err = errorFor(lc, "toggle") ?? errorFor(lc, "reload");
-  if (err) statusBox.appendChild(actionError(err));
+  const toggleErr = errorFor(lc, "toggle");
+  if (toggleErr) statusBox.appendChild(actionError(toggleErr));
 
   return el("section", { class: "hero reveal d2" }, [top, statusBox]);
 }
@@ -205,7 +211,10 @@ function interfaceLabel(iface: InterfaceInfo): string {
 
 /** Picker entries: the enumerated interfaces, plus the configured interface when
  *  it is not among them (a VPN that is down right now), so the user's choice is
- *  never dropped from the list. Mirrors gui-core's `interface_choices`. */
+ *  never dropped from the list. Only ever called with a NON-empty list — the
+ *  empty-enumeration case is diverted to `interfaceManualEntry` by
+ *  `interfaceBlock` — so a configured-but-absent interface is always "(not
+ *  connected)" (the daemon enumerated others but not this one). */
 function interfaceChoices(
   interfaces: InterfaceInfo[],
   configured: string,
@@ -213,8 +222,7 @@ function interfaceChoices(
   const choices = interfaces.map((iface) => ({ name: iface.name, label: interfaceLabel(iface) }));
   const c = configured.trim();
   if (c !== "" && !interfaces.some((iface) => iface.name === c)) {
-    const label = interfaces.length === 0 ? `${c} (configured)` : `${c} (not connected)`;
-    choices.push({ name: c, label });
+    choices.push({ name: c, label: `${c} (not connected)` });
   }
   return choices;
 }
