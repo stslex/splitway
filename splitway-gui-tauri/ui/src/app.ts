@@ -68,6 +68,7 @@ const DNS_FOOTNOTE =
 export interface Actions {
   toggle(enable: boolean): void;
   setInterface(name: string): void;
+  setIfaceInput(value: string): void;
   openAdd(): void;
   cancelAdd(): void;
   setAddInput(value: string): void;
@@ -292,25 +293,32 @@ function dnsReadout(vm: ViewModel, mode: MainMode): HTMLElement {
  *  expects a free-text fallback (parity with the egui editor). Still round-trips
  *  the hidden config fields via setInterface → configInputForInterface. */
 function interfaceManualEntry(vm: ViewModel, lc: Lifecycle, actions: Actions): HTMLElement {
-  const disabled = !vm.config_loaded || isPending(lc, "iface");
+  const pending = isPending(lc, "iface");
+  const disabled = !vm.config_loaded || pending;
+  // Read from the lifecycle buffer (not vm.status.interface) so a background poll
+  // re-render never resets a partially-typed value before the user submits.
   const input = el("input", { class: "field" }) as HTMLInputElement;
   input.id = "iface";
   input.type = "text";
-  input.value = vm.status?.interface ?? "";
+  input.value = lc.ifaceInput;
   input.placeholder = "interface name (e.g. tun0)";
   input.autocomplete = "off";
   input.setAttribute("aria-label", "Network interface");
   input.disabled = disabled;
+  input.addEventListener("input", () => actions.setIfaceInput(input.value));
   const submit = (): void => {
-    const name = input.value.trim();
+    const name = lc.ifaceInput.trim();
     if (name !== "") actions.setInterface(name);
   };
   input.addEventListener("keydown", (event) => {
     if (event.key === "Enter") submit();
   });
-  const set = el("button", { class: "btn", text: "Set" }) as HTMLButtonElement;
+  const set = el("button", {
+    class: "btn",
+    text: pending ? "Setting…" : "Set",
+  }) as HTMLButtonElement;
   set.type = "button";
-  set.disabled = disabled;
+  set.disabled = disabled || lc.ifaceInput.trim() === "";
   set.addEventListener("click", submit);
   return el("div", { class: "iface-manual" }, [input, set]);
 }
@@ -813,7 +821,14 @@ export function start(root: HTMLElement): void {
       const config = lastVm?.config;
       if (!config || name === "" || name === lastVm?.status?.interface) return;
       const sent = configInputForInterface(config, name);
-      void runMutation("iface", () => api.setConfig(sent));
+      void runMutation("iface", async () => {
+        await api.setConfig(sent);
+        lc.ifaceInput = ""; // accepted → clear the manual-entry buffer
+      });
+    },
+    setIfaceInput: (value) => {
+      lc.ifaceInput = value;
+      rerender();
     },
 
     openAdd: () => {

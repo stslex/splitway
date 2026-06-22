@@ -43,6 +43,10 @@ export interface Lifecycle {
   addOpen: boolean;
   /** The add-domain text field (input hygiene only; the daemon validates). */
   addInput: string;
+  /** The free-text interface field, shown only when enumeration returns no
+   *  interfaces. A buffer (like addInput) so a background poll re-render never
+   *  resets a partially-typed value before the user submits it. */
+  ifaceInput: string;
   /** The check-domain text field. */
   checkInput: string;
   /** The ephemeral CheckDomain result/area. */
@@ -57,6 +61,7 @@ export function newLifecycle(): Lifecycle {
     errors: new Map(),
     addOpen: false,
     addInput: "",
+    ifaceInput: "",
     checkInput: "",
     check: "idle",
     undo: null,
