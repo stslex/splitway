@@ -27,4 +27,16 @@ echo "==> copy static assets"
 cp index.html dist/index.html
 cp src/styles.css dist/styles.css
 
+# Bundle the local IBM Plex woff2 (OFL-1.1) referenced by @font-face in
+# styles.css. The sandboxed webview has a self-only CSP and cannot reach a CDN,
+# so the fonts MUST travel inside dist/ — both for the packaged build and for a
+# `nix develop` run. See src/fonts/README.md.
+echo "==> copy bundled fonts"
+mkdir -p dist/assets/fonts
+cp src/fonts/*.woff2 dist/assets/fonts/
+# OFL-1.1 requires the license + copyright notice to travel with the
+# redistributed faces; ship it inside the bundle so it rides along with the
+# embedded fonts (the packaged build also installs it under share/licenses).
+cp src/fonts/LICENSE-OFL.txt dist/assets/fonts/
+
 echo "==> built ui/dist"

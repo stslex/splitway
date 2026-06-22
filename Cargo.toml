@@ -14,9 +14,9 @@ members = [
 # `nix build` / `nix flake check` that wrap them) operate on `default-members`,
 # keeping the daemon/CLI/egui build free of the webkit toolchain. Build it
 # explicitly inside `nix develop` (which provides the native deps):
-#   npm --prefix splitway-gui-tauri/ui ci && npm --prefix splitway-gui-tauri/ui run build
+#   sh splitway-gui-tauri/ui/build.sh   # frontend: tsc + esbuild, no npm
 #   cargo build -p splitway-gui-tauri
-# Packaging it for Nix (frontend vendoring + bundling) is Phase 7d.
+# The packaged, wrapped build is `nix build .#splitway-gui` (see flake.nix).
 default-members = [
     "splitway-daemon",
     "splitway-cli",

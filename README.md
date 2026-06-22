@@ -24,10 +24,12 @@ Splitway automates DNS-based traffic splitting: domains matching the rules are r
 
 ```
 splitway/
-├── splitway-daemon/   # Core daemon — applies/reverts resolvectl rules
-├── splitway-cli/      # CLI frontend (IPC client over the daemon socket)
-├── splitway-gui/      # Primitive GUI (egui; IPC client, no privileges)
-└── splitway-shared/   # Shared types and config parsing
+├── splitway-daemon/     # Core daemon — applies/reverts resolvectl rules
+├── splitway-cli/        # CLI frontend (IPC client over the daemon socket)
+├── splitway-gui/        # Interim egui GUI (IPC client, no privileges)
+├── splitway-gui-core/   # Shared GUI brain — view-model + truth-contract, no UI toolkit
+├── splitway-gui-tauri/  # Native Tauri GUI (web UI + Rust) — the shipping desktop app
+└── splitway-shared/     # Shared types and config parsing
 ```
 
 ## Config
@@ -212,6 +214,12 @@ The config-file path is shown read-only; the "Choose a file…" picker produces 
 `splitway-daemon run --config <PATH>` launch hint rather than switching the
 daemon's active file at runtime (runtime switching is a planned follow-up).
 
+> **Native GUI.** `splitway-gui` is the **interim** egui frontend. The shipping
+> desktop app is the native **Tauri** GUI (`splitway-gui-tauri`) — a real Wayland
+> window with the same unprivileged, daemon-driven design (it duplicates no
+> daemon logic and holds no privileges). Install it from the flake: see
+> [GUI (native Tauri)](#gui-native-tauri).
+
 ## Build
 
 ```sh
@@ -225,7 +233,7 @@ Binaries are placed in `target/release/`.
 With flakes enabled:
 
 ```sh
-nix build      # build both binaries into ./result/bin/
+nix build      # build the daemon, CLI, and egui GUI into ./result/bin/
 nix develop    # dev shell with cargo, rustc, rustfmt, clippy, rust-analyzer
 ```
 
@@ -299,6 +307,44 @@ single-writer state actor; a direct `sudo`-edit works too, and external edits ar
 picked up live. See [Config](#config) for the field reference (`vpn_name`,
 `vpn_hosts`, `vpn_backend`, `openvpn`).
 
+### GUI (native Tauri)
+
+The native GUI ships as its own flake package —
+`splitway.packages.${system}.splitway-gui` (Linux only; it links webkit2gtk). It
+is a **user-launched app, not a service**: a pure IPC client with no privileges,
+so it goes into a user/system profile rather than being run by the module. The
+build bakes in everything a fresh desktop needs — the IBM Plex fonts are bundled
+(the sandboxed webview reaches no CDN), the niri/webkit2gtk blank-window
+workaround is wired into the launch wrapper, and it installs a `.desktop` entry
+and hicolor icons under the app id `io.github.stslex.splitway`.
+
+Install it through the module — flip `installGui` on alongside the socket group:
+
+```nix
+services.splitway = {
+  enable = true;
+  unprivilegedGui = {
+    enable = true;             # 0660 group-accessible control socket (see below)
+    installGui = true;         # add splitway-gui-tauri to environment.systemPackages
+    users = [ "your-username" ];
+  };
+};
+```
+
+Or install the package yourself, system-wide or per-user, e.g.
+`environment.systemPackages = [ splitway.packages.${pkgs.system}.splitway-gui ];`
+(or `home.packages` under Home Manager).
+
+**The socket-group opt-in is required.** Being unprivileged, the GUI can drive
+the root daemon only if your user is in the daemon's socket group — exactly what
+`unprivilegedGui.enable` + `users` provision (a `0660 root:splitway` socket in a
+`0750` runtime dir). Without it the GUI, launched as your normal user, gets
+"permission denied" and surfaces the daemon's own guidance; running a Wayland GUI
+as root is not a good answer. `users = [ … ]` adds you to the `splitway` group —
+equivalently, add the group via your own `users.users.<name>.extraGroups`. See
+the security note under [Using it under niri](#using-it-under-niri-wayland), then
+that section for binding it to a key.
+
 ### Using it under niri (Wayland)
 
 niri is a tiling Wayland compositor with **no system tray**, so Splitway is a
@@ -313,15 +359,25 @@ sudo splitway check https://corp.example.com
 sudo splitway verify
 ```
 
-**GUI** — with no tray, run `splitway-gui` as a plain window, bound to a niri
-keybind (or launched with `spawn-at-startup`):
+**GUI** — with no tray, run the native GUI as a plain window, bound to a niri
+keybind (or launched with `spawn-at-startup`). It carries the app id
+`io.github.stslex.splitway` (its `.desktop` `StartupWMClass`), so a window rule
+can target it:
 
 ```kdl
 # ~/.config/niri/config.kdl
 binds {
-    Mod+Shift+S { spawn "splitway-gui"; }
+    Mod+Shift+S { spawn "splitway-gui-tauri"; }
+}
+window-rule {
+    match app-id="io.github.stslex.splitway"
+    default-column-width { proportion 0.4; }
 }
 ```
+
+Install it first — see [GUI (native Tauri)](#gui-native-tauri). (The interim egui
+GUI launches by spawning `splitway-gui` instead; it does **not** carry the
+`io.github.stslex.splitway` app id, so the window rule above is Tauri-only.)
 
 **Unprivileged access (opt-in).** By default the control socket is `0600` and
 root-owned, so a CLI or GUI launched as your normal desktop user gets "permission
@@ -357,9 +413,9 @@ no `sudo`. (Other init systems: add `--socket-group splitway` to the daemon's
 
 See [ROADMAP.md](ROADMAP.md) for the phased plan and done-criteria. Shipped so
 far: testable foundation → abstraction split (`VpnDetector`/`DnsBackend`) → real
-daemon + IPC → OpenVPN and macOS backends → an interim egui GUI. Next: finish
-the verification / business-logic work, then Linux + macOS packaging, a native
-Tauri GUI, and a hardening pass.
+daemon + IPC → OpenVPN and macOS backends → an interim egui GUI → the native
+Tauri GUI (read-only view → mutations → the Variant B visual design → Nix
+packaging). Next: broader Linux/macOS packaging and a hardening pass.
 
 ## Development
 

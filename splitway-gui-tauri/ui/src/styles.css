@@ -11,10 +11,48 @@
  * destructive); IBM Plex Sans for human text, IBM Plex Mono for machine data;
  * restrained motion behind prefers-reduced-motion; rounded focus rings.
  *
- * Fonts: the IBM Plex stacks fall back to the platform sans/mono, so the
- * machine→human typographic split holds even before the OFL woff2 files are
- * bundled (that bundling + @font-face lands with packaging in 7d-2). No webfont
- * CDN — the CSP is self-only. */
+ * Fonts: IBM Plex Sans/Mono ship as local subset woff2 in the bundle (see the
+ * @font-face block below and fonts/README.md), loaded same-origin — the self-only
+ * CSP blocks any webfont CDN. The platform sans/mono stay in the stacks as a
+ * fallback for glyphs IBM Plex lacks (e.g. ✕, ⚠) and for an unbundled dev run. */
+
+/* Bundled IBM Plex (OFL-1.1, fonts/README.md). Mono is weight 400 only; every
+   heavier weight in this file is Sans, so five faces cover the whole UI. */
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("assets/fonts/IBMPlexSans-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("assets/fonts/IBMPlexSans-Medium.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("assets/fonts/IBMPlexSans-SemiBold.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("assets/fonts/IBMPlexSans-Bold.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("assets/fonts/IBMPlexMono-Regular.woff2") format("woff2");
+}
 
 :root {
   --bg: #0e1217;
