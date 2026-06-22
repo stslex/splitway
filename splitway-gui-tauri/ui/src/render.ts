@@ -177,8 +177,14 @@ export function stageFor(vm: ViewModel): Stage {
   return { kind: "main", mode: mainMode(vm.status), status: vm.status };
 }
 
-/** The main mode from enabled + routing_state (ConfigInvalid handled upstream). */
+/** The main mode from enabled + routing_state (ConfigInvalid handled upstream).
+ *  Mirrors the daemon's `routing_state()` precedence: a failed apply/revert
+ *  (`ApplyFailed` — stale split-DNS rules may still be installed) outranks the
+ *  clean `Disabled` state, so a *disable whose revert failed* shows out-of-sync +
+ *  the Resync action rather than a reassuring "off". Checking `!enabled` first
+ *  would mask that. */
 export function mainMode(status: StatusInfo): MainMode {
+  if (status.routing_state === "ApplyFailed") return "apply-failed";
   if (!status.enabled) return "off";
   switch (status.routing_state) {
     case "NoDomains":
@@ -187,11 +193,10 @@ export function mainMode(status: StatusInfo): MainMode {
       return "waiting";
     case "NoDnsFromVpn":
       return "dns-missing";
-    case "ApplyFailed":
-      return "apply-failed";
     case "Applied":
       return "healthy";
-    // Disabled is covered by !enabled; ConfigInvalid is a blocker upstream.
+    // Disabled is covered by !enabled above; ApplyFailed/ConfigInvalid are handled
+    // before this switch (the latter is a full-window blocker upstream).
     default:
       return "healthy";
   }
