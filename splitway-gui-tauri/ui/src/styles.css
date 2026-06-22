@@ -312,6 +312,11 @@ body {
 }
 .status-line .if {
   font-family: var(--mono);
+  /* Pin to 400: the only var(--mono) element that would otherwise inherit a
+     non-400 weight (500, from .status-line). Only Mono 400 is bundled, and this
+     keeps every mono element at one weight (the "Mono = 400 only" invariant in
+     fonts/README.md) rather than synthesizing a faux-bold from the 400 face. */
+  font-weight: 400;
   font-size: 15px;
   color: var(--text);
 }
