@@ -11,13 +11,14 @@
   },
   "app": {
     "withGlobalTauri": true,
+    "enableGTKAppId": true,
     "windows": [
       {
         "label": "main",
         "title": "Splitway",
-        "width": 540,
-        "height": 720,
-        "minWidth": 420,
+        "width": 560,
+        "height": 820,
+        "minWidth": 380,
         "minHeight": 480
       }
     ],

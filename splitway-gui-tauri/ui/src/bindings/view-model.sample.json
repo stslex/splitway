@@ -30,6 +30,9 @@
       ],
       "interface": "tun0"
     },
+    "detected_dns": [
+      "10.0.0.1"
+    ],
     "detector_health": "Active",
     "domains": [
       "corp.example.com"

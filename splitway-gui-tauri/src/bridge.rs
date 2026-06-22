@@ -366,6 +366,7 @@ mod tests {
                     dns_servers: vec!["10.0.0.1".to_string()],
                 }),
                 routing_state: RoutingState::Applied,
+                detected_dns: vec!["10.0.0.1".to_string()],
                 detector_health: DetectorHealth::Active,
                 domains: vec!["corp.example.com".to_string()],
             })),
@@ -607,6 +608,7 @@ mod tests {
                     vpn_up: true,
                     applied: None,
                     routing_state: RoutingState::VpnDown,
+                    detected_dns: vec![],
                     detector_health: DetectorHealth::Active,
                     domains: if added.get() {
                         vec!["corp.example.com".to_string()]

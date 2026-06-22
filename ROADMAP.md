@@ -1,6 +1,6 @@
 # Roadmap
 
-Reflects code state as of 2026-06-20.
+Reflects code state as of 2026-06-22.
 
 Goal: finish the DNS-split solution to a shippable **v1 for Linux + macOS** —
 complete the verification / business-logic work, package it, and replace the
@@ -205,8 +205,25 @@ reimplemented per frontend:
   and the frozen state is shown prominently. No protocol change (the verbs already
   exist at v6); egui stays a read/write reference, untouched. See
   [`docs/design/tauri-mutations.md`](design/tauri-mutations.md).
-- **7d — visual design + window behavior + bundling**: the full-window layout,
-  Wayland/niri window behavior, and packaging.
+- **7d — visual design + window behavior** (done): the approved Variant B design as
+  the real Tauri UI — full-window layout, the simplified interface-centric model
+  (interface + domains; DNS auto-derived and shown read-only; no vpn-name/backend
+  fields or settings screen, hidden in the GUI only — the daemon keeps every config
+  field), every view-model variant designed (incl. the three full-window blockers),
+  delete-undo + check-loading through the 7c truth contract, the in-app brand mark,
+  and a stable niri `app_id` (`io.github.stslex.splitway` via `enableGTKAppId`). One
+  authorized additive protocol bump (v6 → **v7**): `StatusInfo.detected_dns` exposes
+  the selected interface's detected DNS independent of apply state, so the DNS
+  readout is honest in the empty/disabled states too. See
+  [`docs/design/tauri-design-window.md`](design/tauri-design-window.md). (Manual-DNS
+  override — for VPNs that connect but push no DNS — is deferred as a real future
+  daemon feature, not built here.)
+- **7d-2 — bundling**: Nix packaging (two-stage frontend + Rust, `wrapGAppsHook3`,
+  the blank-window workaround baked into the wrapper), distribution icons (tiled SVG
+  + generated PNG sizes) + `.desktop` (`StartupWMClass` = the `app_id`), the flake
+  `packages.<system>.splitway-gui`, bundling the IBM Plex OFL `woff2`, and the
+  README GUI-install section. Split from 7d because its real proof — the *built*
+  binary rendering for a fresh in-group niri user — is machine-bound.
 
 ### Phase 8 — feature freeze + hardening
 

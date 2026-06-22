@@ -1,28 +1,42 @@
 // The application: it owns the cached view-model and the request-lifecycle store,
-// subscribes to view-model-changed, renders, and wires the mutation controls to
-// the Tauri commands.
+// subscribes to view-model-changed, renders the Variant B design, and wires the
+// controls to the Tauri commands.
 //
 // THE TRUTH CONTRACT, made structural here:
-//   - `lastVm` is the ONLY authoritative state, and is assigned ONLY in
-//     `applyVm` (the VM-event / initial-fetch path). Search the file: nothing
-//     else writes it.
+//   - `lastVm` is the ONLY authoritative state, and is assigned ONLY in `applyVm`
+//     (the VM-event / initial-fetch path). Search the file: nothing else writes it.
 //   - Every mutation handler goes daemon-first: set pending → await the command →
 //     clear pending (+ per-action error on failure). It NEVER edits `lastVm`. The
 //     daemon's resulting truth arrives via the next view-model-changed event (the
 //     backend fires refresh-now after each mutation), and `applyVm` re-renders.
 //   - The only other state is the lifecycle store (pending / per-action error /
-//     ephemeral CheckDomain result / config-editor input buffers) — see
-//     lifecycle.ts. It describes the in-flight interaction, not daemon truth.
+//     add-row input / ephemeral CheckDomain result / ephemeral undo snackbar) —
+//     see lifecycle.ts. It describes the in-flight interaction, not daemon truth.
+//   - DOM is built with createElement / createElementNS + textContent (helpers in
+//     render.ts) — never innerHTML on daemon strings — so daemon data can't inject
+//     markup. (`grep -rn innerHTML ui/src` returns nothing: keep it so.)
+//
+// The Variant B simplification: two inputs only — interface + domains. There is
+// no backend field and no settings screen; the interface selector is the GUI's
+// ONLY config writer, and it round-trips the hidden vpn_backend / openvpn_* fields
+// unchanged via `configInputForInterface` (see config-input.ts) so an OpenVPN
+// user's daemon-side config is never reset.
 
 import {
-  configFileSection,
-  connectionHeader,
+  brandMark,
+  blockerIcon,
+  chipFor,
+  connIndicator,
+  domainDrifted,
+  driftOf,
   el,
-  interfacesSection,
-  row,
-  section,
-  statusRows,
-  verifySection,
+  stageFor,
+  statusLineNodes,
+  type BlockerVariant,
+  type BlockerView,
+  type ConnIndicator,
+  type MainMode,
+  type Stage,
 } from "./render";
 import {
   beginAction,
@@ -32,241 +46,387 @@ import {
   newLifecycle,
   type ActionKey,
   type CheckState,
-  type ConfigForm,
   type Lifecycle,
 } from "./lifecycle";
+import { configInputForInterface } from "./config-input";
 import * as api from "./api";
-import type { ConfigFields, ViewModel, VpnBackend } from "./bindings/view-model";
+import type { DomainCheckInfo, InterfaceInfo, StatusInfo, ViewModel } from "./bindings/view-model";
 
-/** Callbacks the rendered controls invoke. Defined as an interface so `renderApp`
- *  stays a pure `(vm, lifecycle, actions) -> nodes` builder, decoupled from the
- *  controller that owns the state. */
-export interface Actions {
-  toggle(enable: boolean): void;
-  addDomain(): void;
-  removeDomain(domain: string): void;
-  saveConfig(): void;
-  resync(): void;
-  check(): void;
-  setAddInput(value: string): void;
-  setCheckInput(value: string): void;
-  setConfigText(
-    field: "vpn_name" | "openvpn_management" | "openvpn_management_password_file",
-    value: string,
-  ): void;
-  setBackend(value: VpnBackend): void;
-}
+/** How long the undo snackbar lingers before the delete is left committed. The
+ *  delete already happened daemon-side; this is only the window to re-add. */
+const UNDO_MS = 11000;
 
-const BACKENDS: ReadonlyArray<readonly [VpnBackend, string]> = [
-  ["network-manager", "NetworkManager"],
-  ["openvpn", "OpenVPN"],
-];
-
+const PITCH =
+  "Send specific domains through the VPN. Everything else stays on your normal connection.";
+const CHECK_DESC =
+  "Test whether a host would route through the VPN or go direct. This only checks — it changes nothing.";
 const DNS_FOOTNOTE =
   "Checks DNS only — whether the name resolves through the VPN's resolver, not whether the address is reachable through the tunnel.";
 
-// --- small builders ---------------------------------------------------------
-
-function errorNote(text: string): HTMLElement {
-  return el("p", { class: "message message-Error action-error", text });
+/** Callbacks the rendered controls invoke. An interface so the section builders
+ *  stay pure `(vm, lc, actions) -> nodes`, decoupled from the controller. */
+export interface Actions {
+  toggle(enable: boolean): void;
+  setInterface(name: string): void;
+  openAdd(): void;
+  cancelAdd(): void;
+  setAddInput(value: string): void;
+  submitAdd(): void;
+  removeDomain(domain: string): void;
+  undoRemove(): void;
+  dismissUndo(): void;
+  setCheckInput(value: string): void;
+  check(): void;
+  resync(): void;
 }
 
-/** A labelled row whose value cell holds interactive controls. */
-function controlRow(label: string, controls: Node[]): HTMLElement {
-  return el("div", { class: "row" }, [
-    el("span", { class: "label", text: label }),
-    el("span", { class: "value" }, controls),
+// --- small builders ---------------------------------------------------------
+
+function actionError(text: string): HTMLElement {
+  return el("p", { class: "action-error", text });
+}
+
+// --- topbar -----------------------------------------------------------------
+
+function blockerConn(variant: BlockerVariant): ConnIndicator {
+  switch (variant) {
+    case "disconnected":
+    case "error":
+      return { text: "Disconnected", level: "off" };
+    case "no-permission":
+      return { text: "No access", level: "warn" };
+    case "frozen":
+      return { text: "Config error", level: "warn" };
+    case "version":
+      return { text: "Update needed", level: "warn" };
+  }
+}
+
+function connFor(stage: Stage): ConnIndicator {
+  switch (stage.kind) {
+    case "connecting":
+      return { text: "Connecting…", level: "off" };
+    case "blocker":
+      return blockerConn(stage.blocker.variant);
+    case "main":
+      return connIndicator(stage.mode);
+  }
+}
+
+function topbar(stage: Stage): HTMLElement {
+  const conn = connFor(stage);
+  const connEl = el("span", { class: "conn" }, [
+    el("span", { class: `dot ${conn.level}` }),
+    el("span", { text: conn.text }),
+  ]);
+  return el("div", { class: "topbar reveal d1" }, [
+    brandMark(),
+    el("span", { class: "wordmark", text: "Splitway" }),
+    el("span", { class: "grow" }),
+    connEl,
   ]);
 }
 
-function textInput(
-  id: string,
-  value: string,
-  placeholder: string,
-  disabled: boolean,
-  onInput: (value: string) => void,
-  onEnter?: () => void,
-): HTMLInputElement {
-  const input = el("input") as HTMLInputElement;
-  input.id = id;
-  input.type = "text";
-  input.value = value;
-  input.placeholder = placeholder;
-  input.disabled = disabled;
-  input.autocomplete = "off";
-  input.addEventListener("input", () => onInput(input.value));
-  if (onEnter) {
-    input.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") onEnter();
-    });
-  }
-  return input;
-}
+// --- hero -------------------------------------------------------------------
 
-function button(label: string, disabled: boolean, onClick: () => void): HTMLButtonElement {
-  const btn = el("button", { text: label }) as HTMLButtonElement;
-  btn.disabled = disabled;
-  btn.addEventListener("click", onClick);
+function switchControl(status: StatusInfo, lc: Lifecycle, actions: Actions): HTMLButtonElement {
+  const enabled = status.enabled;
+  const pending = isPending(lc, "toggle");
+  const btn = el("button", { class: "switch" }) as HTMLButtonElement;
+  btn.id = "sw";
+  btn.type = "button";
+  btn.setAttribute("role", "switch");
+  btn.setAttribute("aria-checked", String(enabled));
+  btn.setAttribute("aria-label", "Routing");
+  btn.disabled = pending;
+  btn.append(
+    el("span", { class: "lbl on", text: "ON" }),
+    el("span", { class: "lbl off", text: "OFF" }),
+    el("span", { class: "thumb" }),
+  );
+  btn.addEventListener("click", () => actions.toggle(!enabled));
   return btn;
 }
 
-// --- sections ---------------------------------------------------------------
+function hero(
+  status: StatusInfo,
+  lc: Lifecycle,
+  actions: Actions,
+  mode: MainMode,
+  vm: ViewModel,
+): HTMLElement {
+  const top = el("div", { class: "hero-top" }, [
+    el("span", { class: "pitch", text: PITCH }),
+    switchControl(status, lc, actions),
+  ]);
 
-/** A prominent banner when the on-disk config is malformed: the daemon froze on
- *  the last-good config and rejects every mutation until it is fixed on disk. */
-function frozenBanner(vm: ViewModel): HTMLElement | null {
-  if (vm.status?.routing_state !== "ConfigInvalid") return null;
-  return el("div", { class: "frozen-banner" }, [
-    el("strong", { text: "Config file invalid. " }),
-    el("span", {
-      text:
-        "The config on disk could not be parsed — edits are rejected until it is fixed on disk. " +
-        "The daemon is running on the last-good config.",
+  const line = el("p", { class: "status-line" }, statusLineNodes(mode, status));
+  line.id = "statusLine";
+  const statusBox = el("div", { class: "status" }, [line]);
+
+  const chip = chipFor(mode, driftOf(vm));
+  if (chip) {
+    const cls = chip.tone === "ok" ? "chip" : `chip ${chip.tone}`;
+    const chipEl = el("span", { class: cls });
+    if (chip.check) chipEl.appendChild(el("span", { class: "ic", text: "✓" }));
+    chipEl.appendChild(document.createTextNode(chip.text));
+    statusBox.appendChild(chipEl);
+  }
+
+  // Apply-failed is the one mode with a recovery action the mockup's happy path
+  // doesn't carry: offer a Resync so the user can re-drive reconciliation.
+  if (mode === "apply-failed") {
+    const resync = el("button", { class: "add" }) as HTMLButtonElement;
+    resync.type = "button";
+    const pending = isPending(lc, "reload");
+    resync.textContent = pending ? "Resyncing…" : "Resync";
+    resync.disabled = pending;
+    resync.addEventListener("click", () => actions.resync());
+    statusBox.appendChild(resync);
+  }
+
+  const err = errorFor(lc, "toggle") ?? errorFor(lc, "reload");
+  if (err) statusBox.appendChild(actionError(err));
+
+  return el("section", { class: "hero reveal d2" }, [top, statusBox]);
+}
+
+// --- interface block --------------------------------------------------------
+
+function interfaceLabel(iface: InterfaceInfo): string {
+  // Keep the option text close to the mockup's clean bare-name look; the up/down
+  // signal is carried by the status line + chip, so options stay uncluttered.
+  return iface.name;
+}
+
+/** Picker entries: the enumerated interfaces, plus the configured interface when
+ *  it is not among them (a VPN that is down right now), so the user's choice is
+ *  never dropped from the list. Mirrors gui-core's `interface_choices`. */
+function interfaceChoices(
+  interfaces: InterfaceInfo[],
+  configured: string,
+): { name: string; label: string }[] {
+  const choices = interfaces.map((iface) => ({ name: iface.name, label: interfaceLabel(iface) }));
+  const c = configured.trim();
+  if (c !== "" && !interfaces.some((iface) => iface.name === c)) {
+    const label = interfaces.length === 0 ? `${c} (configured)` : `${c} (not connected)`;
+    choices.push({ name: c, label });
+  }
+  return choices;
+}
+
+function interfaceSelect(vm: ViewModel, lc: Lifecycle, actions: Actions): HTMLSelectElement {
+  const sel = el("select", { class: "sel" }) as HTMLSelectElement;
+  sel.id = "iface";
+  sel.setAttribute("aria-label", "Network interface");
+  const configured = vm.status?.interface ?? "";
+  for (const choice of interfaceChoices(vm.interfaces, configured)) {
+    const opt = el("option", { text: choice.label }) as HTMLOptionElement;
+    opt.value = choice.name;
+    if (choice.name === configured) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  if (configured === "") {
+    // No interface configured yet: a leading placeholder so nothing reads as the
+    // current selection.
+    const opt = el("option", { text: "Select an interface…" }) as HTMLOptionElement;
+    opt.value = "";
+    opt.selected = true;
+    opt.disabled = true;
+    sel.insertBefore(opt, sel.firstChild);
+  }
+  // Disabled while the config has not loaded (we cannot safely round-trip the
+  // hidden fields yet) or while a previous interface write is in flight.
+  sel.disabled = !vm.config_loaded || isPending(lc, "iface");
+  sel.addEventListener("change", () => actions.setInterface(sel.value));
+  return sel;
+}
+
+function dnsReadout(vm: ViewModel, mode: MainMode): HTMLElement {
+  const status = vm.status as StatusInfo;
+  const iface = status.interface || "this interface";
+  const detected = status.detected_dns;
+
+  if (detected.length > 0) {
+    const ok = el("div", { class: "dns-ok" });
+    ok.append(
+      document.createTextNode("Using "),
+      el("span", { class: "ip", text: detected.join(", ") }),
+      document.createTextNode(" · detected from "),
+      el("span", { text: iface }),
+    );
+    return ok;
+  }
+
+  if (mode === "dns-missing") {
+    // DNS-not-detected fix — informational ONLY. The daemon auto-derives DNS from
+    // the interface and has no manual-DNS override (a real future daemon feature,
+    // not presentation), so a manual-entry box would be a dead/fake control and
+    // would violate the truth contract. Point at the real fixes instead.
+    const miss = el("div", { class: "dns-miss" });
+    const warn = el("div", { class: "warn" }, [
+      el("span", { class: "ic", text: "⚠" }),
+      document.createTextNode(
+        `No DNS detected on ${iface}. This interface isn't providing a DNS server — ` +
+          `pick the VPN's interface above, or check that the VPN is configured to push DNS.`,
+      ),
+    ]);
+    miss.appendChild(warn);
+    return miss;
+  }
+
+  // off / waiting / empty without detected DNS: a faint neutral note.
+  const note =
+    mode === "waiting"
+      ? `Waiting for ${iface} to come up.`
+      : `No DNS detected for ${iface} yet.`;
+  return el("div", { class: "dns-ok", text: note });
+}
+
+function interfaceBlock(vm: ViewModel, lc: Lifecycle, actions: Actions, mode: MainMode): HTMLElement {
+  const label = el("label", { text: "Route DNS through" });
+  label.setAttribute("for", "iface");
+  const head = el("div", { class: "head" }, [label, interfaceSelect(vm, lc, actions)]);
+  const dns = el("div", { class: "dns" }, [dnsReadout(vm, mode)]);
+  const block = el("div", { class: "iface-block panel reveal d3" }, [head, dns]);
+  const err = errorFor(lc, "iface");
+  if (err) block.appendChild(actionError(err));
+  return block;
+}
+
+// --- domains ----------------------------------------------------------------
+
+function addRow(lc: Lifecycle, actions: Actions): HTMLElement {
+  const pending = isPending(lc, "add");
+  const input = el("input", { class: "field" }) as HTMLInputElement;
+  input.id = "add-domain-input";
+  input.type = "text";
+  input.value = lc.addInput;
+  input.placeholder = "corp.example.com";
+  input.autocomplete = "off";
+  input.setAttribute("aria-label", "Domain to add");
+  input.disabled = pending;
+  input.addEventListener("input", () => actions.setAddInput(input.value));
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") actions.submitAdd();
+    else if (event.key === "Escape") actions.cancelAdd();
+  });
+  const add = el("button", { class: "btn", text: pending ? "Adding…" : "Add" }) as HTMLButtonElement;
+  add.type = "button";
+  add.disabled = pending || lc.addInput.trim() === "";
+  add.addEventListener("click", () => actions.submitAdd());
+  return el("div", { class: "add-row" }, [input, add]);
+}
+
+function domainCard(
+  domain: string,
+  iface: string,
+  lc: Lifecycle,
+  actions: Actions,
+  showVerify: boolean,
+  drifted: boolean,
+): HTMLElement {
+  const card = el("div", { class: drifted ? "card is-drift" : "card" });
+  const row = el("div", { class: "card-row" }, [
+    el("span", { class: "name", text: domain }),
+    el("span", { class: "route" }, [
+      el("span", { class: "arrow", text: "→" }),
+      document.createTextNode(" "),
+      el("span", { class: "ifn", text: iface || "direct" }),
+    ]),
+  ]);
+  if (showVerify) {
+    row.appendChild(
+      el("span", { class: drifted ? "vstate drift" : "vstate ok", text: drifted ? "⚠" : "✓" }),
+    );
+  }
+  const del = el("button", { class: "del", text: "✕" }) as HTMLButtonElement;
+  del.type = "button";
+  del.setAttribute("aria-label", `Remove ${domain}`);
+  del.disabled = isPending(lc, `remove:${domain}`);
+  del.addEventListener("click", () => actions.removeDomain(domain));
+  row.appendChild(del);
+  card.appendChild(row);
+
+  if (drifted) {
+    const sub = el("div", { class: "sub warn" });
+    sub.append(
+      document.createTextNode("expected "),
+      el("span", { class: "ifn", text: iface }),
+      document.createTextNode(" — system currently resolves it direct"),
+    );
+    card.appendChild(sub);
+  }
+  const err = errorFor(lc, `remove:${domain}`);
+  if (err) card.appendChild(actionError(err));
+  return card;
+}
+
+function emptyPlaceholder(): HTMLElement {
+  return el("div", { class: "empty" }, [
+    el("div", { class: "t", text: "No domains yet" }),
+    el("div", {
+      class: "s",
+      text: "Add a domain to start routing it through the VPN. Everything stays direct until you do.",
     }),
   ]);
 }
 
-function statusSection(vm: ViewModel, lc: Lifecycle, actions: Actions): HTMLElement {
-  const body = statusRows(vm.status);
-  const pending = isPending(lc, "toggle");
-  const enabled = vm.status?.enabled ?? false;
-  const toggle = button(
-    pending ? "working…" : enabled ? "Disable" : "Enable",
-    !vm.connected || pending || vm.status === null,
-    () => actions.toggle(!enabled),
-  );
-  const control: Node[] = [el("div", { class: "control" }, [toggle])];
-  const err = errorFor(lc, "toggle");
-  if (err) control.push(errorNote(err));
-  return section("Status", [...body, ...control]);
+function everythingElse(): HTMLElement {
+  return el("div", { class: "everything" }, [
+    el("span", { class: "rest", text: "Everything else" }),
+    el("span", { class: "direct" }, [
+      el("span", { class: "arrow", text: "→" }),
+      document.createTextNode(" direct"),
+    ]),
+  ]);
 }
 
-function domainsSection(vm: ViewModel, lc: Lifecycle, actions: Actions): HTMLElement {
-  const domains = vm.status?.domains ?? [];
-  const body: Node[] = [];
+function domainsSection(
+  vm: ViewModel,
+  lc: Lifecycle,
+  actions: Actions,
+  mode: MainMode,
+): HTMLElement {
+  const status = vm.status as StatusInfo;
+  const domains = status.domains;
 
-  if (domains.length === 0) {
-    body.push(el("p", { class: "muted", text: "(no domains configured)" }));
-  } else {
-    const list = el("ul", { class: "domains" });
-    for (const domain of domains) {
-      const key: ActionKey = `remove:${domain}`;
-      const pending = isPending(lc, key);
-      const remove = button(pending ? "…" : "✖", !vm.connected || pending, () =>
-        actions.removeDomain(domain),
-      );
-      remove.classList.add("remove");
-      const li = el("li", {}, [remove, el("span", { text: ` ${domain}` })]);
-      const err = errorFor(lc, key);
-      if (err) li.appendChild(errorNote(err));
-      list.appendChild(li);
-    }
-    body.push(list);
-  }
+  const count = el("span", { class: "count", text: String(domains.length) });
+  count.id = "count";
+  const eyebrowLabel = el("span", { class: "label" }, [document.createTextNode("Domains "), count]);
 
-  const addPending = isPending(lc, "add");
-  const input = textInput(
-    "add-domain-input",
-    lc.addInput,
-    "add a domain (e.g. corp.example.com)",
-    !vm.connected || addPending,
-    (value) => actions.setAddInput(value),
-    () => actions.addDomain(),
-  );
-  const add = button(
-    addPending ? "…" : "Add",
-    !vm.connected || addPending || lc.addInput.trim() === "",
-    () => actions.addDomain(),
-  );
-  body.push(el("div", { class: "control" }, [input, add]));
+  const add = el("button", { class: "add" }) as HTMLButtonElement;
+  add.type = "button";
+  add.disabled = isPending(lc, "add");
+  add.append(el("span", { class: "plus", text: "+" }), document.createTextNode(" Add domain"));
+  add.addEventListener("click", () => (lc.addOpen ? actions.cancelAdd() : actions.openAdd()));
+
+  const children: Node[] = [el("div", { class: "eyebrow" }, [eyebrowLabel, add])];
+  if (lc.addOpen) children.push(addRow(lc, actions));
   const addErr = errorFor(lc, "add");
-  if (addErr) body.push(errorNote(addErr));
+  if (addErr) children.push(actionError(addErr));
 
-  return section("Routed domains", body);
+  if (mode === "empty") {
+    children.push(emptyPlaceholder());
+  } else {
+    const list = el("div", { class: "domains" });
+    list.id = "domains";
+    // Per-domain verify (✓ / ⚠) is only meaningful when rules are actually applied
+    // AND a live read-back exists; otherwise show no badge rather than a fake ✓.
+    const drift = mode === "healthy" ? driftOf(vm) : null;
+    const showVerify = mode === "healthy" && drift !== null;
+    for (const domain of domains) {
+      list.appendChild(
+        domainCard(domain, status.interface, lc, actions, showVerify, domainDrifted(drift, domain)),
+      );
+    }
+    children.push(list);
+  }
+  children.push(everythingElse());
+  return el("section", { class: "section reveal d4" }, children);
 }
 
-function configSection(vm: ViewModel, lc: Lifecycle, actions: Actions): HTMLElement {
-  if (!vm.config_loaded) {
-    return section("Configuration", [el("p", { class: "muted", text: "loading config…" })]);
-  }
-  const pending = isPending(lc, "config");
-  const disabled = !vm.connected || pending;
-  const cfg = lc.config;
-  const rows: Node[] = [];
-
-  // Active-file-changed-under-an-unsaved-edit warning (parity with the egui editor).
-  if (lc.configPathWarning) {
-    rows.push(el("p", { class: "message message-Error config-path-warning", text: lc.configPathWarning }));
-  }
-
-  // Interface (vpn_name): free text with a datalist of enumerated interfaces.
-  const nameInput = textInput(
-    "config-vpn-name",
-    cfg.vpn_name,
-    "interface name (e.g. tun0)",
-    disabled,
-    (value) => actions.setConfigText("vpn_name", value),
-  );
-  nameInput.setAttribute("list", "iface-options");
-  const datalist = el("datalist") as HTMLDataListElement;
-  datalist.id = "iface-options";
-  for (const iface of vm.interfaces) {
-    const option = el("option") as HTMLOptionElement;
-    option.value = iface.name;
-    datalist.appendChild(option);
-  }
-  rows.push(controlRow("interface (vpn_name)", [nameInput, datalist]));
-
-  // Backend.
-  const backend = el("select") as HTMLSelectElement;
-  backend.id = "config-backend";
-  backend.disabled = disabled;
-  for (const [value, label] of BACKENDS) {
-    const option = el("option", { text: label }) as HTMLOptionElement;
-    option.value = value;
-    if (cfg.vpn_backend === value) option.selected = true;
-    backend.appendChild(option);
-  }
-  backend.addEventListener("change", () => actions.setBackend(backend.value as VpnBackend));
-  rows.push(controlRow("backend", [backend]));
-
-  // OpenVPN fields only matter for the OpenVPN backend.
-  if (cfg.vpn_backend === "openvpn") {
-    rows.push(
-      controlRow("openvpn management", [
-        textInput(
-          "config-openvpn-mgmt",
-          cfg.openvpn_management,
-          "127.0.0.1:7505 or /run/openvpn/mgmt.sock",
-          disabled,
-          (value) => actions.setConfigText("openvpn_management", value),
-        ),
-      ]),
-    );
-    rows.push(
-      controlRow("openvpn password file", [
-        textInput(
-          "config-openvpn-pass",
-          cfg.openvpn_management_password_file,
-          "(optional) password file path",
-          disabled,
-          (value) => actions.setConfigText("openvpn_management_password_file", value),
-        ),
-      ]),
-    );
-  }
-
-  const save = button(
-    pending ? "saving…" : "Save configuration",
-    disabled || !cfg.dirty,
-    () => actions.saveConfig(),
-  );
-  rows.push(el("div", { class: "control" }, [save]));
-  const err = errorFor(lc, "config");
-  if (err) rows.push(errorNote(err));
-
-  return section("Configuration", rows);
-}
+// --- check a domain ---------------------------------------------------------
 
 function checkRoutingText(routingState: string, covered: boolean): string {
   if (!covered) return "not configured to route through the VPN";
@@ -274,171 +434,228 @@ function checkRoutingText(routingState: string, covered: boolean): string {
     case "Applied":
       return "routed through the VPN's DNS";
     case "Disabled":
-      return "configured to route, but rule application is disabled — not routed right now";
+      return "configured to route, but routing is off right now";
     case "VpnDown":
-      return "configured to route, but the VPN is down — not routed right now";
+      return "configured to route, but the VPN is down right now";
     case "NoDnsFromVpn":
-      return "configured to route, but the VPN pushes no DNS — not routed right now";
+      return "configured to route, but the VPN pushes no DNS right now";
     case "ApplyFailed":
-      return "configured to route, but applying the rules failed (out of sync) — not routed right now";
+      return "configured to route, but the rules are out of sync right now";
     case "ConfigInvalid":
-      return "the config file on disk is invalid; routing reflects the last-good config";
+      return "the config file is invalid; routing reflects the last-good config";
     default:
       return "configured to route";
   }
 }
 
-function checkResult(check: CheckState): HTMLElement {
-  if (check === "idle") {
-    return el("p", {
-      class: "muted check-result",
-      text: "Enter a host to check whether it routes through the VPN.",
-    });
-  }
-  if (check === "pending") {
-    return el("p", { class: "muted check-result", text: "checking…" });
-  }
-  if (check.state === "Error") {
-    return el("p", { class: "message message-Error check-result", text: check.message });
-  }
-
-  const info = check.result;
+function checkVerdictNodes(info: DomainCheckInfo): Node[] {
   const live = info.resolution;
   // Live attribution is authoritative over belief: if the daemon believes the
-  // host is routed (`Applied`) but the name actually resolved via a non-VPN link
-  // (out-of-band DNS drift), don't reassure "routed through the VPN" — say the
-  // live result disagrees and is the one to trust (mirrors the CLI's drift line).
+  // host is routed but the name resolved via a non-VPN link, say the live result
+  // disagrees and is the one to trust (mirrors the CLI's drift line).
   const answeredElsewhere =
     live?.via_interface != null &&
     info.vpn_interface !== "" &&
     live.via_interface !== info.vpn_interface;
-  const routingVerdict =
-    info.covered && info.routing_state === "Applied" && answeredElsewhere
-      ? `the daemon believes it is routed, but the name resolved via ${live!.via_interface}, ` +
-        `not the VPN (${info.vpn_interface}) — trust the live result`
-      : checkRoutingText(info.routing_state, info.covered);
 
-  const rows: Node[] = [
-    row("host", info.host),
-    row(
-      "coverage",
-      info.covered
-        ? info.matched_domain
-          ? `covered by ${info.matched_domain}`
-          : "covered"
-        : "NOT covered by any configured domain",
-    ),
-    row("routing", routingVerdict),
-  ];
-  if (live) {
-    rows.push(row("resolved", live.addresses.length ? live.addresses.join(", ") : "(none)"));
-    if (live.via_interface) {
-      // Attribute the answering link relative to the configured VPN interface.
-      let viaNote = live.via_interface;
-      if (info.vpn_interface !== "") {
-        viaNote =
-          live.via_interface === info.vpn_interface
-            ? `${live.via_interface} — the VPN's link`
-            : `${live.via_interface} — not the VPN link (${info.vpn_interface})`;
-      }
-      rows.push(row("via link", viaNote));
-    }
+  const nodes: Node[] = [];
+  if (info.covered) {
+    nodes.push(document.createTextNode("Matches "));
+    nodes.push(el("code", { text: info.matched_domain ?? info.host }));
+    nodes.push(
+      document.createTextNode(
+        " — " +
+          (answeredElsewhere && info.routing_state === "Applied"
+            ? `the daemon believes it routes, but it resolved via ${live!.via_interface}, not the VPN — trust the live result`
+            : checkRoutingText(info.routing_state, true)),
+      ),
+    );
   } else {
-    rows.push(row("resolved", "(live resolution unavailable)"));
+    nodes.push(document.createTextNode("No matching rule — "));
+    nodes.push(el("code", { text: info.host }));
+    nodes.push(document.createTextNode(" goes direct"));
   }
-  rows.push(el("p", { class: "muted footnote", text: DNS_FOOTNOTE }));
-  return el("div", { class: "check-result" }, rows);
+
+  if (live && live.addresses.length > 0) {
+    const viaNote =
+      live.via_interface != null && info.vpn_interface !== ""
+        ? live.via_interface === info.vpn_interface
+          ? ` via ${live.via_interface} (the VPN's link)`
+          : ` via ${live.via_interface} (not the VPN link)`
+        : live.via_interface != null
+          ? ` via ${live.via_interface}`
+          : "";
+    nodes.push(el("span", { class: "footnote", text: `Resolved to ${live.addresses.join(", ")}${viaNote}.` }));
+  }
+  nodes.push(el("span", { class: "footnote", text: DNS_FOOTNOTE }));
+  return nodes;
 }
 
-function checkSection(vm: ViewModel, lc: Lifecycle, actions: Actions): HTMLElement {
+function checkResult(check: CheckState): HTMLElement | null {
+  if (check === "idle" || check === "pending") return null;
+  if (check.state === "Error") {
+    return el("div", { class: "result bad" }, [
+      el("span", { class: "pin", text: "→" }),
+      el("span", { text: check.message }),
+    ]);
+  }
+  const info = check.result;
+  const cls = info.covered ? "result" : "result miss";
+  return el("div", { class: cls }, [
+    el("span", { class: "pin", text: "→" }),
+    el("span", {}, checkVerdictNodes(info)),
+  ]);
+}
+
+function checkSection(lc: Lifecycle, actions: Actions): HTMLElement {
   const pending = lc.check === "pending";
-  const input = textInput(
-    "check-input",
-    lc.checkInput,
-    "paste a host or URL to check",
-    !vm.connected || pending,
-    (value) => actions.setCheckInput(value),
-    () => actions.check(),
-  );
-  const check = button(
-    pending ? "checking…" : "Check",
-    !vm.connected || pending || lc.checkInput.trim() === "",
-    () => actions.check(),
-  );
-  return section("Check a domain", [el("div", { class: "control" }, [input, check]), checkResult(lc.check)]);
+  const input = el("input", { class: "field" }) as HTMLInputElement;
+  input.id = "check-input";
+  input.type = "text";
+  input.value = lc.checkInput;
+  input.placeholder = "host.example.com";
+  input.autocomplete = "off";
+  input.setAttribute("aria-label", "Domain to check");
+  input.disabled = pending;
+  input.addEventListener("input", () => actions.setCheckInput(input.value));
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") actions.check();
+  });
+
+  const btn = el("button", { class: "btn" }) as HTMLButtonElement;
+  btn.type = "button";
+  if (pending) {
+    btn.append(el("span", { class: "spinner" }), document.createTextNode("Checking"));
+  } else {
+    btn.textContent = "Check";
+  }
+  btn.disabled = pending || lc.checkInput.trim() === "";
+  btn.addEventListener("click", () => actions.check());
+
+  const children: Node[] = [
+    el("div", { class: "eyebrow" }, [el("span", { class: "label", text: "Check a domain" })]),
+    el("p", { class: "desc", text: CHECK_DESC }),
+    el("div", { class: "check-row" }, [input, btn]),
+  ];
+  const result = checkResult(lc.check);
+  if (result) children.push(result);
+  return el("section", { class: "section reveal d5" }, children);
 }
 
-function footerControls(vm: ViewModel, lc: Lifecycle, actions: Actions): HTMLElement {
-  const pending = isPending(lc, "reload");
-  const resync = button(pending ? "resyncing…" : "Resync", !vm.connected || pending, () =>
-    actions.resync(),
-  );
-  const nodes: Node[] = [el("div", { class: "control" }, [resync])];
-  const err = errorFor(lc, "reload");
-  if (err) nodes.push(errorNote(err));
-  return section("Resync", nodes);
+// --- footer, message, toast, blockers --------------------------------------
+
+function footer(vm: ViewModel): HTMLElement {
+  return el("div", { class: "foot reveal d5", text: `config ${vm.config_path || "(unknown)"}` });
+}
+
+function messageBanner(vm: ViewModel): HTMLElement | null {
+  if (!vm.message) return null;
+  return el("div", { class: `message message-${vm.message.kind}`, text: vm.message.text });
+}
+
+function undoToast(lc: Lifecycle, actions: Actions): HTMLElement {
+  const toast = el("div", { class: lc.undo ? "toast show" : "toast" });
+  toast.id = "toast";
+  const msg = el("span", { class: "msg" });
+  toast.appendChild(msg);
+  // The buttons exist ONLY while the toast is shown. When hidden, the toast is
+  // opacity:0 + pointer-events:none, but those don't remove an element from the
+  // tab order — leaving the buttons present would be focusable-but-invisible (a
+  // keyboard tab trap). Conditional render keeps them out of the tab order when
+  // hidden (the full-rebuild model already precludes a slide-out animation, so
+  // nothing is lost by not keeping them in the DOM).
+  if (lc.undo) {
+    msg.append(document.createTextNode("Removed "), el("code", { text: lc.undo.domain }));
+    const undo = el("button", { class: "undo", text: "Undo" }) as HTMLButtonElement;
+    undo.type = "button";
+    undo.addEventListener("click", () => actions.undoRemove());
+    const dismiss = el("button", { class: "x", text: "✕" }) as HTMLButtonElement;
+    dismiss.type = "button";
+    dismiss.setAttribute("aria-label", "Dismiss");
+    dismiss.addEventListener("click", () => actions.dismissUndo());
+    toast.append(undo, dismiss);
+  }
+  return toast;
+}
+
+function blockerNode(blocker: BlockerView): HTMLElement {
+  const icon = el("div", { class: "ic" }, [blockerIcon(blocker.variant)]);
+  const body = el("p");
+  if (blocker.codeWord && blocker.body.includes("{}")) {
+    const [before, after] = blocker.body.split("{}");
+    body.append(
+      document.createTextNode(before),
+      el("span", { class: "inline-code", text: blocker.codeWord }),
+      document.createTextNode(after),
+    );
+  } else {
+    body.textContent = blocker.body;
+  }
+  const blk = el("div", { class: `blk ${blocker.tone}` }, [
+    icon,
+    el("h3", { text: blocker.title }),
+    body,
+  ]);
+  if (blocker.command) blk.appendChild(el("code", { class: "cmd", text: blocker.command }));
+  return el("div", { class: "blocker" }, [blk]);
+}
+
+function connectingNode(): HTMLElement {
+  return el("div", { class: "blocker" }, [
+    el("div", { class: "blk neutral" }, [el("p", { class: "muted", text: "Connecting…" })]),
+  ]);
 }
 
 /** Pure builder: the whole UI from (vm, lifecycle, actions). `vm === null` only
  *  before the first event lands. */
 export function renderApp(vm: ViewModel | null, lc: Lifecycle, actions: Actions): Node[] {
-  if (!vm) {
-    return [el("p", { class: "muted", text: "Connecting…" })];
+  const stage: Stage = vm ? stageFor(vm) : { kind: "connecting" };
+  const children: Node[] = [topbar(stage)];
+
+  if (stage.kind === "connecting") {
+    children.push(connectingNode());
+    return children;
   }
-  const children: Node[] = [connectionHeader(vm)];
-  const frozen = frozenBanner(vm);
-  if (frozen) children.push(frozen);
+  if (stage.kind === "blocker") {
+    children.push(blockerNode(stage.blocker));
+    return children;
+  }
+
+  // Main stage — vm is non-null here.
+  const live = vm as ViewModel;
   children.push(
-    statusSection(vm, lc, actions),
-    domainsSection(vm, lc, actions),
-    configSection(vm, lc, actions),
-    checkSection(vm, lc, actions),
-    verifySection(vm.verify),
-    interfacesSection(vm),
-    configFileSection(vm),
-    footerControls(vm, lc, actions),
+    hero(stage.status, lc, actions, stage.mode, live),
+    interfaceBlock(live, lc, actions, stage.mode),
+    domainsSection(live, lc, actions, stage.mode),
+    checkSection(lc, actions),
   );
-  if (vm.message) {
-    children.push(el("div", { class: `message message-${vm.message.kind}`, text: vm.message.text }));
-  }
+  const message = messageBanner(live);
+  if (message) children.push(message);
+  children.push(footer(live), undoToast(lc, actions));
   return children;
 }
 
+/** The data-on / data-mode the CSS keys off, derived from a stage. */
+function rootDataset(stage: Stage): { on: string; mode: string } {
+  if (stage.kind === "main") return { on: String(stage.status.enabled), mode: stage.mode };
+  return { on: "false", mode: stage.kind === "blocker" ? stage.blocker.variant : "connecting" };
+}
+
 // --- controller -------------------------------------------------------------
-
-function adoptConfig(form: ConfigForm, config: ConfigFields): void {
-  form.vpn_name = config.vpn_name;
-  form.vpn_backend = config.vpn_backend;
-  form.openvpn_management = config.openvpn_management;
-  form.openvpn_management_password_file = config.openvpn_management_password_file ?? "";
-  form.dirty = false;
-}
-
-function emptyToNull(value: string): string | null {
-  const trimmed = value.trim();
-  return trimmed === "" ? null : trimmed;
-}
-
-/** Whether the daemon's reported config already equals what the editor would
- *  send (trimmed; the daemon stores SetConfig's fields verbatim). True after a
- *  save *landed* — including the architecture-§2 "saved-but-apply-failed" case,
- *  where the config was persisted but reconciling it failed and the command still
- *  rejected. Lets the editor tell that apart from a persist/validation/frozen
- *  failure (where the daemon's config is unchanged) using daemon truth, not the
- *  opaque error string. */
-function configMatchesDaemon(daemon: ConfigFields, form: ConfigForm): boolean {
-  return (
-    daemon.vpn_name === form.vpn_name.trim() &&
-    daemon.vpn_backend === form.vpn_backend &&
-    daemon.openvpn_management === form.openvpn_management.trim() &&
-    (daemon.openvpn_management_password_file ?? "") === form.openvpn_management_password_file.trim()
-  );
-}
 
 /** Boot the app into `root`: subscribe, fetch once, render, and wire controls. */
 export function start(root: HTMLElement): void {
   let lastVm: ViewModel | null = null; // the ONLY authoritative state; written only in applyVm
   const lc = newLifecycle();
+  let undoTimer: ReturnType<typeof setTimeout> | null = null;
+  let introStarted = false; // the staggered reveal plays once, on the first main paint
+
+  function clearUndoTimer(): void {
+    if (undoTimer !== null) {
+      clearTimeout(undoTimer);
+      undoTimer = null;
+    }
+  }
 
   function rerender(): void {
     // Preserve focus + caret across the full rebuild (text inputs survive a
@@ -448,6 +665,19 @@ export function start(root: HTMLElement): void {
     const selStart = active instanceof HTMLInputElement ? active.selectionStart : null;
     const selEnd = active instanceof HTMLInputElement ? active.selectionEnd : null;
 
+    const stage: Stage = lastVm ? stageFor(lastVm) : { kind: "connecting" };
+    const ds = rootDataset(stage);
+    root.dataset.on = ds.on;
+    root.dataset.mode = ds.mode;
+    // One-time entrance reveal: add `.intro` on the first main paint so the
+    // staggered animation plays once, then drop it so later rebuilds (every VM
+    // event / keystroke) don't replay it. The class lives on the persistent #app
+    // root, not the rebuilt children. See styles.css `.app.intro .reveal`.
+    if (stage.kind === "main" && !introStarted) {
+      introStarted = true;
+      root.classList.add("intro");
+      setTimeout(() => root.classList.remove("intro"), 900);
+    }
     root.replaceChildren(...renderApp(lastVm, lc, actions));
 
     if (activeId) {
@@ -463,47 +693,7 @@ export function start(root: HTMLElement): void {
 
   // The ONLY writer of lastVm.
   function applyVm(vm: ViewModel): void {
-    const prevPath = lastVm?.config_path ?? null;
     lastVm = vm;
-    if (
-      vm.config_loaded &&
-      vm.config &&
-      (!lc.config.dirty || configMatchesDaemon(vm.config, lc.config))
-    ) {
-      // Adopt the daemon's config when it is safe: the editor is clean, OR the
-      // daemon's config already equals what the editor would send. The latter
-      // covers a *saved-but-apply-failed* save (architecture §2) — the write
-      // landed (daemon == sent) even though the command rejected — so the editor
-      // goes clean and Save disables, rather than showing the saved edit as
-      // unsaved (the next action is Resync, not another write). A
-      // persist/validation/frozen failure leaves the daemon's config unchanged
-      // (!= the edit), so the editor stays dirty for a fix-and-retry. Adopting
-      // also clears any stale path-change warning (the buffers now match the file).
-      //
-      // Deliberately NOT gated on the config-save pending flag: the refresh-now
-      // re-poll can deliver the post-save VM *before* the command's rejection
-      // clears pending, and a pending-gate would skip adoption then — leaving the
-      // editor stranded dirty once the next (identical) snapshot is deduped. The
-      // dirty+matches test is sufficient on its own: while a save is genuinely
-      // in flight and unlanded the daemon's config still != the edit (no adopt,
-      // no clobber); once it lands, daemon == sent so it adopts regardless of the
-      // VM-event vs rejection ordering.
-      adoptConfig(lc.config, vm.config);
-      lc.configPathWarning = null;
-    } else if (
-      lc.config.dirty &&
-      prevPath !== null &&
-      vm.config_path !== "" &&
-      vm.config_path !== prevPath
-    ) {
-      // The daemon's active config file changed under an unsaved edit. Keep the
-      // buffers (don't clobber the edit) but warn: Save writes to the daemon's
-      // *current* file, so saving old-file buffers would overwrite the new file's
-      // editable fields without notice. Parity with GuiCore::load_config_view.
-      lc.configPathWarning =
-        `The daemon's active config file changed to ${vm.config_path} while you have ` +
-        `unsaved edits — re-check before saving (Save writes to the daemon's current file).`;
-    }
     rerender();
   }
 
@@ -521,42 +711,78 @@ export function start(root: HTMLElement): void {
     rerender();
   }
 
+  function showUndo(domain: string): void {
+    clearUndoTimer();
+    lc.undo = { domain };
+    undoTimer = setTimeout(() => {
+      undoTimer = null;
+      lc.undo = null;
+      rerender();
+    }, UNDO_MS);
+  }
+
   const actions: Actions = {
     toggle: (enable) => void runMutation("toggle", () => api.setEnabled(enable)),
-    addDomain: () => {
+
+    // The interface selector is the ONLY config writer. It round-trips the hidden
+    // vpn_backend / openvpn_* fields unchanged (configInputForInterface), so an
+    // OpenVPN user's daemon config is never reset by a GUI interface switch.
+    setInterface: (name) => {
+      const config = lastVm?.config;
+      if (!config || name === "" || name === lastVm?.status?.interface) return;
+      const sent = configInputForInterface(config, name);
+      void runMutation("iface", () => api.setConfig(sent));
+    },
+
+    openAdd: () => {
+      lc.addOpen = true;
+      lc.errors.delete("add");
+      rerender();
+      document.getElementById("add-domain-input")?.focus();
+    },
+    cancelAdd: () => {
+      lc.addOpen = false;
+      lc.addInput = "";
+      lc.errors.delete("add");
+      rerender();
+    },
+    setAddInput: (value) => {
+      lc.addInput = value;
+      rerender();
+    },
+    submitAdd: () => {
       const domain = lc.addInput.trim();
       if (domain === "") return; // input hygiene; the daemon validates the rest
       void runMutation("add", async () => {
         await api.addDomain(domain);
-        lc.addInput = ""; // accepted → clear the field (the VM event re-renders the list)
+        lc.addInput = ""; // accepted → clear + close (the VM event re-renders the list)
+        lc.addOpen = false;
       });
     },
-    removeDomain: (domain) => void runMutation(`remove:${domain}`, () => api.removeDomain(domain)),
-    saveConfig: () =>
-      void runMutation("config", async () => {
-        const sent = {
-          vpn_name: lc.config.vpn_name.trim(),
-          vpn_backend: lc.config.vpn_backend,
-          openvpn_management: lc.config.openvpn_management.trim(),
-          openvpn_management_password_file: emptyToNull(lc.config.openvpn_management_password_file),
-        };
-        await api.setConfig(sent);
-        // Adopt the exact values we persisted, then mark clean. The daemon stores
-        // SetConfig's fields verbatim, so the buffers now match disk. We must NOT
-        // rely on the next VM event to correct an unnormalized buffer: when the
-        // trimmed value equals what the daemon already had (e.g. the user only
-        // added whitespace), the snapshot is unchanged and `should_emit` fires no
-        // event — leaving the editor showing a value the daemon never persisted.
-        lc.config.vpn_name = sent.vpn_name;
-        lc.config.openvpn_management = sent.openvpn_management;
-        lc.config.openvpn_management_password_file =
-          sent.openvpn_management_password_file ?? "";
-        lc.config.dirty = false;
-        // The edits are now persisted to the daemon's current file, so the
-        // active-file-changed warning (if any) no longer applies.
-        lc.configPathWarning = null;
+
+    removeDomain: (domain) =>
+      void runMutation(`remove:${domain}`, async () => {
+        await api.removeDomain(domain);
+        showUndo(domain); // ephemeral; the delete already landed daemon-side
       }),
-    resync: () => void runMutation("reload", () => api.reload()),
+    undoRemove: () => {
+      const domain = lc.undo?.domain;
+      if (!domain) return;
+      clearUndoTimer();
+      lc.undo = null;
+      // Re-add through a real daemon write; the VM re-poll restores the list.
+      void runMutation(`remove:${domain}`, () => api.addDomain(domain));
+    },
+    dismissUndo: () => {
+      clearUndoTimer();
+      lc.undo = null;
+      rerender();
+    },
+
+    setCheckInput: (value) => {
+      lc.checkInput = value;
+      rerender();
+    },
     check: () => {
       const host = lc.checkInput.trim();
       if (host === "") return;
@@ -573,30 +799,8 @@ export function start(root: HTMLElement): void {
         })
         .finally(() => rerender());
     },
-    // Rerender on every keystroke: a field's content drives its submit button's
-    // disabled state (empty add/check → disabled; clean config → Save disabled),
-    // and that's computed at render time, so the button must be rebuilt when the
-    // field changes or it would stay stale (a disabled button swallows clicks).
-    // `rerender` preserves focus + caret, so live typing is seamless; setting an
-    // input's value programmatically does not re-fire "input", so there is no loop.
-    setAddInput: (value) => {
-      lc.addInput = value;
-      rerender();
-    },
-    setCheckInput: (value) => {
-      lc.checkInput = value;
-      rerender();
-    },
-    setConfigText: (field, value) => {
-      lc.config[field] = value;
-      lc.config.dirty = true; // latch: a VM refresh stops syncing the form
-      rerender(); // re-enable Save now that the form is dirty
-    },
-    setBackend: (value) => {
-      lc.config.vpn_backend = value;
-      lc.config.dirty = true;
-      rerender(); // the OpenVPN fields show/hide on this change
-    },
+
+    resync: () => void runMutation("reload", () => api.reload()),
   };
 
   // Subscribe BEFORE the initial fetch so no push is missed in the mount gap;

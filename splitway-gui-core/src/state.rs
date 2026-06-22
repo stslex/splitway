@@ -716,6 +716,7 @@ mod tests {
             vpn_up: true,
             applied: None,
             routing_state: RoutingState::VpnDown,
+            detected_dns: vec![],
             detector_health: DetectorHealth::Active,
             domains: domains.iter().map(|d| d.to_string()).collect(),
         }
@@ -1080,6 +1081,7 @@ mod tests {
                 dns_servers: servers.iter().map(|s| s.to_string()).collect(),
             }),
             routing_state: RoutingState::Applied,
+            detected_dns: servers.iter().map(|s| s.to_string()).collect(),
             detector_health: DetectorHealth::Active,
             domains: domains.iter().map(|d| d.to_string()).collect(),
         }

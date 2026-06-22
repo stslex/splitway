@@ -1,188 +1,953 @@
-/* Deliberately plain and functional — visual design is Phase 7d. Just enough to
-   make the read-only view-model legible. */
+/* Splitway — Tauri GUI styling (Phase 7d).
+ *
+ * Ported from the approved Variant B mockup (docs/design/mockups/), adapted from
+ * a centered 556px card to a full top-level Wayland window: the window IS the
+ * app, so there is no backdrop-behind-a-card — the root fills the window, capped
+ * at a readable max-width and centered, and reflows down to narrow niri columns.
+ *
+ * Design invariants (do not drift): monotone flat-dark surface (no gradients,
+ * no backdrop-filter, no glows); colour is semantic state only (indigo accent =
+ * active/via-VPN/in-sync, slate = direct, amber = drift/waiting, rose =
+ * destructive); IBM Plex Sans for human text, IBM Plex Mono for machine data;
+ * restrained motion behind prefers-reduced-motion; rounded focus rings.
+ *
+ * Fonts: the IBM Plex stacks fall back to the platform sans/mono, so the
+ * machine→human typographic split holds even before the OFL woff2 files are
+ * bundled (that bundling + @font-face lands with packaging in 7d-2). No webfont
+ * CDN — the CSP is self-only. */
 
 :root {
-  font-family: system-ui, sans-serif;
-  font-size: 14px;
-  color-scheme: light dark;
+  --bg: #0e1217;
+  --surface: #171d25;
+  --surface-2: #1e2733;
+  --border: #29333e;
+  --border-soft: #202833;
+  --hi: rgba(255, 255, 255, 0.06);
+  --text: #ecf1f7;
+  --text-dim: #9ba7b3;
+  --text-faint: #646e7a;
+  --accent: #7c83f5;
+  --accent-soft: #9aa0ff;
+  --accent-dim: rgba(124, 131, 245, 0.14);
+  --accent-line: rgba(124, 131, 245, 0.32);
+  --slate: #6f7a8c;
+  --slate-dim: rgba(111, 122, 140, 0.13);
+  --amber: #e0a24e;
+  --amber-dim: rgba(224, 162, 78, 0.14);
+  --amber-line: rgba(224, 162, 78, 0.34);
+  --rose: #e8697e;
+  --rose-dim: rgba(232, 105, 126, 0.14);
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: "IBM Plex Mono", "SF Mono", ui-monospace, monospace;
+  --r: 14px;
+  --spring: cubic-bezier(0.34, 1.25, 0.5, 1);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
 }
 
 body {
-  margin: 0;
-  padding: 1rem 1.25rem;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
 }
 
-#app {
+/* The full-window root. Fills the window (so a tiled niri column is covered to
+   the edges), capped + centered for readability on a wide tile, min-height the
+   viewport so the blocker overlay and undo toast have a full-height stage. */
+.app {
+  position: relative;
+  width: 100%;
+  max-width: 680px;
+  min-height: 100vh;
+  margin: 0 auto;
+  background: var(--bg);
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
 }
 
-header .banner {
+/* Staggered load-in reveal — ONE-TIME, not per-render. The frontend re-renders by
+   rebuilding the children of #app on every VM event / keystroke, so an animation
+   keyed to element creation would replay (flash) each time. Instead `.reveal`
+   elements are visible by default, and the entrance animation applies ONLY while
+   the persistent root #app carries the `.intro` class, which the controller adds
+   on the first paint and removes shortly after. Later rebuilds find no `.intro`,
+   so they appear instantly. Honors prefers-reduced-motion (the animation lives
+   entirely inside the no-preference query). */
+@media (prefers-reduced-motion: no-preference) {
+  .app.intro .reveal {
+    opacity: 0;
+    transform: translateY(9px);
+    animation: rise 0.55s var(--spring) forwards;
+  }
+  .app.intro .d1 {
+    animation-delay: 0.04s;
+  }
+  .app.intro .d2 {
+    animation-delay: 0.11s;
+  }
+  .app.intro .d3 {
+    animation-delay: 0.18s;
+  }
+  .app.intro .d4 {
+    animation-delay: 0.25s;
+  }
+  .app.intro .d5 {
+    animation-delay: 0.32s;
+  }
+  @keyframes rise {
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+}
+
+/* --- topbar --------------------------------------------------------------- */
+
+.topbar {
   display: flex;
   align-items: center;
-  gap: 0.4rem;
+  gap: 11px;
+  padding: 17px 20px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.logo {
+  flex: none;
+}
+.wordmark {
+  font-size: 19px;
   font-weight: 600;
+  letter-spacing: -0.01em;
 }
-
-.banner .dot {
-  font-size: 0.8rem;
-}
-
-.health-Connected .dot {
-  color: #3ca03c;
-}
-.health-Unknown .dot {
-  color: #888;
-}
-.health-NotRunning .dot,
-.health-TransientError .dot {
-  color: #c88c00;
-}
-.health-PermissionDenied .dot,
-.health-VersionMismatch .dot {
-  color: #c83c3c;
-}
-
-.banner-message {
-  margin: 0.25rem 0 0;
-  color: #b35a00;
-}
-
-section {
-  border-top: 1px solid color-mix(in srgb, currentColor 18%, transparent);
-  padding-top: 0.5rem;
-}
-
-section h2 {
-  font-size: 0.95rem;
-  margin: 0 0 0.35rem;
-}
-
-.row {
-  display: flex;
-  gap: 0.75rem;
-}
-
-.row .label {
-  flex: 0 0 12rem;
-  color: color-mix(in srgb, currentColor 65%, transparent);
-}
-
-.row .value {
+.topbar .grow {
   flex: 1;
-  font-variant-numeric: tabular-nums;
 }
-
-ul.domains,
-ul.interfaces {
-  margin: 0;
-  padding-left: 1.1rem;
-}
-
-.muted {
-  color: color-mix(in srgb, currentColor 55%, transparent);
-  margin: 0;
-}
-
-.working {
-  font-style: italic;
-  color: color-mix(in srgb, currentColor 65%, transparent);
-}
-
-.message {
-  padding: 0.4rem 0.6rem;
-  border-radius: 4px;
-}
-
-.message-Info {
-  background: color-mix(in srgb, #3ca03c 18%, transparent);
-}
-
-.message-Error {
-  background: color-mix(in srgb, #c83c3c 18%, transparent);
-}
-
-/* --- interactive controls (Phase 7c) --- */
-
-.control {
-  display: flex;
-  gap: 0.5rem;
+.conn {
+  display: inline-flex;
   align-items: center;
-  margin-top: 0.4rem;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.conn .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.conn .dot.ok {
+  background: var(--accent);
+}
+.conn .dot.warn {
+  background: var(--amber);
+}
+.conn .dot.off {
+  background: var(--text-faint);
+}
+
+/* --- hero ----------------------------------------------------------------- */
+
+.hero {
+  padding: 28px 20px 20px;
+}
+.hero-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
   flex-wrap: wrap;
 }
-
-input[type="text"],
-select {
-  font: inherit;
-  padding: 0.25rem 0.4rem;
-  border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
-  border-radius: 4px;
-  background: color-mix(in srgb, currentColor 4%, transparent);
-  color: inherit;
+.hero-top .pitch {
+  font-size: 13px;
+  color: var(--text-faint);
+  max-width: 62%;
+  line-height: 1.5;
 }
-
-.control input[type="text"] {
-  flex: 1;
-  min-width: 12rem;
-}
-
-.row .value input[type="text"] {
-  width: 100%;
-}
-
-button {
-  font: inherit;
-  padding: 0.25rem 0.7rem;
-  border: 1px solid color-mix(in srgb, currentColor 35%, transparent);
-  border-radius: 4px;
-  background: color-mix(in srgb, currentColor 8%, transparent);
-  color: inherit;
+.switch {
+  appearance: none;
+  border: 1px solid var(--border);
   cursor: pointer;
+  width: 80px;
+  height: 40px;
+  border-radius: 22px;
+  position: relative;
+  flex: none;
+  background: var(--surface-2);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.25);
+  transition: background 0.28s, border-color 0.28s;
+}
+.switch:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.switch .thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: #3d4754;
+  transition: transform 0.4s var(--spring), background 0.28s;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+.switch .lbl {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+  transition: opacity 0.25s;
+}
+.switch .lbl.on {
+  left: 15px;
+  opacity: 0;
+}
+.switch .lbl.off {
+  right: 14px;
+  opacity: 1;
+}
+.app[data-on="true"] .switch {
+  background: var(--accent-dim);
+  border-color: var(--accent-line);
+}
+.app[data-on="true"] .switch .thumb {
+  transform: translateX(40px);
+  background: var(--accent);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.3);
+}
+.app[data-on="true"] .switch .lbl.on {
+  opacity: 1;
+  color: var(--accent-soft);
+}
+.app[data-on="true"] .switch .lbl.off {
+  opacity: 0;
+}
+/* Honor the design invariant (restrained motion behind prefers-reduced-motion):
+   drop the spring transform + label fades, keep the state-conveying colour change. */
+@media (prefers-reduced-motion: reduce) {
+  .switch,
+  .switch .lbl {
+    transition: none;
+  }
+  .switch .thumb {
+    transition: background 0.28s;
+  }
 }
 
-button:hover:not(:disabled) {
-  background: color-mix(in srgb, currentColor 16%, transparent);
+.status {
+  margin-top: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+.status-line {
+  font-size: 17.5px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+}
+.status-line .n {
+  color: var(--accent-soft);
+  font-weight: 600;
+}
+.status-line .if {
+  font-family: var(--mono);
+  font-size: 15px;
+  color: var(--text);
+}
+/* Dim the status line when routing is not actively carrying domains. */
+.app[data-on="false"] .status-line,
+.app[data-on="false"] .status-line .n,
+.app[data-on="false"] .status-line .if,
+.app[data-mode="waiting"] .status-line .n,
+.app[data-mode="empty"] .status-line .n,
+.app[data-mode="dns-missing"] .status-line .n,
+.app[data-mode="dns-missing"] .status-line .if {
+  color: var(--text-dim);
+}
+.chip {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 5px 12px 5px 10px;
+  border-radius: 9px;
+  color: var(--accent-soft);
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-line);
+}
+.chip.warn {
+  color: var(--amber);
+  background: var(--amber-dim);
+  border-color: var(--amber-line);
+}
+.chip.bad {
+  color: var(--rose);
+  background: var(--rose-dim);
+  border-color: var(--rose);
+}
+.chip .ic {
+  font-size: 12px;
+  line-height: 1;
 }
 
-button:disabled,
-input:disabled,
-select:disabled {
-  opacity: 0.5;
+/* --- interface block ------------------------------------------------------ */
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  box-shadow: inset 0 1px 0 var(--hi);
+}
+.iface-block {
+  margin: 6px 20px 0;
+  padding: 15px 16px;
+  border-radius: var(--r);
+}
+.iface-block .head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.iface-block label {
+  font-size: 13.5px;
+  color: var(--text);
+  font-weight: 500;
+}
+select.sel {
+  appearance: none;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 30px 8px 12px;
+  cursor: pointer;
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-faint) 50%),
+    linear-gradient(135deg, var(--text-faint) 50%, transparent 50%);
+  background-position: calc(100% - 16px) 53%, calc(100% - 11px) 53%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  transition: border-color 0.2s;
+}
+select.sel:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.dns {
+  margin-top: 12px;
+  font-size: 12px;
+}
+.dns-ok {
+  color: var(--text-faint);
+}
+.dns-ok .ip {
+  font-family: var(--mono);
+  color: var(--text-dim);
+}
+.dns-miss {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.dns-miss .warn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--amber);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.dns-miss .warn .ic {
+  font-size: 12px;
+  flex: none;
+}
+
+/* --- sections (domains, check) ------------------------------------------- */
+
+.section {
+  padding: 22px 20px 4px;
+}
+.eyebrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 13px;
+}
+.eyebrow .label {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.eyebrow .count {
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 20px;
+  padding: 1px 8px;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+}
+.desc {
+  font-size: 12.5px;
+  color: var(--text-faint);
+  margin-bottom: 13px;
+  line-height: 1.5;
+}
+.add {
+  appearance: none;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 5px 12px;
+  border-radius: 9px;
+  cursor: pointer;
+  transition: 0.18s;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.add:hover:not(:disabled) {
+  border-color: var(--accent-line);
+  color: var(--accent-soft);
+}
+.add:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.add .plus {
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* Inline add-domain row (revealed by the Add button — ephemeral UI). */
+.add-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 11px;
+}
+
+.domains {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  max-height: 296px;
+  overflow-y: auto;
+  padding-right: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.domains::-webkit-scrollbar {
+  width: 9px;
+}
+.domains::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 9px;
+  border: 3px solid var(--bg);
+  background-clip: padding-box;
+}
+.domains::-webkit-scrollbar-track {
+  background: transparent;
+}
+.card {
+  border-radius: var(--r);
+  padding: 13px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  box-shadow: inset 0 1px 0 var(--hi);
+  transition: background 0.15s, border-color 0.15s;
+  flex: none;
+}
+.card:hover {
+  background: var(--surface-2);
+}
+.card-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.card .name {
+  font-family: var(--mono);
+  font-size: 13.5px;
+  color: var(--text);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.route {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--accent-soft);
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-line);
+  padding: 3px 9px;
+  border-radius: 8px;
+  flex: none;
+}
+.route .arrow {
+  opacity: 0.7;
+}
+.vstate {
+  font-size: 13px;
+  flex: none;
+  width: 15px;
+  text-align: center;
+}
+.vstate.ok {
+  color: var(--accent-soft);
+}
+.vstate.drift {
+  color: var(--amber);
+}
+.del {
+  appearance: none;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--text-faint);
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+  font-size: 13px;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s, color 0.15s;
+  flex: none;
+}
+.card:hover .del,
+.card:focus-within .del {
+  opacity: 1;
+}
+.del:hover:not(:disabled) {
+  background: var(--rose-dim);
+  color: var(--rose);
+}
+.del:disabled {
   cursor: default;
 }
-
-button.remove {
-  padding: 0 0.4rem;
-  line-height: 1.4;
+.sub {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  margin-top: 7px;
+  font-family: var(--mono);
+}
+.sub.warn {
+  color: var(--amber);
+}
+.card.is-drift {
+  border-color: var(--amber-line);
+}
+.card.is-drift .route {
+  color: var(--amber);
+  background: var(--amber-dim);
+  border-color: var(--amber-line);
+}
+/* Dim the domain list when routing is not carrying it (off / waiting / no DNS). */
+.app[data-on="false"] .domains,
+.app[data-mode="waiting"] .domains,
+.app[data-mode="dns-missing"] .domains {
+  opacity: 0.4;
+  pointer-events: none;
+  filter: saturate(0.4);
 }
 
-ul.domains li {
-  margin-bottom: 0.2rem;
+/* empty-domains placeholder */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 6px;
+  padding: 26px 16px;
+  border: 1px dashed var(--border);
+  border-radius: var(--r);
+}
+.empty .t {
+  font-size: 13.5px;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+.empty .s {
+  font-size: 12px;
+  color: var(--text-faint);
+  line-height: 1.5;
+  max-width: 260px;
 }
 
-/* A per-action error sits tight under its control, distinct from the VM's own
-   transient message. */
+.everything {
+  margin: 11px 0 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px dashed var(--border);
+  border-radius: var(--r);
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.everything .rest {
+  flex: 1;
+}
+.everything .direct {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--slate);
+  background: var(--slate-dim);
+  padding: 3px 9px;
+  border-radius: 8px;
+}
+
+/* --- check a domain ------------------------------------------------------- */
+
+.check-row {
+  display: flex;
+  gap: 8px;
+}
+.field {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  padding: 10px 12px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  transition: border-color 0.2s;
+}
+.field::placeholder {
+  color: var(--text-faint);
+}
+.field:disabled {
+  opacity: 0.55;
+}
+.btn {
+  appearance: none;
+  border: none;
+  cursor: pointer;
+  background: var(--accent);
+  color: #0d0f2b;
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 13px;
+  min-width: 84px;
+  height: 39px;
+  padding: 0 17px;
+  border-radius: 11px;
+  transition: filter 0.15s, background 0.15s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+}
+.btn:hover:not(:disabled) {
+  filter: brightness(1.05);
+}
+.btn:disabled {
+  cursor: default;
+  background: var(--surface-2);
+  color: var(--text-dim);
+  filter: none;
+}
+/* The amber "Set" button reused inside degraded fixes. */
+.btn.amber {
+  background: var(--amber);
+  color: #241402;
+}
+.spinner {
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgba(155, 167, 179, 0.35);
+  border-top-color: var(--text-dim);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 1.4s;
+  }
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.result {
+  margin-top: 11px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  line-height: 1.45;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .result {
+    animation: rise 0.35s var(--spring);
+  }
+}
+.result .pin {
+  color: var(--accent-soft);
+  flex: none;
+}
+.result code {
+  font-family: var(--mono);
+  color: var(--text);
+}
+.result.miss .pin {
+  color: var(--slate);
+}
+.result.bad {
+  color: var(--rose);
+}
+.result.bad .pin {
+  color: var(--rose);
+}
+.result .footnote {
+  display: block;
+  margin-top: 6px;
+  color: var(--text-faint);
+}
+
+/* --- footer --------------------------------------------------------------- */
+
+.foot {
+  padding: 20px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  letter-spacing: 0.03em;
+  border-top: 1px solid var(--border-soft);
+  margin-top: 18px;
+}
+
+/* A transient daemon message (info/error), shown above the footer. */
+.message {
+  margin: 0 20px 14px;
+  padding: 10px 13px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.message-Info {
+  color: var(--accent-soft);
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-line);
+}
+.message-Error {
+  color: var(--rose);
+  background: var(--rose-dim);
+  border: 1px solid var(--rose);
+}
+/* A per-action error sits tight under its control. */
 .action-error {
-  margin: 0.3rem 0 0;
-  font-size: 0.9rem;
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--rose);
 }
 
-.check-result {
-  margin-top: 0.5rem;
+/* --- undo snackbar -------------------------------------------------------- */
+
+.toast {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 14px;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  box-shadow: 0 14px 34px -12px rgba(0, 0, 0, 0.65), inset 0 1px 0 var(--hi);
+  font-size: 13px;
+  color: var(--text-dim);
+  transform: translateY(150%);
+  opacity: 0;
+  transition: transform 0.38s var(--spring), opacity 0.25s;
+  pointer-events: none;
+}
+.toast.show {
+  transform: translateY(0);
+  opacity: 1;
+  pointer-events: auto;
+}
+@media (prefers-reduced-motion: reduce) {
+  .toast {
+    transition: opacity 0.2s;
+    transform: none;
+  }
+}
+.toast .msg {
+  flex: 1;
+}
+.toast .msg code {
+  font-family: var(--mono);
+  color: var(--text);
+}
+.toast .undo {
+  appearance: none;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--accent-soft);
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 13px;
+  padding: 5px 9px;
+  border-radius: 8px;
+  transition: 0.15s;
+}
+.toast .undo:hover {
+  background: var(--accent-dim);
+}
+.toast .x {
+  appearance: none;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-faint);
+  font-size: 12px;
+  padding: 5px 7px;
+  border-radius: 7px;
+}
+.toast .x:hover {
+  color: var(--text-dim);
 }
 
-.footnote {
-  font-size: 0.85rem;
-  margin-top: 0.4rem;
-}
+/* --- full-window blockers (disconnected / no-permission / frozen) --------- */
 
-/* The frozen-on-malformed banner: prominent, since every mutation is rejected
-   until the config is fixed on disk. */
-.frozen-banner {
-  padding: 0.5rem 0.7rem;
+.blocker {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 58px;
+  bottom: 0;
+  z-index: 25;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 36px 30px;
+  gap: 14px;
+}
+.blk {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 13px;
+  max-width: 360px;
+}
+.blk .ic {
+  width: 50px;
+  height: 50px;
+  border-radius: 14px;
+  display: grid;
+  place-items: center;
+}
+.blk .ic svg {
+  width: 25px;
+  height: 25px;
+}
+.blk.neutral .ic {
+  background: rgba(155, 167, 179, 0.12);
+  color: var(--text-dim);
+}
+.blk.warn .ic {
+  background: var(--amber-dim);
+  color: var(--amber);
+}
+.blk h3 {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.blk p {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.55;
+}
+.blk p .inline-code {
+  font-family: var(--mono);
+  padding: 1px 5px;
   border-radius: 4px;
-  background: color-mix(in srgb, #c83c3c 22%, transparent);
-  border: 1px solid color-mix(in srgb, #c83c3c 45%, transparent);
+  background: var(--surface-2);
+}
+.blk code.cmd {
+  display: block;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  padding: 10px 12px;
+  border-radius: 9px;
+}
+
+/* --- focus rings (rounded, follow the radius) + keyboard nav -------------- */
+
+.btn:focus-visible,
+.add:focus-visible,
+select.sel:focus-visible,
+.field:focus-visible,
+.switch:focus-visible,
+.del:focus-visible,
+.toast .undo:focus-visible,
+.toast .x:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+}
+select.sel:focus,
+.field:focus {
+  outline: none;
+  border-color: var(--accent-line);
+}
+
+@media (max-width: 380px) {
+  .hero-top .pitch {
+    display: none;
+  }
+  .conn span:last-child {
+    display: none;
+  }
 }

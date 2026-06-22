@@ -696,6 +696,20 @@ impl StateMachine {
             // domain → DNS mapping for client-side verification.
             applied: self.applied.as_ref().map(AppliedInfo::from),
             routing_state: self.routing_state(),
+            // The DNS the configured interface is detected to expose right now,
+            // surfaced regardless of apply state so a client can show the
+            // interface's resolver read-only (the DNS-auto model). Sourced from
+            // the last detector reading, gated on its interface matching the
+            // configured `vpn_name` — the same guard `desired()`/`routing_state()`
+            // use, so a stale reading from a since-switched interface is never
+            // attributed to the current one. Empty when no interface is
+            // configured, it is down, or it pushes no DNS.
+            detected_dns: self
+                .last_info
+                .as_ref()
+                .filter(|info| info.interface_name == self.config.vpn_name)
+                .map(|info| info.dns_servers.clone())
+                .unwrap_or_default(),
             detector_health: self.detector_health.clone(),
             domains: self.config.vpn_hosts.clone(),
         }
