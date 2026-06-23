@@ -327,6 +327,11 @@ fn read_managed_state(dir: &Path) -> LinkDnsState {
     LinkDnsState {
         servers,
         routing_domains,
+        // macOS split-DNS is per-domain (`/etc/resolver/<domain>` files): there is
+        // no link-level catch-all to leak through, so the default-route flag does
+        // not apply here. `None` keeps `compare_drift`'s leak check from ever
+        // tripping on macOS.
+        default_route: None,
     }
 }
 

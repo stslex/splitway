@@ -3494,6 +3494,7 @@ mod tests {
         backend.set_link_state(LinkDnsState {
             servers: vec!["10.0.0.1".to_string()],
             routing_domains: vec!["example.com".to_string()],
+            default_route: None,
         });
         let mut sm = machine(
             backend.clone(),
@@ -3518,6 +3519,7 @@ mod tests {
         backend.set_link_state(LinkDnsState {
             servers: vec!["198.51.100.9".to_string()],
             routing_domains: vec![],
+            default_route: None,
         });
         let mut sm = machine(backend, config(true, &["example.com"]), "verify-drift");
         sm.on_event(vpn_up("wg0")).await;
@@ -3527,12 +3529,48 @@ mod tests {
             DriftVerdict::Drifted {
                 missing_servers,
                 unrouted_domains,
+                default_route_leak,
             } => {
                 assert_eq!(missing_servers, vec!["10.0.0.1"]);
                 assert_eq!(unrouted_domains, vec!["example.com"]);
+                // The live link is not a catch-all here (default_route: None), so
+                // this drift is the server/domain divergence only — no leak.
+                assert!(!default_route_leak);
             }
             other => panic!("expected Drifted, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn verify_reports_catch_all_default_route_as_leak() {
+        let backend = Arc::new(MockBackend::default());
+        // The believed split is fully present (server + domain match), but the link
+        // is the DNS default route (catch-all) — a full-tunnel VPN whose link
+        // resolves every unmatched name. This must read as DRIFT (a leak), not
+        // InSync, even though nothing is missing or unrouted.
+        backend.set_link_state(LinkDnsState {
+            servers: vec!["10.0.0.1".to_string()],
+            routing_domains: vec!["example.com".to_string()],
+            default_route: Some(true),
+        });
+        let mut sm = machine(backend, config(true, &["example.com"]), "verify-leak");
+        sm.on_event(vpn_up("wg0")).await;
+        assert!(sm.applied.is_some());
+
+        let info = verify_info(verify_via(&sm).await);
+        match info.drift {
+            DriftVerdict::Drifted {
+                missing_servers,
+                unrouted_domains,
+                default_route_leak,
+            } => {
+                assert!(missing_servers.is_empty());
+                assert!(unrouted_domains.is_empty());
+                assert!(default_route_leak, "catch-all link must read as a leak");
+            }
+            other => panic!("expected Drifted (leak), got {other:?}"),
+        }
+        assert_eq!(info.live.default_route, Some(true));
     }
 
     #[tokio::test]
@@ -3543,6 +3581,7 @@ mod tests {
         backend.set_link_state(LinkDnsState {
             servers: vec!["10.0.0.1".to_string()],
             routing_domains: vec!["example.com".to_string()],
+            default_route: None,
         });
         let sm = machine(backend.clone(), config(true, &["example.com"]), "verify-na");
         assert!(sm.applied.is_none());

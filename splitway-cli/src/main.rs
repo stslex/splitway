@@ -221,6 +221,7 @@ fn print_verify(info: &splitway_shared::ipc::VerifyInfo) {
         DriftVerdict::Drifted {
             missing_servers,
             unrouted_domains,
+            default_route_leak,
         } => {
             println!(
                 "verdict:          DRIFT — the live DNS state diverges from what the daemon believes"
@@ -236,6 +237,17 @@ fn print_verify(info: &splitway_shared::ipc::VerifyInfo) {
                 println!(
                     "                  unrouted domains (believed, not routed live): {}",
                     unrouted_domains.join(", ")
+                );
+            }
+            if *default_route_leak {
+                println!(
+                    "                  catch-all leak: the link is the DNS default route, so it"
+                );
+                println!(
+                    "                  resolves EVERY name through the VPN — not just the configured"
+                );
+                println!(
+                    "                  domains. Names you never configured leak to the VPN resolver."
                 );
             }
             if live_empty {

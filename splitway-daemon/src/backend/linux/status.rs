@@ -44,6 +44,7 @@ enum Section {
 pub(crate) fn parse_resolvectl_status(output: &str) -> LinkDnsState {
     let mut servers: Vec<String> = Vec::new();
     let mut routing_domains: Vec<String> = Vec::new();
+    let mut default_route: Option<bool> = None;
     let mut section = Section::Other;
 
     for line in output.lines() {
@@ -66,10 +67,18 @@ pub(crate) fn parse_resolvectl_status(output: &str) -> LinkDnsState {
         } else if let Some(values) = trimmed.strip_prefix("DNS Domain:") {
             section = Section::Domains;
             push_domains(values, &mut routing_domains);
+        } else if let Some(value) = trimmed.strip_prefix("Default Route:") {
+            // The per-link DNS default-route (catch-all) flag. Single-valued, so
+            // it ends any continuation section. `yes`/`no` map to `Some`; anything
+            // else leaves it unknown (`None`). Authoritative over the `Protocols:`
+            // `+DefaultRoute` token (which is ignored — see `looks_like_new_field`).
+            section = Section::Other;
+            if let Some(flag) = parse_default_route(value) {
+                default_route = Some(flag);
+            }
         } else if looks_like_new_field(trimmed) {
-            // Some other field (`Protocols:`, `Default Route:`, the `Link N (…)`
-            // header, …): it ends any open continuation section but contributes
-            // nothing.
+            // Some other field (`Protocols:`, the `Link N (…)` header, …): it ends
+            // any open continuation section but contributes nothing.
             section = Section::Other;
         } else {
             // A continuation line of the current multi-valued field.
@@ -84,6 +93,18 @@ pub(crate) fn parse_resolvectl_status(output: &str) -> LinkDnsState {
     LinkDnsState {
         servers,
         routing_domains,
+        default_route,
+    }
+}
+
+/// Parse a `Default Route:` value (`yes` / `no`, case-insensitive) into a boolean;
+/// any other token (or an empty value) yields `None` so an unrecognized form
+/// leaves the flag unknown rather than guessing.
+fn parse_default_route(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
     }
 }
 
@@ -165,6 +186,9 @@ Current DNS Server: 10.0.0.1
         let state = parse_resolvectl_status(output);
         assert_eq!(state.servers, vec!["10.0.0.1", "10.0.0.2"]);
         assert_eq!(state.routing_domains, vec!["example.com"]);
+        // Only the explicit `Default Route:` line sets the flag — the `Protocols:`
+        // `+DefaultRoute` token is ignored, so without that line it stays unknown.
+        assert_eq!(state.default_route, None);
     }
 
     #[test]
@@ -203,12 +227,16 @@ Link 5 (tun0)
             state.routing_domains,
             vec!["example.com", "corp.example.com", "sub.example.net"]
         );
+        // The trailing `Default Route: yes` is captured (and does not bleed into
+        // the wrapped domain list above it).
+        assert_eq!(state.default_route, Some(true));
     }
 
     #[test]
     fn a_following_field_label_ends_the_domain_section() {
         // The permissive domain collector must stop at the next field label, not
-        // swallow `Default Route: yes` as three bogus "domains".
+        // swallow `Default Route: yes` as three bogus "domains" — while still
+        // capturing the flag itself.
         let output = "\
         DNS Domain: example.com
      Default Route: yes
@@ -216,6 +244,7 @@ Link 5 (tun0)
 ";
         let state = parse_resolvectl_status(output);
         assert_eq!(state.routing_domains, vec!["example.com"]);
+        assert_eq!(state.default_route, Some(true));
     }
 
     #[test]
@@ -297,10 +326,45 @@ Link 1 (lo)
         let state = parse_resolvectl_status(output);
         assert!(state.servers.is_empty());
         assert!(state.routing_domains.is_empty());
+        // `Default Route: no` is still captured even on a DNS-less link.
+        assert_eq!(state.default_route, Some(false));
 
         let empty = parse_resolvectl_status("");
         assert!(empty.servers.is_empty());
         assert!(empty.routing_domains.is_empty());
+        // No `Default Route:` line at all → unknown.
+        assert_eq!(empty.default_route, None);
+    }
+
+    #[test]
+    fn parses_default_route_flag_yes_no_and_unknown() {
+        // The catch-all flag the split-DNS fix reads back: a full-tunnel link is
+        // the DNS default route (`yes`) and resolves every unmatched name, which
+        // `compare_drift` treats as a leak. `no` is the correct post-apply state.
+        let yes = "\
+Link 5 (tun0)
+        DNS Domain: jira.example.com
+     Default Route: yes
+";
+        assert_eq!(parse_resolvectl_status(yes).default_route, Some(true));
+
+        let no = "\
+Link 5 (tun0)
+        DNS Domain: jira.example.com
+     Default Route: no
+";
+        assert_eq!(parse_resolvectl_status(no).default_route, Some(false));
+
+        // A case-variant value still parses (defensive against formatting drift).
+        let mixed_case = "     Default Route: YES\n";
+        assert_eq!(
+            parse_resolvectl_status(mixed_case).default_route,
+            Some(true)
+        );
+
+        // An unrecognized value leaves the flag unknown rather than guessing.
+        let garbage = "     Default Route: maybe\n";
+        assert_eq!(parse_resolvectl_status(garbage).default_route, None);
     }
 
     #[test]
