@@ -178,6 +178,15 @@ async fn device_interface_name(
 }
 
 /// Map an NM device state to a deduplicated `VpnEvent` and send it.
+///
+/// For an `Up` transition this awaits `detect()` inline — including its settle
+/// window (up to ~0.9 s; see `detector::SETTLE_ATTEMPTS`). Because `watch_loop`
+/// `.await`s this call inside its `select!`, that branch is the only one being
+/// serviced while the window runs: a `DeviceRemoved`/`DeviceAdded` or a dropped
+/// subscriber arriving mid-settle is deferred until detect returns. That is
+/// acceptable — a teardown during the brief settle simply lands a beat late —
+/// but the blocking duration is no longer the few milliseconds it once was,
+/// hence this note.
 async fn handle_state(
     new_state: u32,
     interface: &str,
@@ -195,17 +204,42 @@ async fn handle_state(
     match t {
         Transition::Up => {
             let iface = interface.to_string();
-            // detect() runs nmcli synchronously; keep it off the async thread.
+            // detect() runs nmcli synchronously and may block for the settle
+            // window (up to ~0.9 s) to let pushed DNS appear; keep it off the
+            // async thread.
             let detected = tokio::task::spawn_blocking(move || LinuxDetector.detect(&iface))
                 .await
                 .map_err(|e| PlatformError::CommandFailed(format!("detect task panicked: {e}")))?;
             match detected {
+                // Up-ness is NOT gated on finding pushed DNS: detect() returns
+                // Ok with possibly-empty dns_servers (a VPN that pushed no DNS,
+                // or the settle window lost the race). We emit Up either way —
+                // an Up with empty DNS is a safe no-op for *rules* downstream,
+                // since StateMachine::desired() returns None for it (it does flip
+                // `vpn_up` and report NoDnsFromVpn).
                 Ok(info) => {
-                    dedup.record(t);
+                    if info.dns_servers.is_empty() {
+                        // Soft Up: emitted, but it must pin nothing in the
+                        // deduper. Recording it as Up would foreclose
+                        // re-detection on a re-emitted ACTIVATED (the recovery
+                        // path for a lost settle race, since the daemon reacts
+                        // solely to Device.StateChanged). Leaving the prior
+                        // transition in place is worse: a startup/teardown Down
+                        // would still be `last`, so the genuine following Down is
+                        // seen as a duplicate and dropped — `vpn_up` would never
+                        // clear and the daemon would report the VPN up after it
+                        // went down. reset() returns to neutral: the next Up
+                        // re-detects and the next Down still emits.
+                        dedup.reset();
+                    } else {
+                        dedup.record(t);
+                    }
                     send_event(tx, VpnEvent::Up(info)).await;
                 }
-                // Not recorded in dedup: a later re-emitted ACTIVATED
-                // state gets another chance to detect.
+                // detect() errors only on a genuine nmcli failure / absent
+                // device, never on empty DNS. No event is sent and dedup is left
+                // untouched, so a re-emitted ACTIVATED still gets a chance to
+                // detect.
                 Err(e) => log::warn!("{interface} reported up but detect failed: {e}"),
             }
         }
