@@ -20,6 +20,19 @@ RestartSec=2
 RuntimeDirectory=splitway
 RuntimeDirectoryMode=0700
 
+# Unprivileged GUI/CLI access (opt-in): let a non-root user in a dedicated group
+# drive the daemon without sudo. To enable, create + join the group
+# (`groupadd splitway`, `usermod -aG splitway <user>`) and uncomment all four
+# lines below — the socket becomes 0660 and the runtime dir 0750, both
+# root:splitway. The bare `ExecStart=` first clears the default start command so
+# the second line replaces it (rather than adding a second one). SECURITY: group
+# membership ≈ control of system split-DNS routing (see packaging/README.md,
+# "Socket security model"). Default is root-only.
+#ExecStart=
+#ExecStart=/usr/bin/splitway-daemon run --socket-group splitway
+#RuntimeDirectoryMode=0750
+#SupplementaryGroups=splitway
+
 # Runs as root deliberately. `resolvectl dns|domain|revert <iface>` performs
 # privileged DNS changes that polkit otherwise gates behind interactive
 # authentication — unworkable for an unattended daemon. Running as root

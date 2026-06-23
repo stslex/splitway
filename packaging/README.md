@@ -18,7 +18,16 @@ sudo install -Dm755 target/release/splitway         /usr/bin/splitway
 sudo systemctl enable --now splitway
 ```
 
-On NixOS, use the flake's `nixosModules.default` instead (`services.splitway.enable = true;`).
+On NixOS, use the flake's `nixosModules.default` instead
+(`services.splitway.enable = true;`) — this is also the author's daily-driver and
+iteration channel. The module runs the daemon with
+`--config /var/lib/splitway/config.json` and provisions that path via systemd's
+`StateDirectory` (a `0700` dir owned by the service). The config is **writable
+and owned by the daemon** (the GUI/CLI mutate it at runtime, and external
+hand-edits are picked up live); the module deliberately does not generate a
+read-only `/etc` config. The daemon creates an empty config there on first run.
+See [docs/architecture.md](../docs/architecture.md) ("Config is the single
+source of truth").
 
 ### Socket security model
 
@@ -27,17 +36,43 @@ privilege boundary:
 
 - Path: `$XDG_RUNTIME_DIR/splitway.sock`, falling back to
   `/run/splitway/splitway.sock` for a system service.
-- Permissions: **`0600`, owner-only**. The containing directory is `0700`
-  (`$XDG_RUNTIME_DIR` already is; the `/run/splitway` fallback is created that
-  way), so the brief window between `bind()` and `chmod` is still not reachable
-  by other users.
+- Permissions: **`0600`, owner-only** by default. The containing directory is
+  `0700` (`$XDG_RUNTIME_DIR` already is; the `/run/splitway` fallback is created
+  that way), so the brief window between `bind()` and `chmod` is still not
+  reachable by other users.
 - **Threat model:** any process that can write the socket can change DNS.
   `0600` restricts that to the user running the daemon — root, for the system
-  service (so control commands run via `sudo`). For unprivileged multi-user
-  control, an operator can widen this to `0660` owned by a dedicated
-  `splitway` group; this is intentionally **not** the default, to avoid
-  silently broadening who can change DNS.
+  service (so control commands run via `sudo`).
 - No secrets or user data are placed in the socket path.
+
+#### Unprivileged access via a socket group (opt-in)
+
+For unprivileged control — e.g. a GUI run as your desktop user under a
+no-system-tray compositor like niri — the daemon accepts `--socket-group <name>`.
+With it, the socket is `0660` and the runtime dir `0750`, both owned by
+`root:<group>`: a member of `<group>` can connect without `sudo`; a non-member
+cannot even traverse the dir to reach the socket. Without the flag, behavior is
+unchanged (`0600`, root-only).
+
+- **On NixOS**, do not pass the flag by hand — enable
+  `services.splitway.unprivilegedGui` (see the README's niri section), which
+  creates the group, adds the listed users, sets `RuntimeDirectoryMode=0750`,
+  and passes `--socket-group` for you.
+- **On other init systems**, add `--socket-group splitway` to the daemon's
+  `ExecStart`, set `RuntimeDirectoryMode=0750`, and `groupadd splitway` +
+  `usermod -aG splitway <user>`. The daemon `chgrp`s the dir and socket on
+  start; a missing group makes it exit non-zero with an actionable message.
+
+> **Security:** membership in this group grants the ability to drive the daemon's
+> privileged split-DNS operations (`resolvectl`/`nmcli`) — adding a user to the
+> group ≈ granting them control of system split-DNS routing. That is why it is
+> **not** the default and the group is empty until you opt in. (Stronger per-peer
+> authentication via `SO_PEERCRED` is a later phase.) To keep the grant *to that*
+> and no more, while a socket group is configured the daemon refuses to change the
+> file-reading OpenVPN fields (`openvpn.management` / `…password_file`) over IPC —
+> they make the root daemon read a file and connect to an endpoint, so they stay
+> root-config-file-only. See
+> [docs/design/socket-group.md](../docs/design/socket-group.md).
 
 `SIGTERM` (systemd stop / `kill`) makes the daemon revert active DNS rules
 before exiting, so a stop never leaves the system half-configured.

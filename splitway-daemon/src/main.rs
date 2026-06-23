@@ -25,12 +25,27 @@ mod command;
 mod daemon;
 #[cfg(unix)]
 mod detector;
+// Tool resolution + loud-on-missing spawn wrapper for the external commands the
+// daemon shells out to (`nmcli`, `resolvectl`). Linux-only today — the macOS
+// backend can adopt it later (see `exec` docs / ROADMAP.md).
+#[cfg(target_os = "linux")]
+mod exec;
+#[cfg(unix)]
+mod interfaces;
 
 #[cfg(unix)]
 fn main() {
-    env_logger::init();
+    // Default to `info` when RUST_LOG is unset. Plain `env_logger::init()` keeps
+    // env_logger's built-in default of `error`, which suppresses the very `warn`
+    // and `info` lines that diagnose a broken deployment — e.g. a detect failure
+    // or "VPN up" transition. A core-function failure must be visible without the
+    // operator first knowing to set RUST_LOG. RUST_LOG still overrides this.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     match env::args().parse_command() {
-        Ok(Command::Run { config }) => daemon::run(config),
+        Ok(Command::Run {
+            config,
+            socket_group,
+        }) => daemon::run(config, socket_group),
         Ok(Command::Status) => status(),
         Ok(Command::Revert { config }) => revert(config),
         Err(message) => {
@@ -55,7 +70,23 @@ fn status() {
             println!("enabled:   {}", info.enabled);
             println!("interface: {}", info.interface);
             println!("vpn_up:    {}", info.vpn_up);
-            println!("applied:   {}", info.applied);
+            println!("routing:   {}", info.routing_state);
+            println!(
+                "applied:   {}",
+                match &info.applied {
+                    Some(applied) => applied.to_string(),
+                    None => "(none)".to_string(),
+                }
+            );
+            println!(
+                "detected:  {}",
+                if info.detected_dns.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    info.detected_dns.join(", ")
+                }
+            );
+            println!("detector:  {}", info.detector_health);
             println!(
                 "domains:   {}",
                 if info.domains.is_empty() {

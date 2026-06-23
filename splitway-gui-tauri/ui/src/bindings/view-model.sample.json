@@ -1,0 +1,59 @@
+{
+  "config": {
+    "openvpn_management": "",
+    "openvpn_management_password_file": null,
+    "vpn_backend": "network-manager",
+    "vpn_name": "tun0"
+  },
+  "config_loaded": true,
+  "config_path": "/etc/splitway/config.json",
+  "connected": true,
+  "connection": {
+    "health": "Connected",
+    "message": null
+  },
+  "interfaces": [
+    {
+      "name": "tun0",
+      "up": true,
+      "vpn_like": true
+    }
+  ],
+  "message": null,
+  "status": {
+    "applied": {
+      "dns_servers": [
+        "10.0.0.1"
+      ],
+      "domains": [
+        "corp.example.com"
+      ],
+      "interface": "tun0"
+    },
+    "detected_dns": [
+      "10.0.0.1"
+    ],
+    "detector_health": "Active",
+    "domains": [
+      "corp.example.com"
+    ],
+    "enabled": true,
+    "interface": "tun0",
+    "routing_state": "Applied",
+    "vpn_up": true
+  },
+  "verify": {
+    "drift": "InSync",
+    "live": {
+      "default_route": false,
+      "routing_domains": [
+        "corp.example.com"
+      ],
+      "servers": [
+        "10.0.0.1"
+      ]
+    },
+    "state": "Available"
+  },
+  "working": false
+}

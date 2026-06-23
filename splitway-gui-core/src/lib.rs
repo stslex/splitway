@@ -1,0 +1,51 @@
+//! `splitway-gui-core`: the framework-agnostic GUI logic shared by every client
+//! that drives the daemon's control socket.
+//!
+//! It holds these and **no UI framework** (no egui/eframe, no Tauri — only
+//! `splitway-shared`, plus `serde` for the serializable snapshot):
+//!
+//! - [`model`] — the pure view-model helpers: classify a client error, reduce a
+//!   `Status` round-trip to a connection banner, validate user input, build the
+//!   interface picker. Stateless functions, unit-tested in isolation.
+//! - [`command`] — the command-response mutation path for a request/response
+//!   frontend (the Tauri shell): [`run_mutation`] issues one of the daemon's
+//!   existing write verbs ([`Mutation`]) and returns a per-action `Result`;
+//!   [`run_check`] issues the one-shot route-check and returns a [`CheckOutcome`].
+//!   Stateless, so a mutation/query result can never become displayed state.
+//! - [`GuiCore`] — the stateful orchestration that implements the **GUI mutation
+//!   truth contract** (`docs/architecture.md` §2) once, for all frontends:
+//!   connection state plus the (re)connection-edge refetch policy, reply folding
+//!   (no optimistic UI — displayed state only ever changes from a daemon reply),
+//!   the post-mutation/resync refresh, unsaved-edit preservation, and the
+//!   read-only [`ViewModel`] a frontend renders.
+//! - [`snapshot`] — the owned, `Serialize` [`ViewModelSnapshot`] for a frontend
+//!   that lives across a serialization boundary (Tauri): same field set as the
+//!   borrowed [`ViewModel`], produced by [`GuiCore::snapshot`].
+//!
+//! A frontend (the interim egui harness today, the Tauri backend in Phase 7b)
+//! owns only rendering and the socket plumbing: it feeds each reply to
+//! [`GuiCore::apply_reply`], renders [`GuiCore::view`] (egui) or serializes
+//! [`GuiCore::snapshot`] (Tauri), binds its config inputs to
+//! [`GuiCore::editor_mut`], and sends exactly the requests
+//! [`GuiCore::take_next_request`] hands it. The blocking IPC client itself stays
+//! in `splitway_shared::ipc::client`.
+//!
+//! Unix-only, like that client (it speaks a Unix domain socket): the modules are
+//! `cfg(unix)` so a whole-workspace build on a non-Unix target still compiles
+//! this crate (as empty), mirroring how `splitway-gui` guards its egui stack.
+
+#[cfg(unix)]
+pub mod command;
+#[cfg(unix)]
+pub mod model;
+#[cfg(unix)]
+pub mod snapshot;
+#[cfg(unix)]
+mod state;
+
+#[cfg(unix)]
+pub use command::{run_check, run_mutation, CheckOutcome, Mutation};
+#[cfg(unix)]
+pub use snapshot::{ConfigFields, MessageView, VerifyView, ViewModelSnapshot};
+#[cfg(unix)]
+pub use state::{ConfigEditor, GuiCore, MessageKind, ViewModel};

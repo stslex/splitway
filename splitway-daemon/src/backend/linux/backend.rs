@@ -1,8 +1,10 @@
 use std::path::Path;
-use std::process::Command;
 
+use splitway_shared::ipc::{LinkDnsState, ResolutionInfo};
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnInfo};
 
+use crate::backend::linux::query::parse_resolvectl_query;
+use crate::backend::linux::status::parse_resolvectl_status;
 use crate::backend::linux::LinuxBackend;
 
 impl DnsBackend for LinuxBackend {
@@ -28,11 +30,14 @@ impl DnsBackend for LinuxBackend {
 
         // Set DNS servers: resolvectl dns <interface> <servers...>
 
-        let result = Command::new("resolvectl")
-            .arg("dns")
-            .arg(&vpn_info.interface_name)
-            .args(&vpn_info.dns_servers)
-            .output()?;
+        let result = crate::exec::run(
+            crate::exec::tool("SPLITWAY_RESOLVECTL", "resolvectl")
+                .arg("dns")
+                .arg(&vpn_info.interface_name)
+                .args(&vpn_info.dns_servers),
+            "resolvectl",
+            "split-DNS apply",
+        )?;
 
         log::debug!(
             "resolvectl dns stdout: {}",
@@ -49,38 +54,43 @@ impl DnsBackend for LinuxBackend {
             ));
         }
 
-        // Set domains: resolvectl domain <interface> <domains...>
-        let domain_error = match Command::new("resolvectl")
-            .arg("domain")
-            .arg(&vpn_info.interface_name)
-            .args(domains)
-            .output()
-        {
-            Ok(result) => {
-                log::debug!(
-                    "resolvectl domain stdout: {}",
-                    String::from_utf8_lossy(&result.stdout)
-                );
-                log::debug!(
-                    "resolvectl domain stderr: {}",
-                    String::from_utf8_lossy(&result.stderr)
-                );
-                if result.status.success() {
-                    None
-                } else {
-                    Some(PlatformError::CommandFailed(
-                        String::from_utf8_lossy(&result.stderr).to_string(),
-                    ))
-                }
-            }
-            Err(e) => Some(PlatformError::Io(e)),
-        };
+        // Set domains as systemd-resolved **routing-only** (`~domain`): route
+        // `*.domain` queries to this link without polluting the search list.
+        // `resolvectl domain` replaces the link's whole domain list, so this also
+        // drops any catch-all/search domains a VPN client left on the link.
+        let routing_domains = routing_only(domains);
+        let mut step_error = run_apply_step(
+            crate::exec::tool("SPLITWAY_RESOLVECTL", "resolvectl")
+                .arg("domain")
+                .arg(&vpn_info.interface_name)
+                .args(&routing_domains),
+            "domain",
+        );
 
-        // The DNS step already succeeded, so a domain failure leaves the
+        // Disable the link's DNS default-route (catch-all) flag so it resolves
+        // ONLY its routing domains. A full-tunnel VPN carries the default IP route,
+        // which makes systemd-resolved mark the link as the DNS *default route* —
+        // so without this every name that matches no routing domain (a sibling of a
+        // configured domain, or anything else) leaks to the VPN resolver, defeating
+        // the split. Run last: if it fails the link still has correct servers and
+        // domains (no worse than before this step), and the rollback below restores
+        // a clean state. `resolvectl revert` clears this flag along with the servers
+        // and domains, so the rollback path needs no extra step.
+        if step_error.is_none() {
+            step_error = run_apply_step(
+                crate::exec::tool("SPLITWAY_RESOLVECTL", "resolvectl")
+                    .arg("default-route")
+                    .arg(&vpn_info.interface_name)
+                    .arg("false"),
+                "default-route",
+            );
+        }
+
+        // The DNS step already succeeded, so a later step's failure leaves the
         // system half-configured; revert before returning the original error.
-        if let Some(error) = domain_error {
+        if let Some(error) = step_error {
             log::error!(
-                "domain step failed for {}: {error}; rolling back DNS settings",
+                "split-DNS apply step failed for {}: {error}; rolling back DNS settings",
                 vpn_info.interface_name
             );
             match self.revert_rules(&vpn_info.interface_name) {
@@ -100,10 +110,13 @@ impl DnsBackend for LinuxBackend {
     }
 
     fn revert_rules(&self, interface: &str) -> Result<(), PlatformError> {
-        let result = Command::new("resolvectl")
-            .arg("revert")
-            .arg(interface)
-            .output()?;
+        let result = crate::exec::run(
+            crate::exec::tool("SPLITWAY_RESOLVECTL", "resolvectl")
+                .arg("revert")
+                .arg(interface),
+            "resolvectl",
+            "DNS revert",
+        )?;
 
         log::debug!(
             "resolvectl revert stdout: {}",
@@ -136,19 +149,73 @@ impl DnsBackend for LinuxBackend {
         Ok(())
     }
 
-    fn status(&self, interface: &str) -> Result<(), PlatformError> {
-        let status = Command::new("resolvectl")
-            .arg("status")
-            .arg(interface)
-            .status()?;
+    /// Read the live per-link DNS state from `resolvectl status <iface>` and
+    /// parse it (I/O-free) via [`parse_resolvectl_status`]. A non-zero exit or a
+    /// vanished link is a clean [`PlatformError`] the daemon degrades to
+    /// "read-back unavailable" — never a hard failure. This reports the link's
+    /// resolver state, not reachability (see the trait doc / `docs/architecture.md`).
+    fn read_link_state(&self, interface: &str) -> Result<LinkDnsState, PlatformError> {
+        let output = crate::exec::run(
+            crate::exec::tool("SPLITWAY_RESOLVECTL", "resolvectl")
+                .arg("status")
+                .arg(interface),
+            "resolvectl",
+            "DNS read-back",
+        )?;
 
-        if !status.success() {
+        log::debug!(
+            "resolvectl status stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        if !output.status.success() {
+            // A non-zero exit is usually a vanished link (the VPN-down race) or a
+            // bad interface name; surface it as a clean error the daemon turns
+            // into "read-back unavailable".
             return Err(PlatformError::CommandFailed(
-                "resolvectl status failed".to_string(),
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
             ));
         }
 
-        Ok(())
+        Ok(parse_resolvectl_status(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
+    }
+
+    /// Strong attribution via systemd-resolved: `resolvectl query` routes the
+    /// query by the per-link routing domains, so the link it reports as having
+    /// answered reflects the actual split. The resolver IP is not reported, so
+    /// `via_dns` stays `None`. This reports which resolver answered, not
+    /// reachability (see the trait doc / `docs/architecture.md`).
+    fn resolve(&self, host: &str) -> Result<ResolutionInfo, PlatformError> {
+        let output = crate::exec::run(
+            crate::exec::tool("SPLITWAY_RESOLVECTL", "resolvectl")
+                .arg("query")
+                .arg(host),
+            "resolvectl",
+            "DNS resolution",
+        )?;
+
+        log::debug!(
+            "resolvectl query stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        if !output.status.success() {
+            // A non-zero exit is the normal NXDOMAIN / SERVFAIL path; surface it
+            // as a clean error the daemon turns into "resolution unavailable".
+            return Err(PlatformError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+
+        let info = parse_resolvectl_query(&String::from_utf8_lossy(&output.stdout));
+        if info.addresses.is_empty() {
+            return Err(PlatformError::ParseError(format!(
+                "no addresses parsed from `resolvectl query {host}`"
+            )));
+        }
+        Ok(info)
     }
 }
 
@@ -160,9 +227,77 @@ fn interface_exists(interface: &str) -> bool {
     Path::new("/sys/class/net").join(interface).exists()
 }
 
+/// Map configured (bare) domains to systemd-resolved **routing-only** form by
+/// prefixing each with `~`: `jira.example.com` → `~jira.example.com`. A
+/// routing-only domain routes `*.domain` queries to the link but is *not* added
+/// to the search list — a bare domain is both a search and a routing domain, so a
+/// single-label lookup (`host foo`) would otherwise get the domain appended and
+/// routed here. A domain already carrying the `~` marker (a hand-edited config) is
+/// left unchanged so it is never double-prefixed. Pure, no I/O.
+fn routing_only(domains: &[String]) -> Vec<String> {
+    domains
+        .iter()
+        .map(|domain| {
+            if domain.starts_with('~') {
+                domain.clone()
+            } else {
+                format!("~{domain}")
+            }
+        })
+        .collect()
+}
+
+/// Run one fallible `resolvectl` mutation step of [`apply_rules`], log its output
+/// at debug, and map a non-zero exit (or a spawn failure) to a [`PlatformError`].
+/// Returns `None` on success. Shared by the domain and default-route steps so both
+/// feed the single rollback path identically; `step` names the step for logs.
+fn run_apply_step(cmd: &mut std::process::Command, step: &str) -> Option<PlatformError> {
+    match crate::exec::run(cmd, "resolvectl", "split-DNS apply") {
+        Ok(result) => {
+            log::debug!(
+                "resolvectl {step} stdout: {}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+            log::debug!(
+                "resolvectl {step} stderr: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            if result.status.success() {
+                None
+            } else {
+                Some(PlatformError::CommandFailed(
+                    String::from_utf8_lossy(&result.stderr).to_string(),
+                ))
+            }
+        }
+        Err(e) => Some(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routing_only_prefixes_bare_domains_and_preserves_existing_marker() {
+        // Bare config domains gain the `~` routing-only marker; a domain already
+        // carrying it (a hand-edited config) is not double-prefixed.
+        let domains = vec![
+            "jira.example.com".to_string(),
+            "corp.example.com".to_string(),
+            "~already.example.net".to_string(),
+        ];
+        assert_eq!(
+            routing_only(&domains),
+            vec![
+                "~jira.example.com",
+                "~corp.example.com",
+                "~already.example.net",
+            ]
+        );
+        // No domains → no args (the empty-DNS path never reaches this anyway).
+        assert!(routing_only(&[]).is_empty());
+    }
 
     #[test]
     fn apply_with_no_dns_is_a_noop_ok() {

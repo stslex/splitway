@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use splitway_shared::config::atomic_write;
+use splitway_shared::ipc::{LinkDnsState, ResolutionInfo};
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnInfo};
 
 use super::resolver::{is_managed, is_valid_domain, resolver_contents, resolver_path};
@@ -43,15 +44,57 @@ impl DnsBackend for MacosBackend {
         Ok(())
     }
 
-    fn status(&self, _interface: &str) -> Result<(), PlatformError> {
-        // Mirror the Linux backend: shell out to the system resolver inspector.
-        let status = Command::new("scutil").arg("--dns").status()?;
-        if !status.success() {
-            return Err(PlatformError::CommandFailed(
-                "scutil --dns failed".to_string(),
-            ));
+    /// Best-effort live read-back. macOS has no per-link DNS block to parse
+    /// (`resolvectl status`'s analogue), and `scutil --dns` does not attribute
+    /// state to the interface that owns it — so the authoritative "what Splitway
+    /// installed" is the managed `/etc/resolver/<domain>` files this backend
+    /// wrote. We reconstruct the live state from exactly those: each managed
+    /// file's name is a routing domain, and its `nameserver` lines are the
+    /// servers. The `interface` argument is advisory (resolver files are keyed by
+    /// domain, not interface). Verify on hardware before relying on this.
+    fn read_link_state(&self, _interface: &str) -> Result<LinkDnsState, PlatformError> {
+        Ok(read_managed_state(Path::new(RESOLVER_DIR)))
+    }
+
+    fn reverts_globally(&self) -> bool {
+        // revert_rules removes every managed resolver file, not just one
+        // interface's — resolver files are keyed by domain (see revert_rules).
+        true
+    }
+
+    /// Best-effort live resolution. macOS routes the lookup through the system
+    /// resolver, which honors the `/etc/resolver/<domain>` files this backend
+    /// writes — so a covered domain resolves via the VPN's DNS. But the system
+    /// lookup does not attribute which link/resolver answered, so `via_interface`
+    /// and `via_dns` are always `None` (unlike Linux's strong attribution). This
+    /// reports the resolved address, not reachability (see the trait doc).
+    fn resolve(&self, host: &str) -> Result<ResolutionInfo, PlatformError> {
+        use std::net::ToSocketAddrs;
+
+        // Port 0: we only want the address resolution, not a connection. This
+        // goes through getaddrinfo, which respects `/etc/resolver`.
+        let addresses: Vec<String> = (host, 0u16)
+            .to_socket_addrs()
+            .map_err(|e| PlatformError::CommandFailed(format!("resolve {host}: {e}")))?
+            .map(|addr| addr.ip().to_string())
+            // Dedup while keeping output stable: getaddrinfo returns A/AAAA
+            // records, and a host often resolves to the same IP via several
+            // entries (duplicate records, or both the v4 and v6 family).
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        if addresses.is_empty() {
+            return Err(PlatformError::ParseError(format!(
+                "no addresses resolved for {host}"
+            )));
         }
-        Ok(())
+
+        Ok(ResolutionInfo {
+            addresses,
+            via_interface: None,
+            via_dns: None,
+        })
     }
 }
 
@@ -229,6 +272,67 @@ fn remove_managed(dir: &Path, keep: Option<&BTreeSet<&str>>) -> io::Result<usize
         }
     }
     Ok(removed)
+}
+
+/// Reconstruct the live [`LinkDnsState`] from the managed `/etc/resolver` files
+/// in `dir`: each managed file's name is a routing domain and its `nameserver`
+/// lines are the servers (`man 5 resolver`). Files we do not own (no marker),
+/// unreadable files, and non-regular entries (symlinks, directories) are skipped.
+/// Best-effort: a missing dir or a read error degrades to an empty state rather
+/// than failing, which the caller treats as "read-back unavailable". Entries are
+/// visited in sorted order for a stable result, and servers are de-duplicated
+/// across files (every managed file lists the same VPN servers).
+fn read_managed_state(dir: &Path) -> LinkDnsState {
+    let mut routing_domains: Vec<String> = Vec::new();
+    let mut servers: Vec<String> = Vec::new();
+
+    let mut entries: Vec<PathBuf> = match fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).collect(),
+        Err(_) => return LinkDnsState::default(),
+    };
+    entries.sort();
+
+    for path in entries {
+        // Only ever read real files we could have written — `symlink_metadata`
+        // does not follow links, so a symlink is skipped rather than read through.
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => {}
+            _ => continue,
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        // Only attribute files Splitway wrote; a user-authored resolver is not
+        // part of the daemon's belief and would be a false "live" entry.
+        if !is_managed(&contents) {
+            continue;
+        }
+        // The filename is the routing domain it resolves.
+        if !routing_domains.iter().any(|d| d == name) {
+            routing_domains.push(name.to_string());
+        }
+        for line in contents.lines() {
+            if let Some(server) = line.trim().strip_prefix("nameserver ") {
+                let server = server.trim();
+                if !server.is_empty() && !servers.iter().any(|s| s == server) {
+                    servers.push(server.to_string());
+                }
+            }
+        }
+    }
+
+    LinkDnsState {
+        servers,
+        routing_domains,
+        // macOS split-DNS is per-domain (`/etc/resolver/<domain>` files): there is
+        // no link-level catch-all to leak through, so the default-route flag does
+        // not apply here. `None` keeps `compare_drift`'s leak check from ever
+        // tripping on macOS.
+        default_route: None,
+    }
 }
 
 /// Best-effort flush of the macOS DNS caches after resolver files change.
@@ -466,5 +570,73 @@ mod tests {
             .arg(&stale)
             .status();
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_managed_state_reconstructs_domains_and_servers() {
+        let dir = temp_dir("read-managed");
+        apply_to_dir(
+            &dir,
+            &servers(),
+            &["a.example.com".to_string(), "b.example.com".to_string()],
+        )
+        .unwrap();
+
+        let state = read_managed_state(&dir);
+        // Domains are the managed filenames (sorted order is stable).
+        assert_eq!(
+            state.routing_domains,
+            vec!["a.example.com", "b.example.com"]
+        );
+        // Servers are de-duplicated across the per-domain files.
+        assert_eq!(state.servers, vec!["10.0.0.1", "10.0.0.2"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_managed_state_ignores_unmanaged_files() {
+        let dir = temp_dir("read-unmanaged");
+        apply_to_dir(&dir, &servers(), &["a.example.com".to_string()]).unwrap();
+        // A resolver file the user wrote by hand must not appear in the read-back.
+        fs::write(dir.join("user.example"), "nameserver 198.51.100.9\n").unwrap();
+
+        let state = read_managed_state(&dir);
+        assert_eq!(state.routing_domains, vec!["a.example.com"]);
+        assert_eq!(state.servers, vec!["10.0.0.1", "10.0.0.2"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_managed_state_on_missing_dir_is_empty() {
+        let mut missing = std::env::temp_dir();
+        missing.push(format!("splitway-absent-readback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        let state = read_managed_state(&missing);
+        assert!(state.servers.is_empty());
+        assert!(state.routing_domains.is_empty());
+    }
+
+    #[test]
+    fn read_managed_state_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = temp_dir("read-symlink");
+        // A genuine managed file that must appear in the read-back.
+        apply_to_dir(&dir, &servers(), &["a.example.com".to_string()]).unwrap();
+        // A managed-marker target *outside* the scanned dir, and a symlink inside
+        // the dir whose name looks like a routing domain pointing at it.
+        // `symlink_metadata` must not follow the link, so neither the symlink's
+        // name nor the target's servers leak into the live state.
+        let outside = temp_dir("read-symlink-target");
+        let target = outside.join("target");
+        fs::write(&target, resolver_contents(&["198.51.100.9".to_string()])).unwrap();
+        symlink(&target, dir.join("evil.example.com")).unwrap();
+
+        let state = read_managed_state(&dir);
+        // Only the real managed file's domain; the symlink's name is excluded.
+        assert_eq!(state.routing_domains, vec!["a.example.com"]);
+        // The symlink target's server (198.51.100.9) is not read through.
+        assert_eq!(state.servers, vec!["10.0.0.1", "10.0.0.2"]);
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
     }
 }
