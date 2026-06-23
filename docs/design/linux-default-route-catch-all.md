@@ -48,11 +48,17 @@ was defeated.
   config entry is not double-prefixed. `compare_drift` and the status parser
   already strip a leading `~` symmetrically, so this is not false drift.
 - **The read-back learns the flag.** `LinkDnsState` gains
-  `default_route: Option<bool>` (parsed from the `Default Route:` line — the
-  explicit line is authoritative; the `Protocols: +DefaultRoute` token stays
-  ignored). `compare_drift` reports a `Drifted { default_route_leak: true }` when
-  the live link is `Some(true)` while the belief is a narrow split — so a link
-  that re-becomes the catch-all (see tradeoffs) is detected, not silently InSync.
+  `default_route: Option<bool>`, parsed from the `Default Route:` line and falling
+  back to the `Protocols: +DefaultRoute` token when the explicit line is absent
+  (older systemd-resolved output omits it). `compare_drift` reports a
+  `Drifted { default_route_leak: true }` when the live link is a catch-all while
+  the belief is a narrow split — so a link that re-becomes the catch-all (see
+  tradeoffs) is detected, not silently InSync. A link counts as a catch-all by
+  **either** signal: `default_route == Some(true)` **or** a live route-all routing
+  domain (`~.`, parsed to `.`), since a VPN manager can install the catch-all
+  either way and the suffix-aware coverage check would otherwise treat `.` as
+  covering every believed domain and hide the leak. `None` with no route-all
+  domain (read-back did not learn the flag, or macOS) is never a leak.
 
 ## Scope / out of scope
 

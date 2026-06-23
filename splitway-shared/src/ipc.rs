@@ -327,14 +327,15 @@ pub enum DriftVerdict {
         missing_servers: Vec<String>,
         /// Believed domains not covered by any live routing domain.
         unrouted_domains: Vec<String>,
-        /// The live link is the DNS **default route** (catch-all) while the
-        /// believed split is narrow: it resolves *every* unmatched name through
-        /// the VPN resolver, not just the configured domains, so a name the user
-        /// never configured still leaks to the VPN. This is drift even when
-        /// `missing_servers` and `unrouted_domains` are both empty (the narrow
-        /// domains are technically present, but the link routes far more than
-        /// them). Set only when the live `default_route` is `Some(true)` and the
-        /// belief is not itself route-all — see [`compare_drift`].
+        /// The live link is a **catch-all** while the believed split is narrow: it
+        /// resolves *every* unmatched name through the VPN resolver, not just the
+        /// configured domains, so a name the user never configured still leaks to
+        /// the VPN. This is drift even when `missing_servers` and `unrouted_domains`
+        /// are both empty (the narrow domains are technically present, but the link
+        /// routes far more than them). Set when the live link is a catch-all by
+        /// either signal — `default_route == Some(true)` or a live route-all (`~.`)
+        /// routing domain — and the belief is not itself route-all. See
+        /// [`compare_drift`].
         default_route_leak: bool,
     },
 }
@@ -352,13 +353,14 @@ pub enum DriftVerdict {
 ///     `routing_domain`, suffix-aware via [`domain::domain_covers`] (so a live
 ///     `example.com` covers a believed `sub.example.com`, and case / a trailing
 ///     dot / a stripped `~` never matter).
-///   - the live link must **not** be the DNS default route (catch-all) while the
-///     belief is a narrow split: a `Some(true)` `default_route` means the link
-///     resolves every unmatched name through the VPN, leaking names the user never
-///     configured — that is drift even when the narrow domains are all present. A
-///     `None` `default_route` (read-back did not learn it, or macOS) is never a
-///     leak, and a belief that is *itself* route-all (a deliberate full-tunnel
-///     split) is not a leak either.
+///   - the live link must **not** be a catch-all while the belief is a narrow
+///     split. A link is a catch-all if `default_route == Some(true)` OR it carries
+///     a live route-all routing domain (`~.`, parsed to `.`) — either makes it
+///     resolve every unmatched name through the VPN, leaking names the user never
+///     configured. That is drift even when the narrow domains are all present. A
+///     `None` `default_route` with no route-all domain (read-back did not learn the
+///     flag, or macOS) is never a leak, and a belief that is *itself* route-all (a
+///     deliberate full-tunnel split) is not a leak either.
 ///   - all present, covered, and no leak → [`DriftVerdict::InSync`]; otherwise
 ///     [`DriftVerdict::Drifted`] naming the missing servers, unrouted domains, and
 ///     whether the link leaks as a catch-all.
@@ -416,7 +418,21 @@ pub fn compare_drift(live: &LinkDnsState, applied: Option<&AppliedInfo>) -> Drif
         let believed = believed.strip_prefix('~').unwrap_or(believed);
         is_route_all(believed)
     });
-    let default_route_leak = live.default_route == Some(true) && !believes_route_all;
+    // The live link is a catch-all by EITHER signal: systemd-resolved flags it the
+    // DNS default route (`default_route == Some(true)`), OR a VPN manager installed
+    // the catch-all as a live route-all routing domain (`~.`, parsed to `.`). The
+    // two are equivalent ways to make a link answer every unmatched name, so both
+    // must count — otherwise a manager that sets only `~.` (leaving the flag
+    // `None`/`Some(false)`) would leak while the suffix-aware coverage loop above
+    // reports every believed domain "covered" by `.`, hiding the leak as InSync.
+    // Against a narrow belief either is a leak; a belief that is itself route-all
+    // (a deliberate full-tunnel split) wants the catch-all, so it is not.
+    let live_is_catch_all = live.default_route == Some(true)
+        || live
+            .routing_domains
+            .iter()
+            .any(|domain| is_route_all(domain));
+    let default_route_leak = live_is_catch_all && !believes_route_all;
 
     if missing_servers.is_empty() && unrouted_domains.is_empty() && !default_route_leak {
         DriftVerdict::InSync
@@ -1009,10 +1025,28 @@ mod tests {
     }
 
     #[test]
-    fn drift_route_all_live_domain_covers_every_believed_domain() {
-        // A full-tunnel link carrying `~.` (parsed to `.`) routes everything, so
-        // every believed domain is covered — in sync, not a false drift.
+    fn drift_live_route_all_domain_against_narrow_belief_is_a_leak() {
+        // A live route-all routing domain (`~.`, parsed to `.`) makes the link a
+        // catch-all just as `default_route == Some(true)` does — even when the flag
+        // is unknown. Against a narrow belief that is a leak: the believed domains
+        // are "covered" (so unrouted is empty), but the link routes everything.
         let applied = believed(&["10.0.0.1"], &["example.com", "corp.example.com"]);
+        let live = live(&["10.0.0.1"], &["."]);
+        assert_eq!(
+            compare_drift(&live, Some(&applied)),
+            DriftVerdict::Drifted {
+                missing_servers: vec![],
+                unrouted_domains: vec![],
+                default_route_leak: true,
+            }
+        );
+    }
+
+    #[test]
+    fn drift_live_route_all_with_route_all_belief_is_in_sync() {
+        // A belief that is itself route-all (a deliberate full-tunnel split) WANTS
+        // the live link to be the catch-all, so a live `~.` is in sync, not a leak.
+        let applied = believed(&["10.0.0.1"], &["~."]);
         let live = live(&["10.0.0.1"], &["."]);
         assert_eq!(compare_drift(&live, Some(&applied)), DriftVerdict::InSync);
     }

@@ -45,6 +45,10 @@ pub(crate) fn parse_resolvectl_status(output: &str) -> LinkDnsState {
     let mut servers: Vec<String> = Vec::new();
     let mut routing_domains: Vec<String> = Vec::new();
     let mut default_route: Option<bool> = None;
+    // Fallback source for the default-route flag: older systemd-resolved output
+    // exposes the catch-all only as the `Protocols: +DefaultRoute` token, with no
+    // separate `Default Route:` line. The explicit line wins when both are present.
+    let mut protocols_default_route: Option<bool> = None;
     let mut section = Section::Other;
 
     for line in output.lines() {
@@ -70,12 +74,18 @@ pub(crate) fn parse_resolvectl_status(output: &str) -> LinkDnsState {
         } else if let Some(value) = trimmed.strip_prefix("Default Route:") {
             // The per-link DNS default-route (catch-all) flag. Single-valued, so
             // it ends any continuation section. `yes`/`no` map to `Some`; anything
-            // else leaves it unknown (`None`). Authoritative over the `Protocols:`
-            // `+DefaultRoute` token (which is ignored — see `looks_like_new_field`).
+            // else leaves it unknown (`None`). This explicit line is authoritative
+            // over the `Protocols: +DefaultRoute` fallback below.
             section = Section::Other;
             if let Some(flag) = parse_default_route(value) {
                 default_route = Some(flag);
             }
+        } else if let Some(value) = trimmed.strip_prefix("Protocols:") {
+            // `Protocols: ±DefaultRoute ±LLMNR …`. Single-valued line. Used only as
+            // the fallback default-route source (above) for output without the
+            // explicit `Default Route:` line; otherwise it contributes nothing.
+            section = Section::Other;
+            protocols_default_route = parse_protocols_default_route(value);
         } else if looks_like_new_field(trimmed) {
             // Some other field (`Protocols:`, the `Link N (…)` header, …): it ends
             // any open continuation section but contributes nothing.
@@ -93,7 +103,9 @@ pub(crate) fn parse_resolvectl_status(output: &str) -> LinkDnsState {
     LinkDnsState {
         servers,
         routing_domains,
-        default_route,
+        // The explicit `Default Route:` line wins; fall back to the `Protocols:`
+        // `+DefaultRoute` token for older output that lacks the explicit line.
+        default_route: default_route.or(protocols_default_route),
     }
 }
 
@@ -106,6 +118,18 @@ fn parse_default_route(value: &str) -> Option<bool> {
         "no" => Some(false),
         _ => None,
     }
+}
+
+/// Scan a `Protocols:` line's `±Flag` tokens for the default-route flag — a
+/// fallback for older systemd-resolved output that omits the explicit
+/// `Default Route:` line. `+DefaultRoute` → `Some(true)`, `-DefaultRoute` →
+/// `Some(false)`, absent → `None`.
+fn parse_protocols_default_route(values: &str) -> Option<bool> {
+    values.split_whitespace().find_map(|token| match token {
+        "+DefaultRoute" => Some(true),
+        "-DefaultRoute" => Some(false),
+        _ => None,
+    })
 }
 
 /// Push the bare IP of each whitespace token of `values` onto `servers`,
@@ -186,9 +210,9 @@ Current DNS Server: 10.0.0.1
         let state = parse_resolvectl_status(output);
         assert_eq!(state.servers, vec!["10.0.0.1", "10.0.0.2"]);
         assert_eq!(state.routing_domains, vec!["example.com"]);
-        // Only the explicit `Default Route:` line sets the flag — the `Protocols:`
-        // `+DefaultRoute` token is ignored, so without that line it stays unknown.
-        assert_eq!(state.default_route, None);
+        // No explicit `Default Route:` line here, so the flag falls back to the
+        // `Protocols: +DefaultRoute` token → Some(true).
+        assert_eq!(state.default_route, Some(true));
     }
 
     #[test]
@@ -365,6 +389,43 @@ Link 5 (tun0)
         // An unrecognized value leaves the flag unknown rather than guessing.
         let garbage = "     Default Route: maybe\n";
         assert_eq!(parse_resolvectl_status(garbage).default_route, None);
+    }
+
+    #[test]
+    fn default_route_falls_back_to_protocols_token_then_explicit_line_wins() {
+        // Older systemd-resolved output exposes the catch-all only via the
+        // `Protocols:` token, with no explicit `Default Route:` line — the flag
+        // must still be learned, or `compare_drift` would miss the leak.
+        let protocols_only_on = "\
+Link 5 (tun0)
+         Protocols: +DefaultRoute +LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported
+        DNS Domain: jira.example.com
+";
+        assert_eq!(
+            parse_resolvectl_status(protocols_only_on).default_route,
+            Some(true)
+        );
+
+        let protocols_only_off = "\
+Link 5 (tun0)
+         Protocols: -DefaultRoute +LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported
+";
+        assert_eq!(
+            parse_resolvectl_status(protocols_only_off).default_route,
+            Some(false)
+        );
+
+        // When both are present the explicit `Default Route:` line is authoritative
+        // and overrides a disagreeing `Protocols:` token.
+        let both_disagree = "\
+Link 5 (tun0)
+         Protocols: +DefaultRoute +LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported
+     Default Route: no
+";
+        assert_eq!(
+            parse_resolvectl_status(both_disagree).default_route,
+            Some(false)
+        );
     }
 
     #[test]
