@@ -27,6 +27,7 @@ import {
   blockerIcon,
   chipFor,
   connIndicator,
+  defaultRouteLeak,
   domainDrifted,
   driftOf,
   el,
@@ -427,7 +428,19 @@ function emptyPlaceholder(): HTMLElement {
   ]);
 }
 
-function everythingElse(): HTMLElement {
+function everythingElse(leaking: boolean): HTMLElement {
+  if (leaking) {
+    // The live link is a catch-all (the DNS default route): names outside the
+    // configured domains resolve through the VPN, NOT direct. Say so honestly
+    // rather than render the usual "→ direct", which would be a lie here.
+    return el("div", { class: "everything leak" }, [
+      el("span", { class: "rest", text: "Everything else" }),
+      el("span", { class: "via-vpn" }, [
+        el("span", { class: "arrow", text: "→" }),
+        document.createTextNode(" through the VPN — catch-all leak"),
+      ]),
+    ]);
+  }
   return el("div", { class: "everything" }, [
     el("span", { class: "rest", text: "Everything else" }),
     el("span", { class: "direct" }, [
@@ -461,14 +474,14 @@ function domainsSection(
   const addErr = errorFor(lc, "add");
   if (addErr) children.push(actionError(addErr));
 
+  // Per-domain verify (✓ / ⚠) is only meaningful when rules are actually applied
+  // AND a live read-back exists; otherwise show no badge rather than a fake ✓.
+  const drift = mode === "healthy" ? driftOf(vm) : null;
   if (mode === "empty") {
     children.push(emptyPlaceholder());
   } else {
     const list = el("div", { class: "domains" });
     list.id = "domains";
-    // Per-domain verify (✓ / ⚠) is only meaningful when rules are actually applied
-    // AND a live read-back exists; otherwise show no badge rather than a fake ✓.
-    const drift = mode === "healthy" ? driftOf(vm) : null;
     const showVerify = mode === "healthy" && drift !== null;
     for (const domain of domains) {
       list.appendChild(
@@ -477,7 +490,7 @@ function domainsSection(
     }
     children.push(list);
   }
-  children.push(everythingElse());
+  children.push(everythingElse(defaultRouteLeak(drift)));
   return el("section", { class: "section reveal d4" }, children);
 }
 

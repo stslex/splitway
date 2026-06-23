@@ -52,6 +52,20 @@ test("drifted verify → amber, not checked", () => {
   assert.equal(chip?.check, false);
 });
 
+test("default-route leak → amber chip naming the catch-all leak", () => {
+  // Leak-only verdict (empty lists, default_route_leak true): the hero chip must
+  // call out the catch-all leak, not stay silent or claim in-sync.
+  const chip = chipFor(
+    "healthy",
+    available({
+      Drifted: { missing_servers: [], unrouted_domains: [], default_route_leak: true },
+    }),
+  );
+  assert.equal(chip?.tone, "warn");
+  assert.equal(chip?.check, false);
+  assert.match(chip?.text ?? "", /leak|through the VPN/i);
+});
+
 test("non-healthy modes keep their chips (or none)", () => {
   assert.equal(chipFor("off", { state: "Unknown" }), null);
   assert.equal(chipFor("empty", { state: "Unknown" }), null);

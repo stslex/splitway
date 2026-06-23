@@ -301,6 +301,11 @@ export function chipFor(mode: MainMode, verify: VerifyView): ChipView | null {
       if (verify.state === "Available") {
         const drift = verify.drift;
         if (typeof drift === "object" && "Drifted" in drift) {
+          // A catch-all leak is the headline: the live link is the DNS default
+          // route, so every unmatched name resolves through the VPN, not direct.
+          if (drift.Drifted.default_route_leak) {
+            return { tone: "warn", check: false, text: "Everything else leaks through the VPN" };
+          }
           return { tone: "warn", check: false, text: "Some domains have drifted" };
         }
         if (drift === "InSync") {
@@ -327,4 +332,13 @@ export function driftOf(vm: ViewModel): DriftVerdict | null {
 export function domainDrifted(drift: DriftVerdict | null, domain: string): boolean {
   if (!drift || typeof drift !== "object" || !("Drifted" in drift)) return false;
   return drift.Drifted.unrouted_domains.includes(domain);
+}
+
+/** Whether the live link is a catch-all (the DNS default route) while the
+ *  configured split is narrow — i.e. every name NOT in the configured domains
+ *  leaks through the VPN instead of going direct. Drives the "Everything else"
+ *  row, which would otherwise falsely claim "direct". */
+export function defaultRouteLeak(drift: DriftVerdict | null): boolean {
+  if (!drift || typeof drift !== "object" || !("Drifted" in drift)) return false;
+  return drift.Drifted.default_route_leak;
 }
