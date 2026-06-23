@@ -214,26 +214,32 @@ async fn handle_state(
                 // Up-ness is NOT gated on finding pushed DNS: detect() returns
                 // Ok with possibly-empty dns_servers (a VPN that pushed no DNS,
                 // or the settle window lost the race). We emit Up either way —
-                // an Up with empty DNS is a safe no-op downstream, since
-                // StateMachine::desired() returns None for it.
-                //
-                // Dedup is recorded only when DNS was actually found. Leaving an
-                // empty-DNS Up *un*-recorded is deliberate: the daemon reacts
-                // solely to Device.StateChanged, and NM does not re-emit state
-                // 100 once activated — so recording here would foreclose the one
-                // recovery path for a lost settle race. Un-recorded, a later
-                // re-emitted ACTIVATED (if one ever arrives) re-runs detect() and
-                // can pick up DNS that settled after our window. Any redundant
-                // Up(empty) events this produces are harmless no-ops.
+                // an Up with empty DNS is a safe no-op for *rules* downstream,
+                // since StateMachine::desired() returns None for it (it does flip
+                // `vpn_up` and report NoDnsFromVpn).
                 Ok(info) => {
-                    if !info.dns_servers.is_empty() {
+                    if info.dns_servers.is_empty() {
+                        // Soft Up: emitted, but it must pin nothing in the
+                        // deduper. Recording it as Up would foreclose
+                        // re-detection on a re-emitted ACTIVATED (the recovery
+                        // path for a lost settle race, since the daemon reacts
+                        // solely to Device.StateChanged). Leaving the prior
+                        // transition in place is worse: a startup/teardown Down
+                        // would still be `last`, so the genuine following Down is
+                        // seen as a duplicate and dropped — `vpn_up` would never
+                        // clear and the daemon would report the VPN up after it
+                        // went down. reset() returns to neutral: the next Up
+                        // re-detects and the next Down still emits.
+                        dedup.reset();
+                    } else {
                         dedup.record(t);
                     }
                     send_event(tx, VpnEvent::Up(info)).await;
                 }
                 // detect() errors only on a genuine nmcli failure / absent
-                // device, never on empty DNS. Also not recorded in dedup, for
-                // the same reason: a re-emitted ACTIVATED gets another chance.
+                // device, never on empty DNS. No event is sent and dedup is left
+                // untouched, so a re-emitted ACTIVATED still gets a chance to
+                // detect.
                 Err(e) => log::warn!("{interface} reported up but detect failed: {e}"),
             }
         }

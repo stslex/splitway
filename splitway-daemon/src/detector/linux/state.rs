@@ -48,6 +48,18 @@ impl Deduper {
         self.last = Some(transition);
     }
 
+    /// Forget the last transition, returning to the initial neutral state in
+    /// which neither an `Up` nor a `Down` is a duplicate.
+    ///
+    /// Used after emitting a *soft* `Up` — one carrying no DNS — which must pin
+    /// nothing: recording it as `Up` would foreclose re-detection on a
+    /// re-emitted ACTIVATED, while leaving the prior transition in place (e.g. a
+    /// startup/teardown `Down`) would make the genuine following `Down` look
+    /// like a duplicate and get dropped, stranding the daemon's `vpn_up` flag.
+    pub(crate) fn reset(&mut self) {
+        self.last = None;
+    }
+
     pub(crate) fn push(&mut self, transition: Transition) -> Option<Transition> {
         if self.is_dup(transition) {
             return None;
@@ -84,6 +96,22 @@ mod tests {
     fn deduper_passes_first_event() {
         let mut dedup = Deduper::default();
         assert_eq!(dedup.push(Transition::Up), Some(Transition::Up));
+    }
+
+    #[test]
+    fn deduper_reset_returns_to_neutral_state() {
+        // After a soft (empty-DNS) Up, `reset()` must leave neither transition a
+        // duplicate: the genuine following Down still emits (so `vpn_up` clears),
+        // and a re-emitted ACTIVATED still re-detects.
+        let mut dedup = Deduper::default();
+        dedup.record(Transition::Down);
+        assert!(dedup.is_dup(Transition::Down));
+
+        dedup.reset();
+        assert!(!dedup.is_dup(Transition::Down));
+        assert!(!dedup.is_dup(Transition::Up));
+        // The following Down passes through rather than being swallowed.
+        assert_eq!(dedup.push(Transition::Down), Some(Transition::Down));
     }
 
     #[test]
