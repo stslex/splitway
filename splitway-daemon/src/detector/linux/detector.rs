@@ -69,14 +69,21 @@ struct RealNmcli;
 /// degrades to empty and the pushed DNS is never applied. The nmcli manual
 /// recommends `LC_ALL=C` for exactly this machine-parsing case.
 fn nmcli() -> Command {
-    let mut cmd = Command::new("nmcli");
+    // Resolve via the SPLITWAY_NMCLI override (absolute store path injected by
+    // packaging) before falling back to a bare-name PATH lookup, so detection
+    // does not depend on a service manager's PATH. See `crate::exec`.
+    let mut cmd = crate::exec::tool("SPLITWAY_NMCLI", "nmcli");
     cmd.env("LC_ALL", "C");
     cmd
 }
 
 impl NmcliSource for RealNmcli {
     fn device_show(&self, iface: &str) -> Result<String, PlatformError> {
-        let output = nmcli().args(["device", "show", iface]).output()?;
+        let output = crate::exec::run(
+            nmcli().args(["device", "show", iface]),
+            "nmcli",
+            "VPN detection",
+        )?;
         if !output.status.success() {
             return Err(PlatformError::VpnNotFound(iface.to_string()));
         }
@@ -84,16 +91,18 @@ impl NmcliSource for RealNmcli {
     }
 
     fn active_connections(&self) -> Result<String, PlatformError> {
-        let output = nmcli()
-            .args([
+        let output = crate::exec::run(
+            nmcli().args([
                 "-t",
                 "-f",
                 "UUID,TYPE,STATE",
                 "connection",
                 "show",
                 "--active",
-            ])
-            .output()?;
+            ]),
+            "nmcli",
+            "VPN detection",
+        )?;
         if !output.status.success() {
             return Err(PlatformError::CommandFailed(
                 "nmcli connection show --active failed".to_string(),
@@ -103,7 +112,11 @@ impl NmcliSource for RealNmcli {
     }
 
     fn connection_show(&self, uuid: &str) -> Result<String, PlatformError> {
-        let output = nmcli().args(["connection", "show", uuid]).output()?;
+        let output = crate::exec::run(
+            nmcli().args(["connection", "show", uuid]),
+            "nmcli",
+            "VPN detection",
+        )?;
         if !output.status.success() {
             return Err(PlatformError::CommandFailed(format!(
                 "nmcli connection show {uuid} failed"
