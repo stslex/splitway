@@ -25,12 +25,22 @@ mod command;
 mod daemon;
 #[cfg(unix)]
 mod detector;
+// Tool resolution + loud-on-missing spawn wrapper for the external commands the
+// daemon shells out to (`nmcli`, `resolvectl`). Linux-only today — the macOS
+// backend can adopt it later (see `exec` docs / ROADMAP.md).
+#[cfg(target_os = "linux")]
+mod exec;
 #[cfg(unix)]
 mod interfaces;
 
 #[cfg(unix)]
 fn main() {
-    env_logger::init();
+    // Default to `info` when RUST_LOG is unset. Plain `env_logger::init()` keeps
+    // env_logger's built-in default of `error`, which suppresses the very `warn`
+    // and `info` lines that diagnose a broken deployment — e.g. a detect failure
+    // or "VPN up" transition. A core-function failure must be visible without the
+    // operator first knowing to set RUST_LOG. RUST_LOG still overrides this.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     match env::args().parse_command() {
         Ok(Command::Run {
             config,

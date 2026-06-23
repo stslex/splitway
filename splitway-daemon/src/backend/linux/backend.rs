@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::process::Command;
 
 use splitway_shared::ipc::{LinkDnsState, ResolutionInfo};
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnInfo};
@@ -31,11 +30,14 @@ impl DnsBackend for LinuxBackend {
 
         // Set DNS servers: resolvectl dns <interface> <servers...>
 
-        let result = Command::new("resolvectl")
-            .arg("dns")
-            .arg(&vpn_info.interface_name)
-            .args(&vpn_info.dns_servers)
-            .output()?;
+        let result = crate::exec::run(
+            crate::exec::tool("SPLITWAY_RESOLVECTL", "resolvectl")
+                .arg("dns")
+                .arg(&vpn_info.interface_name)
+                .args(&vpn_info.dns_servers),
+            "resolvectl",
+            "split-DNS apply",
+        )?;
 
         log::debug!(
             "resolvectl dns stdout: {}",
@@ -53,12 +55,14 @@ impl DnsBackend for LinuxBackend {
         }
 
         // Set domains: resolvectl domain <interface> <domains...>
-        let domain_error = match Command::new("resolvectl")
-            .arg("domain")
-            .arg(&vpn_info.interface_name)
-            .args(domains)
-            .output()
-        {
+        let domain_error = match crate::exec::run(
+            crate::exec::tool("SPLITWAY_RESOLVECTL", "resolvectl")
+                .arg("domain")
+                .arg(&vpn_info.interface_name)
+                .args(domains),
+            "resolvectl",
+            "split-DNS apply",
+        ) {
             Ok(result) => {
                 log::debug!(
                     "resolvectl domain stdout: {}",
@@ -76,7 +80,7 @@ impl DnsBackend for LinuxBackend {
                     ))
                 }
             }
-            Err(e) => Some(PlatformError::Io(e)),
+            Err(e) => Some(e),
         };
 
         // The DNS step already succeeded, so a domain failure leaves the
@@ -103,10 +107,13 @@ impl DnsBackend for LinuxBackend {
     }
 
     fn revert_rules(&self, interface: &str) -> Result<(), PlatformError> {
-        let result = Command::new("resolvectl")
-            .arg("revert")
-            .arg(interface)
-            .output()?;
+        let result = crate::exec::run(
+            crate::exec::tool("SPLITWAY_RESOLVECTL", "resolvectl")
+                .arg("revert")
+                .arg(interface),
+            "resolvectl",
+            "DNS revert",
+        )?;
 
         log::debug!(
             "resolvectl revert stdout: {}",
@@ -145,10 +152,13 @@ impl DnsBackend for LinuxBackend {
     /// "read-back unavailable" — never a hard failure. This reports the link's
     /// resolver state, not reachability (see the trait doc / `docs/architecture.md`).
     fn read_link_state(&self, interface: &str) -> Result<LinkDnsState, PlatformError> {
-        let output = Command::new("resolvectl")
-            .arg("status")
-            .arg(interface)
-            .output()?;
+        let output = crate::exec::run(
+            crate::exec::tool("SPLITWAY_RESOLVECTL", "resolvectl")
+                .arg("status")
+                .arg(interface),
+            "resolvectl",
+            "DNS read-back",
+        )?;
 
         log::debug!(
             "resolvectl status stderr: {}",
@@ -175,7 +185,13 @@ impl DnsBackend for LinuxBackend {
     /// `via_dns` stays `None`. This reports which resolver answered, not
     /// reachability (see the trait doc / `docs/architecture.md`).
     fn resolve(&self, host: &str) -> Result<ResolutionInfo, PlatformError> {
-        let output = Command::new("resolvectl").arg("query").arg(host).output()?;
+        let output = crate::exec::run(
+            crate::exec::tool("SPLITWAY_RESOLVECTL", "resolvectl")
+                .arg("query")
+                .arg(host),
+            "resolvectl",
+            "DNS resolution",
+        )?;
 
         log::debug!(
             "resolvectl query stderr: {}",

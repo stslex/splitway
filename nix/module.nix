@@ -1,11 +1,16 @@
 # NixOS module for Splitway.
 #
-# Runtime dependencies: the daemon shells out to `nmcli` (NetworkManager)
-# and `resolvectl` (systemd-resolved). Hosts that set
-# `networking.networkmanager.enable = true` and
-# `services.resolved.enable = true` already have both binaries in PATH,
-# so this module does not pull them in itself — enabling those services
-# is left to the host configuration.
+# Runtime dependencies: the daemon shells out to `nmcli` (NetworkManager) and
+# `resolvectl` (systemd-resolved). A systemd unit runs with systemd's minimal
+# default unit PATH — NOT the host/login PATH — so it would fail to find these
+# binaries (ENOENT on spawn) even on a host where NetworkManager and resolved
+# are enabled. This module therefore puts the tools on the service `path` itself
+# AND injects their absolute store paths via the daemon's SPLITWAY_NMCLI /
+# SPLITWAY_RESOLVECTL overrides (see `serviceConfig` below), so detection and
+# apply never depend on the ambient PATH. The host is still expected to *enable*
+# NetworkManager + resolved (`networking.networkmanager.enable` /
+# `services.resolved.enable`) — those run the actual services the daemon talks
+# to — but is no longer relied on for PATH.
 #
 # Config model — imperative, not declarative. The daemon owns a *writable*
 # config at /var/lib/splitway/config.json (provisioned by systemd's
@@ -176,9 +181,9 @@ in
       # never overwrites an existing new-path config.
       #
       # Use an absolute `cp` (`[`/`echo` are bash builtins) rather than adding
-      # coreutils to the service `path`: the daemon resolves its runtime tools
-      # (`nmcli` / `resolvectl`) by bare name from the host's PATH, so the service
-      # PATH must be left untouched.
+      # coreutils to the service `path`: that path carries only the daemon's
+      # actual runtime tools (NetworkManager + systemd, for `nmcli`/`resolvectl`
+      # — see `path` below); a one-shot migration helper does not belong on it.
       preStart = ''
         old=/root/.config/splitway/config.json
         new=/var/lib/splitway/config.json
@@ -188,7 +193,31 @@ in
         fi
       '';
 
+      # A systemd unit gets systemd's minimal default unit PATH, not the host
+      # PATH, so the daemon's bare-name `nmcli` / `resolvectl` spawns would fail
+      # with ENOENT even when NetworkManager/resolved are enabled on the host.
+      # Put the tools on the service PATH explicitly: `networkmanager` provides
+      # `nmcli`, `systemd` provides `resolvectl` — listed deliberately rather
+      # than relying on `resolvectl` happening to be on the default unit PATH
+      # (it only is because resolved ships in the `systemd` package). The
+      # absolute SPLITWAY_* overrides below make resolution independent of PATH
+      # entirely; this `path` is the belt to their braces (and covers any future
+      # bare-name spawn the daemon adds).
+      path = [
+        pkgs.networkmanager
+        pkgs.systemd
+      ];
+
       serviceConfig = {
+        # Inject the tools' absolute store paths, which the daemon resolves
+        # *before* falling back to a bare-name PATH lookup (see the `exec`
+        # module). This removes any dependence on the unit PATH for the two
+        # commands the daemon's core function needs. These keys are
+        # packaging-internal, not a user-facing config surface.
+        Environment = [
+          "SPLITWAY_NMCLI=${pkgs.networkmanager}/bin/nmcli"
+          "SPLITWAY_RESOLVECTL=${pkgs.systemd}/bin/resolvectl"
+        ];
         # The writable config lives in the StateDirectory (below). On first run
         # the daemon creates an empty config there if absent. `--socket-group` is
         # appended only when unprivilegedGui is enabled (else the socket is 0600).
