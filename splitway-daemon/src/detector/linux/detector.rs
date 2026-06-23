@@ -17,14 +17,22 @@ use crate::detector::linux::LinuxDetector;
 /// thread (`spawn_blocking`), so it may block briefly: it reads, and on an
 /// empty result waits `SETTLE_DELAY` then re-reads, up to `SETTLE_ATTEMPTS`
 /// times. A non-empty result returns immediately. Total sleeping is bounded to
-/// `(SETTLE_ATTEMPTS - 1) * SETTLE_DELAY` (here ~0.6 s, comfortably under the
-/// reference's 1 s) so detect never blocks indefinitely when DNS never appears.
-const SETTLE_ATTEMPTS: u32 = 3;
+/// `(SETTLE_ATTEMPTS - 1) * SETTLE_DELAY` — here ~0.9 s, with the last read at
+/// ~900 ms. That deliberately *tracks* the reference's empirical ~1 s rather
+/// than undercutting it: the budget must be at least as long as the race is
+/// known to take, because a missed window degrades to `Ok(empty)` whose only
+/// recovery is a re-emitted ACTIVATED (see `dbus::handle_state`). The bound
+/// still caps blocking so detect never waits indefinitely when DNS genuinely
+/// never appears.
+const SETTLE_ATTEMPTS: u32 = 4;
 const SETTLE_DELAY_MS: u64 = 300;
 const SETTLE_DELAY: Duration = Duration::from_millis(SETTLE_DELAY_MS);
 
-// Guard the "bounded, total <= ~1 s" budget at compile time. The settle test
-// uses a no-op sleep counter, so it asserts the iteration bound but not the
+// Guard the "bounded, total <= ~1 s" budget at compile time — an *upper* bound
+// only (it keeps detect from blocking too long). The lower bound, "wait at
+// least as long as the reference's ~1 s race," is a deliberate choice of
+// SETTLE_ATTEMPTS / SETTLE_DELAY above, not enforced here. The settle test uses
+// a no-op sleep counter, so it asserts the iteration bound but not the
 // wall-clock one; bumping either constant past the 1 s budget is then a build
 // error rather than a silent regression no test would catch.
 const _: () = assert!(
@@ -54,11 +62,21 @@ trait NmcliSource {
 /// Live `nmcli`-backed [`NmcliSource`].
 struct RealNmcli;
 
+/// An `nmcli` invocation with a forced C locale. We parse nmcli's output, and NM
+/// localizes some field *values* under the host locale — notably the connection
+/// `STATE` token `parse_active_vpn_uuids` matches on (`activated`). Without this
+/// a non-English host fails to find the active VPN UUID, so openconnect/GP DNS
+/// degrades to empty and the pushed DNS is never applied. The nmcli manual
+/// recommends `LC_ALL=C` for exactly this machine-parsing case.
+fn nmcli() -> Command {
+    let mut cmd = Command::new("nmcli");
+    cmd.env("LC_ALL", "C");
+    cmd
+}
+
 impl NmcliSource for RealNmcli {
     fn device_show(&self, iface: &str) -> Result<String, PlatformError> {
-        let output = Command::new("nmcli")
-            .args(["device", "show", iface])
-            .output()?;
+        let output = nmcli().args(["device", "show", iface]).output()?;
         if !output.status.success() {
             return Err(PlatformError::VpnNotFound(iface.to_string()));
         }
@@ -66,7 +84,7 @@ impl NmcliSource for RealNmcli {
     }
 
     fn active_connections(&self) -> Result<String, PlatformError> {
-        let output = Command::new("nmcli")
+        let output = nmcli()
             .args([
                 "-t",
                 "-f",
@@ -85,9 +103,7 @@ impl NmcliSource for RealNmcli {
     }
 
     fn connection_show(&self, uuid: &str) -> Result<String, PlatformError> {
-        let output = Command::new("nmcli")
-            .args(["connection", "show", uuid])
-            .output()?;
+        let output = nmcli().args(["connection", "show", uuid]).output()?;
         if !output.status.success() {
             return Err(PlatformError::CommandFailed(format!(
                 "nmcli connection show {uuid} failed"

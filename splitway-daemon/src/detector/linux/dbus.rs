@@ -178,6 +178,15 @@ async fn device_interface_name(
 }
 
 /// Map an NM device state to a deduplicated `VpnEvent` and send it.
+///
+/// For an `Up` transition this awaits `detect()` inline — including its settle
+/// window (up to ~0.9 s; see `detector::SETTLE_ATTEMPTS`). Because `watch_loop`
+/// `.await`s this call inside its `select!`, that branch is the only one being
+/// serviced while the window runs: a `DeviceRemoved`/`DeviceAdded` or a dropped
+/// subscriber arriving mid-settle is deferred until detect returns. That is
+/// acceptable — a teardown during the brief settle simply lands a beat late —
+/// but the blocking duration is no longer the few milliseconds it once was,
+/// hence this note.
 async fn handle_state(
     new_state: u32,
     interface: &str,
@@ -195,24 +204,36 @@ async fn handle_state(
     match t {
         Transition::Up => {
             let iface = interface.to_string();
-            // detect() runs nmcli synchronously (and may briefly block to let
-            // pushed DNS settle); keep it off the async thread.
+            // detect() runs nmcli synchronously and may block for the settle
+            // window (up to ~0.9 s) to let pushed DNS appear; keep it off the
+            // async thread.
             let detected = tokio::task::spawn_blocking(move || LinuxDetector.detect(&iface))
                 .await
                 .map_err(|e| PlatformError::CommandFailed(format!("detect task panicked: {e}")))?;
             match detected {
                 // Up-ness is NOT gated on finding pushed DNS: detect() returns
-                // Ok with possibly-empty dns_servers (e.g. a VPN that pushed no
-                // DNS), and we emit Up either way. An Up with empty DNS is a
-                // safe no-op downstream — StateMachine::desired() returns None
-                // for it, so nothing is applied or reverted.
+                // Ok with possibly-empty dns_servers (a VPN that pushed no DNS,
+                // or the settle window lost the race). We emit Up either way —
+                // an Up with empty DNS is a safe no-op downstream, since
+                // StateMachine::desired() returns None for it.
+                //
+                // Dedup is recorded only when DNS was actually found. Leaving an
+                // empty-DNS Up *un*-recorded is deliberate: the daemon reacts
+                // solely to Device.StateChanged, and NM does not re-emit state
+                // 100 once activated — so recording here would foreclose the one
+                // recovery path for a lost settle race. Un-recorded, a later
+                // re-emitted ACTIVATED (if one ever arrives) re-runs detect() and
+                // can pick up DNS that settled after our window. Any redundant
+                // Up(empty) events this produces are harmless no-ops.
                 Ok(info) => {
-                    dedup.record(t);
+                    if !info.dns_servers.is_empty() {
+                        dedup.record(t);
+                    }
                     send_event(tx, VpnEvent::Up(info)).await;
                 }
-                // detect() now errors only on a genuine nmcli failure / absent
-                // device, never on empty DNS. Not recorded in dedup: a later
-                // re-emitted ACTIVATED state gets another chance to detect.
+                // detect() errors only on a genuine nmcli failure / absent
+                // device, never on empty DNS. Also not recorded in dedup, for
+                // the same reason: a re-emitted ACTIVATED gets another chance.
                 Err(e) => log::warn!("{interface} reported up but detect failed: {e}"),
             }
         }
