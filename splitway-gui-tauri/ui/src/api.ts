@@ -53,3 +53,28 @@ export function reload(): Promise<void> {
 export function checkDomain(domain: string): Promise<CheckOutcome> {
   return tauri.core.invoke<CheckOutcome>("check_domain", { domain });
 }
+
+// --- macOS self-install commands --------------------------------------------
+//
+// install/disable escalate via osascript (one native password prompt) to run the
+// bundled bootstrap as root; they resolve on success and reject with the error
+// string on failure (incl. a cancelled password dialog), so callers drive their
+// per-action lifecycle exactly like the mutation commands. Neither carries VM
+// truth — the real health arrives via the next view-model-changed.
+
+/** The host platform, so the UI can branch macOS-vs-Linux remediation copy. */
+export type HostPlatform = "macos" | "linux" | "other";
+
+export function hostPlatform(): Promise<HostPlatform> {
+  return tauri.core.invoke<HostPlatform>("host_platform");
+}
+
+/** Install & start the root Splitway LaunchDaemon (macOS; one password prompt). */
+export function installService(): Promise<void> {
+  return tauri.core.invoke<void>("install_service");
+}
+
+/** Stop the daemon and remove its LaunchDaemon plist (macOS). */
+export function disableService(): Promise<void> {
+  return tauri.core.invoke<void>("disable_service");
+}

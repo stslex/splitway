@@ -345,6 +345,29 @@ equivalently, add the group via your own `users.users.<name>.extraGroups`. See
 the security note under [Using it under niri](#using-it-under-niri-wayland), then
 that section for binding it to a key.
 
+#### macOS (`Splitway.app`)
+
+On macOS the GUI ships as a self-installing app — **no Terminal, no Homebrew, no
+code signing**. Build it locally (it is ad-hoc/unsigned, `.app` only):
+
+```sh
+bash splitway-gui-tauri/scripts/build-macos-app.sh
+cp -R target/release/bundle/macos/Splitway.app /Applications/
+```
+
+The wrapper pulls its off-PATH toolchain (`cargo-tauri`, `node`, `esbuild`, …)
+from nixpkgs via `nix shell`, so it just runs. A locally-built `.app` carries no
+quarantine flag, so it launches from `/Applications` with no Gatekeeper prompt.
+
+Open it and click **Install & start the Splitway service**: one native password
+prompt installs the `splitway-daemon`/`splitway` helpers to `/usr/local/bin`,
+creates the `splitway` group and adds you to it, and bootstraps the root
+LaunchDaemon with a group-reachable socket — the app then shows **Connected** (no
+re-login needed if you launch it after the install; an app left open across the
+install reconnects after a relaunch). A discreet **Stop the Splitway service**
+footer link reverses it (the daemon reverts `/etc/resolver` and won't relaunch at
+boot). See [docs/design/macos-self-install.md](docs/design/macos-self-install.md).
+
 ### Using it under niri (Wayland)
 
 niri is a tiling Wayland compositor with **no system tray**, so Splitway is a

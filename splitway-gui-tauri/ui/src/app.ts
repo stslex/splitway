@@ -52,6 +52,7 @@ import {
 import { configInputForInterface } from "./config-input";
 import { canUndoReadd } from "./domain-undo";
 import * as api from "./api";
+import type { HostPlatform } from "./api";
 import type { DomainCheckInfo, InterfaceInfo, StatusInfo, ViewModel } from "./bindings/view-model";
 
 /** How long the undo snackbar lingers before the delete is left committed. The
@@ -81,6 +82,10 @@ export interface Actions {
   setCheckInput(value: string): void;
   check(): void;
   resync(): void;
+  installService(): void;
+  armDisable(): void;
+  cancelDisable(): void;
+  disableService(): void;
 }
 
 // --- small builders ---------------------------------------------------------
@@ -612,8 +617,46 @@ function checkSection(lc: Lifecycle, actions: Actions): HTMLElement {
 
 // --- footer, message, toast, blockers --------------------------------------
 
-function footer(vm: ViewModel): HTMLElement {
-  return el("div", { class: "foot reveal d5", text: `config ${vm.config_path || "(unknown)"}` });
+function footer(vm: ViewModel, platform: HostPlatform, lc: Lifecycle, actions: Actions): HTMLElement {
+  const foot = el("div", { class: "foot reveal d5" });
+  foot.appendChild(el("span", { class: "config-path", text: `config ${vm.config_path || "(unknown)"}` }));
+  // A discreet "stop the service" control, macOS only (the app owns the
+  // privileged LaunchDaemon there): a rarely-used, mildly-destructive action, so
+  // it is a small link rather than a prominent button. Driven through the same
+  // daemon-first runMutation path; the poll thread surfaces NotRunning afterward.
+  //
+  // Confirmation is a TWO-CLICK arm, not window.confirm(): WKWebView suppresses
+  // native confirm dialogs (returns false), which would silently no-op the stop.
+  // First click arms ("Confirm" + "Cancel"); second click runs disable.
+  if (platform === "macos") {
+    const pending = isPending(lc, "disable");
+    if (pending) {
+      const stopping = el("button", { class: "foot-link", text: "Stopping…" }) as HTMLButtonElement;
+      stopping.type = "button";
+      stopping.disabled = true;
+      foot.appendChild(stopping);
+    } else if (lc.disableArmed) {
+      const confirm = el("button", { class: "foot-link danger", text: "Confirm stop" }) as HTMLButtonElement;
+      confirm.type = "button";
+      confirm.addEventListener("click", () => actions.disableService());
+      const cancel = el("button", { class: "foot-link", text: "Cancel" }) as HTMLButtonElement;
+      cancel.type = "button";
+      cancel.addEventListener("click", () => actions.cancelDisable());
+      foot.append(
+        el("span", { class: "confirm-q", text: "Stop the service?" }),
+        confirm,
+        cancel,
+      );
+    } else {
+      const stop = el("button", { class: "foot-link", text: "Stop the Splitway service" }) as HTMLButtonElement;
+      stop.type = "button";
+      stop.addEventListener("click", () => actions.armDisable());
+      foot.appendChild(stop);
+    }
+    const err = errorFor(lc, "disable");
+    if (err) foot.appendChild(actionError(err));
+  }
+  return foot;
 }
 
 function messageBanner(vm: ViewModel): HTMLElement | null {
@@ -691,7 +734,7 @@ function undoToast(lc: Lifecycle, actions: Actions): HTMLElement {
   return toast;
 }
 
-function blockerNode(blocker: BlockerView): HTMLElement {
+function blockerNode(blocker: BlockerView, lc: Lifecycle, actions: Actions): HTMLElement {
   const icon = el("div", { class: "ic" }, [blockerIcon(blocker.variant)]);
   const body = el("p");
   if (blocker.codeWord && blocker.body.includes("{}")) {
@@ -709,6 +752,23 @@ function blockerNode(blocker: BlockerView): HTMLElement {
     el("h2", { text: blocker.title }),
     body,
   ]);
+  // The in-app remediation button (macOS self-install) takes precedence over a
+  // copy-paste command: one click + the native password prompt. The poll thread
+  // re-polls after it resolves, so the screen moves on via the truth contract —
+  // this never edits lastVm.
+  if (blocker.action) {
+    const pending = isPending(lc, blocker.action.key);
+    const btn = el("button", {
+      class: "blk-action",
+      text: pending ? "Installing…" : blocker.action.label,
+    }) as HTMLButtonElement;
+    btn.type = "button";
+    btn.disabled = pending;
+    btn.addEventListener("click", () => actions.installService());
+    blk.appendChild(btn);
+    const err = errorFor(lc, blocker.action.key);
+    if (err) blk.appendChild(actionError(err));
+  }
   if (blocker.command) blk.appendChild(el("code", { class: "cmd", text: blocker.command }));
   return el("div", { class: "blocker" }, [blk]);
 }
@@ -719,10 +779,16 @@ function connectingNode(): HTMLElement {
   ]);
 }
 
-/** Pure builder: the whole UI from (vm, lifecycle, actions). `vm === null` only
- *  before the first event lands. */
-export function renderApp(vm: ViewModel | null, lc: Lifecycle, actions: Actions): Node[] {
-  const stage: Stage = vm ? stageFor(vm) : { kind: "connecting" };
+/** Pure builder: the whole UI from (vm, platform, lifecycle, actions). `vm ===
+ *  null` only before the first event lands. `platform` only affects the macOS
+ *  self-install affordances (blocker install button + footer stop link). */
+export function renderApp(
+  vm: ViewModel | null,
+  platform: HostPlatform,
+  lc: Lifecycle,
+  actions: Actions,
+): Node[] {
+  const stage: Stage = vm ? stageFor(vm, platform) : { kind: "connecting" };
   const children: Node[] = [topbar(stage)];
 
   if (stage.kind === "connecting") {
@@ -730,7 +796,7 @@ export function renderApp(vm: ViewModel | null, lc: Lifecycle, actions: Actions)
     return children;
   }
   if (stage.kind === "blocker") {
-    children.push(blockerNode(stage.blocker));
+    children.push(blockerNode(stage.blocker, lc, actions));
     return children;
   }
 
@@ -744,7 +810,7 @@ export function renderApp(vm: ViewModel | null, lc: Lifecycle, actions: Actions)
   );
   const message = messageBanner(live);
   if (message) children.push(message);
-  children.push(footer(live), undoToast(lc, actions));
+  children.push(footer(live, platform, lc, actions), undoToast(lc, actions));
   return children;
 }
 
@@ -759,6 +825,10 @@ function rootDataset(stage: Stage): { on: string; mode: string } {
 /** Boot the app into `root`: subscribe, fetch once, render, and wire controls. */
 export function start(root: HTMLElement): void {
   let lastVm: ViewModel | null = null; // the ONLY authoritative state; written only in applyVm
+  // The host platform, fetched once at boot (it cannot change). Defaults to a
+  // non-macOS value so the first paint never offers the macOS install button
+  // before we know; it is corrected before any blocker can render in practice.
+  let platform: HostPlatform = "other";
   const lc = newLifecycle();
   let undoTimer: ReturnType<typeof setTimeout> | null = null;
   let introStarted = false; // the staggered reveal plays once, on the first main paint
@@ -778,7 +848,7 @@ export function start(root: HTMLElement): void {
     const selStart = active instanceof HTMLInputElement ? active.selectionStart : null;
     const selEnd = active instanceof HTMLInputElement ? active.selectionEnd : null;
 
-    const stage: Stage = lastVm ? stageFor(lastVm) : { kind: "connecting" };
+    const stage: Stage = lastVm ? stageFor(lastVm, platform) : { kind: "connecting" };
     const ds = rootDataset(stage);
     root.dataset.on = ds.on;
     root.dataset.mode = ds.mode;
@@ -791,7 +861,7 @@ export function start(root: HTMLElement): void {
       root.classList.add("intro");
       setTimeout(() => root.classList.remove("intro"), 900);
     }
-    root.replaceChildren(...renderApp(lastVm, lc, actions));
+    root.replaceChildren(...renderApp(lastVm, platform, lc, actions));
 
     if (activeId) {
       const restored = document.getElementById(activeId);
@@ -807,6 +877,10 @@ export function start(root: HTMLElement): void {
   // The ONLY writer of lastVm.
   function applyVm(vm: ViewModel): void {
     lastVm = vm;
+    // Disarm the disable-confirm if the daemon is no longer reachably connected:
+    // the footer (and its armed prompt) only renders on the connected main stage,
+    // so a reconnect must not silently re-present a stale armed confirm.
+    if (vm.connection.health !== "Connected") lc.disableArmed = false;
     rerender();
   }
 
@@ -955,7 +1029,44 @@ export function start(root: HTMLElement): void {
     },
 
     resync: () => void runMutation("reload", () => api.reload()),
+
+    // macOS self-install: escalate via the native password prompt to install /
+    // disable the root service. Both go through the daemon-first runMutation
+    // shape — they touch no VM; the poll thread re-polls and the new health
+    // (NotRunning → PermissionDenied/Connected, or back to NotRunning) surfaces
+    // via view-model-changed.
+    installService: () => void runMutation("install", () => api.installService()),
+    // Disable is mildly destructive, so it is a two-click arm (window.confirm is
+    // unreliable under WKWebView). armDisable shows the inline Confirm/Cancel.
+    armDisable: () => {
+      lc.disableArmed = true;
+      // Announce for screen readers: the button was replaced by a confirm prompt
+      // (mirrors the delete/undo flow's announce — the destructive step is where
+      // SR users most need the heads-up).
+      announce("Stop the Splitway service? Confirm or cancel.");
+      rerender();
+    },
+    cancelDisable: () => {
+      lc.disableArmed = false;
+      rerender();
+    },
+    disableService: () => {
+      lc.disableArmed = false;
+      void runMutation("disable", () => api.disableService());
+    },
   };
+
+  // The platform cannot change; fetch it once so blocker copy/affordances branch
+  // correctly. A failure leaves the safe non-macOS default (no install button).
+  api
+    .hostPlatform()
+    .then((p) => {
+      platform = p;
+      rerender();
+    })
+    .catch(() => {
+      /* keep the default platform */
+    });
 
   // Subscribe BEFORE the initial fetch so no push is missed in the mount gap;
   // each event carries the whole VM (last-wins), so an event during the fetch is

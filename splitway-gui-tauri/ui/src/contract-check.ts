@@ -26,7 +26,7 @@ export const _fixtureHasAllViewModelKeys: HasAllKeys<ViewModel> = sample;
 // 2. renderApp must accept a ViewModel (signature compatibility with the mirror).
 //    Never executed — purely a type assertion.
 export function _renderTypechecks(vm: ViewModel, actions: Actions): Node[] {
-  return renderApp(vm, newLifecycle(), actions);
+  return renderApp(vm, "macos", newLifecycle(), actions);
 }
 
 // 3. CheckOutcome must stay an exhaustively-handled discriminated union — locks

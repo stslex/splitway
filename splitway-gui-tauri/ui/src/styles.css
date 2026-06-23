@@ -819,6 +819,56 @@ select.sel:disabled {
   letter-spacing: 0.03em;
   border-top: 1px solid var(--border-soft);
   margin-top: 18px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 14px;
+}
+.foot .config-path {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* A discreet "stop the service" control (macOS): a quiet text link, not a
+   prominent button — it is rarely used and mildly destructive. */
+.foot-link {
+  appearance: none;
+  border: none;
+  background: none;
+  cursor: pointer;
+  padding: 0;
+  font-family: var(--sans);
+  font-size: 11px;
+  letter-spacing: normal;
+  color: var(--text-dim);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  transition: color 0.15s;
+}
+.foot-link:hover:not(:disabled) {
+  color: var(--rose);
+}
+.foot-link:disabled {
+  cursor: default;
+  color: var(--text-faint);
+  text-decoration: none;
+}
+/* The armed "Confirm stop" link reads as the destructive option. */
+.foot-link.danger {
+  color: var(--rose);
+  font-weight: 600;
+}
+/* The inline "Stop the service?" prompt beside the Confirm/Cancel links. */
+.foot .confirm-q {
+  font-family: var(--sans);
+  font-size: 11px;
+  letter-spacing: normal;
+  color: var(--text-dim);
+}
+.foot .action-error {
+  flex-basis: 100%;
+  font-family: var(--sans);
+  letter-spacing: normal;
 }
 
 /* A transient daemon message (info/error), shown above the footer. */
@@ -987,6 +1037,33 @@ select.sel:disabled {
   padding: 10px 12px;
   border-radius: 9px;
 }
+/* The in-app remediation button (macOS self-install): a prominent primary
+   action inside the blocker, sized larger than the inline .btn since it is the
+   one thing the user should click here. */
+.blk-action {
+  appearance: none;
+  border: none;
+  cursor: pointer;
+  background: var(--accent);
+  color: #0d0f2b;
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 13.5px;
+  height: 42px;
+  padding: 0 22px;
+  margin-top: 4px;
+  border-radius: 11px;
+  transition: filter 0.15s, background 0.15s;
+}
+.blk-action:hover:not(:disabled) {
+  filter: brightness(1.05);
+}
+.blk-action:disabled {
+  cursor: default;
+  background: var(--surface-2);
+  color: var(--text-dim);
+  filter: none;
+}
 
 /* --- utilities ------------------------------------------------------------ */
 
@@ -1013,6 +1090,8 @@ select.sel:disabled {
 
 .btn:focus-visible,
 .add:focus-visible,
+.blk-action:focus-visible,
+.foot-link:focus-visible,
 select.sel:focus-visible,
 .field:focus-visible,
 .switch:focus-visible,

@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Splitway split-DNS daemon, as a macOS LaunchDaemon (runs as root) — the
+  GUI-installer variant.
+
+  This is the plist the Splitway.app self-installer drops into
+  /Library/LaunchDaemons (see scripts/bootstrap.sh). It differs from the sibling
+  com.splitway.daemon.plist in exactly one way: ProgramArguments passes
+  `--socket-group splitway`, so the control socket is `0660 root:splitway`
+  (runtime dir `0750 root:splitway`) instead of the default `0600 root`. That is
+  what lets the unprivileged desktop GUI — a member of the `splitway` group —
+  reach the root daemon without sudo (the macOS analog of the NixOS
+  `services.splitway.unprivilegedGui` option). The manual/sudo install path keeps
+  using com.splitway.daemon.plist, where the socket stays root-only.
+
+  Root is required: the daemon writes /etc/resolver/<domain> files and flushes
+  the DNS cache (dscacheutil / killall -HUP mDNSResponder). The privilege
+  boundary for the unprivileged GUI/CLI is the group-owned Unix control socket;
+  see packaging/README.md and docs/design/socket-group.md for the threat model.
+
+  Install: the GUI does this for you (one password prompt). To do it by hand, see
+  docs/design/macos-self-install.md.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.splitway.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/splitway-daemon</string>
+        <string>run</string>
+        <!-- Group-reachable socket so the unprivileged GUI can connect; the
+             daemon chgrps /var/run/splitway + the socket to this group on
+             start, and exits non-zero with an actionable message if the group
+             is missing (the installer creates it first). -->
+        <string>--socket-group</string>
+        <string>splitway</string>
+    </array>
+
+    <!-- Start at boot and restart on crash. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+        <!-- launchd does not set HOME; pin it to root's macOS home so the
+             daemon's config resolves to /var/root/.config/splitway rather than
+             the (nonexistent on macOS) /root fallback. -->
+        <key>HOME</key>
+        <string>/var/root</string>
+    </dict>
+
+    <!-- On `launchctl bootout`/stop, launchd sends SIGTERM, which the daemon
+         traps to revert active /etc/resolver rules before exiting — the system
+         is never left half-configured. -->
+    <key>StandardOutPath</key>
+    <string>/var/log/splitway.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/splitway.log</string>
+</dict>
+</plist>

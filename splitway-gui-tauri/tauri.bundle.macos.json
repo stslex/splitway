@@ -1,0 +1,26 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": ""
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "icon": [
+      "resources/icons/32x32.png",
+      "resources/icons/128x128.png",
+      "resources/icons/128x128@2x.png",
+      "resources/icons/icon.icns",
+      "resources/icons/icon.ico"
+    ],
+    "resources": {
+      "resources/splitway-daemon": "splitway-daemon",
+      "resources/splitway": "splitway",
+      "resources/com.splitway.daemon.plist": "com.splitway.daemon.plist",
+      "resources/bootstrap.sh": "bootstrap.sh"
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  }
+}

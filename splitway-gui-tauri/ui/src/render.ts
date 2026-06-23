@@ -11,6 +11,7 @@
 // hold no authoritative state.
 
 import type { DriftVerdict, Health, StatusInfo, VerifyView, ViewModel } from "./bindings/view-model";
+import type { HostPlatform } from "./api";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -91,8 +92,18 @@ export function blockerIcon(variant: BlockerVariant): SVGElement {
 
 export type BlockerVariant = "disconnected" | "no-permission" | "frozen" | "version" | "error";
 
+/** An in-app remediation button a blocker can offer (macOS self-install): the
+ *  one-click action that resolves the degraded state, instead of a copy-paste
+ *  terminal command. `key` selects which privileged command runs. Presentation
+ *  only — it is computed frontend-side from health + platform and is NOT part of
+ *  the serialized view-model, so it never touches the bindings contract. */
+export interface BlockerAction {
+  key: "install";
+  label: string;
+}
+
 /** A full-window blocker: a degraded state the user must resolve before the main
- *  UI is meaningful. Carries its own copy + fix command. */
+ *  UI is meaningful. Carries its own copy + (a fix command and/or an action). */
 export interface BlockerView {
   variant: BlockerVariant;
   /** "neutral" (informational, e.g. daemon down) vs "warn" (needs attention). */
@@ -104,6 +115,8 @@ export interface BlockerView {
   codeWord?: string;
   /** A copy-paste fix command shown in a code block. */
   command?: string;
+  /** An in-app remediation button (macOS), shown instead of / beside `command`. */
+  action?: BlockerAction;
 }
 
 /** The main-screen mode, mapped from the daemon's routing belief. Drives the
@@ -139,30 +152,70 @@ function frozenBlocker(configPath: string): BlockerView {
   };
 }
 
-/** Map a non-connected (or frozen) condition to its full-window blocker, or null
- *  when the main UI should render. ConfigInvalid is a blocker even while the link
- *  is healthy (the daemon froze on the last-good config). */
-function blockerFor(vm: ViewModel): BlockerView | null {
-  const health: Health = vm.connection.health;
-  if (health === "NotRunning" || health === "TransientError") {
+/** The `NotRunning` blocker. On macOS the daemon isn't a thing the user starts by
+ *  hand — the app installs it — so offer the one-click Install action (escalates
+ *  via the native password prompt) instead of a `systemctl` line that doesn't
+ *  apply. On Linux/other, keep the copy-paste status command. */
+function notRunningBlocker(platform: HostPlatform): BlockerView {
+  if (platform === "macos") {
     return {
-      variant: health === "NotRunning" ? "disconnected" : "error",
+      variant: "disconnected",
       tone: "neutral",
-      title: "Can't reach Splitway",
-      body: "The background service isn't responding. Make sure it's running, then it'll reconnect on its own.",
-      command: "systemctl status splitway",
+      title: "Splitway isn't running yet",
+      body: "Install the background service to start routing. You'll be asked for your password once — no Terminal needed.",
+      action: { key: "install", label: "Install & start the Splitway service" },
     };
   }
-  if (health === "PermissionDenied") {
+  return {
+    variant: "disconnected",
+    tone: "neutral",
+    title: "Can't reach Splitway",
+    body: "The background service isn't responding. Make sure it's running, then it'll reconnect on its own.",
+    command: "systemctl status splitway",
+  };
+}
+
+/** The `PermissionDenied` blocker. On macOS the installer already added the user
+ *  to the `splitway` group, but macOS only applies new group access at login —
+ *  so the remaining step is a sign-out, NOT a `usermod` (which is the wrong OS and
+ *  already done). On Linux, keep the add-to-group command + re-login guidance. */
+function permissionDeniedBlocker(platform: HostPlatform): BlockerView {
+  if (platform === "macos") {
     return {
       variant: "no-permission",
       tone: "warn",
-      title: "No permission to make changes",
-      body: "Your user isn't in the {} group. Add it, then sign out and back in.",
+      title: "Almost done — sign out to finish",
+      body: "Splitway is installed and your account was added to the {} group. macOS only applies new group access at login, so sign out and back in (or restart) to start controlling routing.",
       codeWord: "splitway",
-      command: "sudo usermod -aG splitway $USER",
     };
   }
+  return {
+    variant: "no-permission",
+    tone: "warn",
+    title: "No permission to make changes",
+    body: "Your user isn't in the {} group. Add it, then sign out and back in.",
+    codeWord: "splitway",
+    command: "sudo usermod -aG splitway $USER",
+  };
+}
+
+/** Map a non-connected (or frozen) condition to its full-window blocker, or null
+ *  when the main UI should render. ConfigInvalid is a blocker even while the link
+ *  is healthy (the daemon froze on the last-good config). `platform` selects the
+ *  macOS self-install affordances over the Linux copy-paste commands. */
+function blockerFor(vm: ViewModel, platform: HostPlatform): BlockerView | null {
+  const health: Health = vm.connection.health;
+  if (health === "NotRunning") return notRunningBlocker(platform);
+  if (health === "TransientError") {
+    return {
+      variant: "error",
+      tone: "neutral",
+      title: "Can't reach Splitway",
+      body: "The background service isn't responding. Make sure it's running, then it'll reconnect on its own.",
+      command: platform === "macos" ? undefined : "systemctl status splitway",
+    };
+  }
+  if (health === "PermissionDenied") return permissionDeniedBlocker(platform);
   if (health === "VersionMismatch") {
     return {
       variant: "version",
@@ -178,10 +231,11 @@ function blockerFor(vm: ViewModel): BlockerView | null {
   return null;
 }
 
-/** Reduce the VM to the stage the window renders. */
-export function stageFor(vm: ViewModel): Stage {
+/** Reduce the VM to the stage the window renders. `platform` only affects blocker
+ *  copy/affordances (the main stage is platform-agnostic). */
+export function stageFor(vm: ViewModel, platform: HostPlatform): Stage {
   if (vm.connection.health === "Unknown") return { kind: "connecting" };
-  const blocker = blockerFor(vm);
+  const blocker = blockerFor(vm, platform);
   if (blocker) return { kind: "blocker", blocker };
   // Connected with a trustworthy status (dropped to null only on a non-status
   // reply, which `blockerFor` already routed to a blocker via health).

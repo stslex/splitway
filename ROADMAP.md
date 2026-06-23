@@ -224,6 +224,21 @@ reimplemented per frontend:
   `packages.<system>.splitway-gui`, bundling the IBM Plex OFL `woff2`, and the
   README GUI-install section. Split from 7d because its real proof — the *built*
   binary rendering for a fresh in-group niri user — is machine-bound.
+- **7d-3 — macOS self-install**: the macOS counterpart of 7d-2's Linux bundling.
+  An ad-hoc/unsigned `Splitway.app` (`.app` only — no signing, notarization,
+  `.dmg`/`.pkg`, or `SMAppService`) that bundles the `splitway-daemon` + `splitway`
+  helpers, a GUI LaunchDaemon plist (carrying `--socket-group splitway`), and a
+  `bootstrap.sh`. Two health-keyed Tauri commands escalate via `osascript … with
+  administrator privileges` (one native password prompt) to install/start
+  (`NotRunning` → Install button) and disable (footer link) the root daemon — no
+  terminal. The bundle path is additive (the Tauri bundler is invoked only by the
+  build wrapper; `cargo build` / `nix build` never read `bundle`), and the commands
+  keep the truth contract (do the work → refresh-now → never touch the VM). Split
+  from 7d-2 because its real proof — the built `.app` driving the live install on
+  macOS — is machine-bound. See
+  [`docs/design/macos-self-install.md`](design/macos-self-install.md). (Homebrew —
+  installing the same `.app` + binaries, with no competing `service` block — is the
+  next phase.)
 
 ### Phase 8 — feature freeze + hardening
 
