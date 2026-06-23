@@ -45,6 +45,7 @@
   "verify": {
     "drift": "InSync",
     "live": {
+      "default_route": false,
       "routing_domains": [
         "corp.example.com"
       ],

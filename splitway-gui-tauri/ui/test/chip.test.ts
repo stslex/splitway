@@ -16,7 +16,11 @@ function test(name: string, fn: () => void): void {
   console.log(`  ok  ${name}`);
 }
 
-const LIVE: LinkDnsState = { servers: ["192.0.2.53"], routing_domains: ["corp.example.com"] };
+const LIVE: LinkDnsState = {
+  servers: ["192.0.2.53"],
+  routing_domains: ["corp.example.com"],
+  default_route: false,
+};
 const available = (drift: DriftVerdict): VerifyView => ({ state: "Available", live: LIVE, drift });
 
 test("in-sync chip (✓) ONLY on Available + InSync", () => {
@@ -40,7 +44,9 @@ test("Unavailable verify → routing active, NOT an in-sync claim", () => {
 test("drifted verify → amber, not checked", () => {
   const chip = chipFor(
     "healthy",
-    available({ Drifted: { missing_servers: [], unrouted_domains: ["corp.example.com"] } }),
+    available({
+      Drifted: { missing_servers: [], unrouted_domains: ["corp.example.com"], default_route_leak: false },
+    }),
   );
   assert.equal(chip?.tone, "warn");
   assert.equal(chip?.check, false);
