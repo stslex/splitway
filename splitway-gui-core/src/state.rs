@@ -1095,6 +1095,7 @@ mod tests {
             live: LinkDnsState {
                 servers: servers.iter().map(|s| s.to_string()).collect(),
                 routing_domains: domains.iter().map(|d| d.to_string()).collect(),
+                default_route: None,
             },
             drift: DriftVerdict::NotApplicable,
         }))
@@ -1188,6 +1189,7 @@ mod tests {
                     DriftVerdict::Drifted {
                         missing_servers,
                         unrouted_domains,
+                        default_route_leak: _,
                     },
                 ..
             } => {

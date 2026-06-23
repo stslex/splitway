@@ -30,14 +30,18 @@ use crate::domain;
 /// [`StatusInfo::detected_dns`] field — the DNS server(s) the configured VPN
 /// interface is currently *detected* to expose, surfaced independently of whether
 /// routing is applied so a client can show the interface's resolver read-only
-/// (the interface-centric, DNS-auto model the Tauri GUI renders). The daemon
+/// (the interface-centric, DNS-auto model the Tauri GUI renders). Bumped to `8`
+/// for the additive [`LinkDnsState::default_route`] field (the per-link
+/// DNS-default-route / catch-all flag, read back so a full-tunnel link that
+/// resolves *every* name — leaking past a narrow split — is detected) and the
+/// matching additive `default_route_leak` field on [`DriftVerdict::Drifted`]. The daemon
 /// enforces *strict equality* (see
 /// `daemon::ipc::process_line`): a daemon rejects a client whose version differs,
 /// and vice versa, so there is no silent mixed-version operation. The daemon, CLI
 /// and GUI all build from this one workspace, so they upgrade in lockstep; a
 /// mismatch only happens across separately-updated installs and is surfaced as
 /// actionable "update splitway" guidance, never a raw decode error.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Stable prefix the daemon uses to introduce a protocol-version-mismatch
 /// error reply. Shared so a client (CLI/GUI) can recognize skew and render
@@ -278,6 +282,18 @@ pub struct LinkDnsState {
     /// The routing/search domains the link currently routes, each with any
     /// leading `~` already stripped to the plain domain.
     pub routing_domains: Vec<String>,
+    /// Whether the link is systemd-resolved's DNS **default route** (catch-all):
+    /// `Some(true)` means it resolves *every* name that matches no other link's
+    /// routing domain — an implicit `~.` that defeats a narrow split (a full-tunnel
+    /// VPN gets this set automatically because it carries the default IP route);
+    /// `Some(false)` means it resolves only its `routing_domains`; `None` means the
+    /// flag is unknown or not applicable — the read-back did not learn it (an older
+    /// peer, or a transient failure) or the platform has no link-level catch-all
+    /// concept (macOS `/etc/resolver` files are per-domain). `None` must never be
+    /// treated as drift — see [`compare_drift`]. Parsed from `resolvectl`'s
+    /// `Default Route:` line.
+    #[serde(default)]
+    pub default_route: Option<bool>,
 }
 
 /// The result of a [`Request::Verify`] read-back: the live link state plus the
@@ -303,14 +319,24 @@ pub enum DriftVerdict {
     /// covered by a live routing domain — reality matches belief.
     InSync,
     /// The live state diverges from belief. Each field names exactly what is
-    /// missing so a client can render the specifics; either may be empty as long
-    /// as the other is non-empty (an empty/empty `Drifted` is never produced —
-    /// that case is [`DriftVerdict::InSync`]).
+    /// missing so a client can render the specifics. A `Drifted` is produced when
+    /// *any* of the three fields is non-empty/true; an all-clear (no missing
+    /// servers, no unrouted domains, no leak) is [`DriftVerdict::InSync`] instead.
     Drifted {
         /// Believed DNS servers not found in the live `servers`.
         missing_servers: Vec<String>,
         /// Believed domains not covered by any live routing domain.
         unrouted_domains: Vec<String>,
+        /// The live link is a **catch-all** while the believed split is narrow: it
+        /// resolves *every* unmatched name through the VPN resolver, not just the
+        /// configured domains, so a name the user never configured still leaks to
+        /// the VPN. This is drift even when `missing_servers` and `unrouted_domains`
+        /// are both empty (the narrow domains are technically present, but the link
+        /// routes far more than them). Set when the live link is a catch-all by
+        /// either signal — `default_route == Some(true)` or a live route-all (`~.`)
+        /// routing domain — and the belief is not itself route-all. See
+        /// [`compare_drift`].
+        default_route_leak: bool,
     },
 }
 
@@ -323,12 +349,23 @@ pub enum DriftVerdict {
 ///     `servers`. Servers compare by canonical IP equality when both parse as IPs
 ///     (so `2001:DB8::1` equals `2001:db8::1` and a zero-compressed form equals
 ///     its expansion), falling back to a case-folded string match otherwise.
-///   - every believed `domains` entry must be **covered** by some live
+///   - every believed `domains` entry must be **covered**: a catch-all live link
+///     (see below) covers any believed domain (it routes everything — including a
+///     believed route-all `~.`), otherwise the domain must be covered by some live
 ///     `routing_domain`, suffix-aware via [`domain::domain_covers`] (so a live
 ///     `example.com` covers a believed `sub.example.com`, and case / a trailing
 ///     dot / a stripped `~` never matter).
-///   - all present and covered → [`DriftVerdict::InSync`]; otherwise
-///     [`DriftVerdict::Drifted`] naming the missing servers and unrouted domains.
+///   - the live link must **not** be a catch-all while the belief is a narrow
+///     split. A link is a catch-all if `default_route == Some(true)` OR it carries
+///     a live route-all routing domain (`~.`, parsed to `.`) — either makes it
+///     resolve every unmatched name through the VPN, leaking names the user never
+///     configured. That is drift even when the narrow domains are all present. A
+///     `None` `default_route` with no route-all domain (read-back did not learn the
+///     flag, or macOS) is never a leak, and a belief that is *itself* route-all (a
+///     deliberate full-tunnel split) is not a leak either.
+///   - all present, covered, and no leak → [`DriftVerdict::InSync`]; otherwise
+///     [`DriftVerdict::Drifted`] naming the missing servers, unrouted domains, and
+///     whether the link leaks as a catch-all.
 pub fn compare_drift(live: &LinkDnsState, applied: Option<&AppliedInfo>) -> DriftVerdict {
     let Some(applied) = applied else {
         return DriftVerdict::NotApplicable;
@@ -346,10 +383,23 @@ pub fn compare_drift(live: &LinkDnsState, applied: Option<&AppliedInfo>) -> Drif
         .cloned()
         .collect();
 
-    // A believed domain is routed live if any live routing domain covers it
-    // (suffix-aware): the live link may route a broader parent (`example.com`)
-    // that still covers the believed `sub.example.com`, or route *everything* via
-    // the systemd route-all marker (`~.`, parsed to the root `.`).
+    // The live link is a catch-all — it resolves *every* name — by EITHER signal:
+    // systemd-resolved flags it the DNS default route (`default_route == Some(true)`),
+    // OR a VPN manager installed the catch-all as a live route-all routing domain
+    // (`~.`, parsed to `.`). The two are equivalent ways to make a link answer every
+    // unmatched name, and a manager may express it as only one of them (e.g. the
+    // flag with no `~.` domain, or vice versa), so both must count everywhere a
+    // catch-all matters below — coverage AND the leak.
+    let live_is_catch_all = live.default_route == Some(true)
+        || live
+            .routing_domains
+            .iter()
+            .any(|domain| is_route_all(domain));
+
+    // A believed domain is routed live if the link covers it. A catch-all link
+    // covers *any* believed domain (it routes everything); otherwise the believed
+    // domain must be covered (suffix-aware) by some specific live routing domain —
+    // a live parent (`example.com`) covers a believed `sub.example.com`.
     let unrouted_domains: Vec<String> = applied
         .domains
         .iter()
@@ -361,20 +411,37 @@ pub fn compare_drift(live: &LinkDnsState, applied: Option<&AppliedInfo>) -> Drif
             // parser's normalization.
             let believed = believed.as_str();
             let believed = believed.strip_prefix('~').unwrap_or(believed);
-            !live
-                .routing_domains
-                .iter()
-                .any(|live| is_route_all(live) || domain::domain_covers(live, believed))
+            !(live_is_catch_all
+                || live
+                    .routing_domains
+                    .iter()
+                    .any(|live| domain::domain_covers(live, believed)))
         })
         .cloned()
         .collect();
 
-    if missing_servers.is_empty() && unrouted_domains.is_empty() {
+    // A catch-all link against a narrow belief is a leak in its own right: it
+    // resolves names the user never configured (a sibling of a configured domain,
+    // or anything else) through the VPN, defeating the split even when the
+    // configured domains are technically present. A `None` flag with no route-all
+    // domain (read-back did not learn it, or a platform with no link-level
+    // catch-all) is not a catch-all and never fabricates drift. A belief that is
+    // *itself* route-all (a deliberate full-tunnel `~.`) wants the catch-all — both
+    // its coverage (above) and its leak gate below resolve in favor of InSync.
+    let believes_route_all = applied.domains.iter().any(|believed| {
+        let believed = believed.trim();
+        let believed = believed.strip_prefix('~').unwrap_or(believed);
+        is_route_all(believed)
+    });
+    let default_route_leak = live_is_catch_all && !believes_route_all;
+
+    if missing_servers.is_empty() && unrouted_domains.is_empty() && !default_route_leak {
         DriftVerdict::InSync
     } else {
         DriftVerdict::Drifted {
             missing_servers,
             unrouted_domains,
+            default_route_leak,
         }
     }
 }
@@ -783,23 +850,29 @@ mod tests {
                 vpn_up: false,
                 routing_state: RoutingState::NoDomains,
             }),
-            // Verify, in-sync: a populated live state with a matching belief.
+            // Verify, in-sync: a populated live state with a matching belief
+            // (default-route disabled — the correct post-apply state).
             Response::Verify(VerifyInfo {
                 live: LinkDnsState {
                     servers: vec!["10.0.0.1".to_string()],
                     routing_domains: vec!["example.com".to_string()],
+                    default_route: Some(false),
                 },
                 drift: DriftVerdict::InSync,
             }),
-            // Verify, drifted: the other shape, naming what diverged.
+            // Verify, drifted: the other shape, naming what diverged — here a
+            // catch-all leak (the link is the default route) on top of a missing
+            // server and an unrouted domain.
             Response::Verify(VerifyInfo {
                 live: LinkDnsState {
                     servers: vec!["198.51.100.1".to_string()],
                     routing_domains: vec![],
+                    default_route: Some(true),
                 },
                 drift: DriftVerdict::Drifted {
                     missing_servers: vec!["10.0.0.1".to_string()],
                     unrouted_domains: vec!["corp.example.com".to_string()],
+                    default_route_leak: true,
                 },
             }),
             // Verify, not-applicable: an empty live state and nothing believed.
@@ -859,6 +932,11 @@ mod tests {
         LinkDnsState {
             servers: servers.iter().map(|s| s.to_string()).collect(),
             routing_domains: domains.iter().map(|s| s.to_string()).collect(),
+            // The default-route flag is orthogonal to the server/domain dimensions
+            // these helpers exercise; `None` ("read-back did not learn it") is the
+            // neutral value that never trips the catch-all-leak check. Leak tests
+            // set it explicitly via `LinkDnsState { default_route: .., ..live(..) }`.
+            default_route: None,
         }
     }
 
@@ -948,11 +1026,44 @@ mod tests {
     }
 
     #[test]
-    fn drift_route_all_live_domain_covers_every_believed_domain() {
-        // A full-tunnel link carrying `~.` (parsed to `.`) routes everything, so
-        // every believed domain is covered — in sync, not a false drift.
+    fn drift_live_route_all_domain_against_narrow_belief_is_a_leak() {
+        // A live route-all routing domain (`~.`, parsed to `.`) makes the link a
+        // catch-all just as `default_route == Some(true)` does — even when the flag
+        // is unknown. Against a narrow belief that is a leak: the believed domains
+        // are "covered" (so unrouted is empty), but the link routes everything.
         let applied = believed(&["10.0.0.1"], &["example.com", "corp.example.com"]);
         let live = live(&["10.0.0.1"], &["."]);
+        assert_eq!(
+            compare_drift(&live, Some(&applied)),
+            DriftVerdict::Drifted {
+                missing_servers: vec![],
+                unrouted_domains: vec![],
+                default_route_leak: true,
+            }
+        );
+    }
+
+    #[test]
+    fn drift_live_route_all_with_route_all_belief_is_in_sync() {
+        // A belief that is itself route-all (a deliberate full-tunnel split) WANTS
+        // the live link to be the catch-all, so a live `~.` is in sync, not a leak.
+        let applied = believed(&["10.0.0.1"], &["~."]);
+        let live = live(&["10.0.0.1"], &["."]);
+        assert_eq!(compare_drift(&live, Some(&applied)), DriftVerdict::InSync);
+    }
+
+    #[test]
+    fn drift_route_all_belief_covered_by_default_route_flag_alone() {
+        // A hand-edited route-all belief (`~.`) verified against a link that is the
+        // catch-all via the FLAG only — `Default Route: yes` with no live `~.`
+        // routing domain. The link routes everything, so the believed route-all is
+        // covered: InSync, not a false `unrouted: ["."]` drift. (The coverage check
+        // must consult the default-route flag, not only `routing_domains`.)
+        let applied = believed(&["10.0.0.1"], &["~."]);
+        let live = LinkDnsState {
+            default_route: Some(true),
+            ..live(&["10.0.0.1"], &[])
+        };
         assert_eq!(compare_drift(&live, Some(&applied)), DriftVerdict::InSync);
     }
 
@@ -968,6 +1079,7 @@ mod tests {
             DriftVerdict::Drifted {
                 missing_servers: vec![],
                 unrouted_domains: vec!["example.com".to_string()],
+                default_route_leak: false,
             }
         );
     }
@@ -985,6 +1097,7 @@ mod tests {
             DriftVerdict::Drifted {
                 missing_servers: vec!["10.0.0.2".to_string()],
                 unrouted_domains: vec!["b.example.com".to_string()],
+                default_route_leak: false,
             }
         );
     }
@@ -999,6 +1112,7 @@ mod tests {
             DriftVerdict::Drifted {
                 missing_servers: vec!["10.0.0.1".to_string()],
                 unrouted_domains: vec!["example.com".to_string()],
+                default_route_leak: false,
             }
         );
     }
@@ -1011,6 +1125,89 @@ mod tests {
         assert_eq!(
             compare_drift(&LinkDnsState::default(), Some(&applied)),
             DriftVerdict::InSync
+        );
+    }
+
+    #[test]
+    fn drift_catch_all_default_route_is_a_leak_even_when_domains_present() {
+        // The regression this fix targets: the narrow split is technically present
+        // (the believed server and domain are both live), but the link is the DNS
+        // default route, so it resolves EVERY unmatched name through the VPN — a
+        // sibling like `bitbucket.example.com` leaks even though only
+        // `jira.example.com` was configured. That is drift, not InSync, with the
+        // leak flagged and the per-field lists empty.
+        let applied = believed(&["10.0.0.1"], &["jira.example.com"]);
+        let live = LinkDnsState {
+            default_route: Some(true),
+            ..live(&["10.0.0.1"], &["jira.example.com"])
+        };
+        assert_eq!(
+            compare_drift(&live, Some(&applied)),
+            DriftVerdict::Drifted {
+                missing_servers: vec![],
+                unrouted_domains: vec![],
+                default_route_leak: true,
+            }
+        );
+    }
+
+    #[test]
+    fn drift_default_route_disabled_is_in_sync() {
+        // The correct post-apply state: the link resolves only its routing domain,
+        // not everything — no leak, so InSync.
+        let applied = believed(&["10.0.0.1"], &["jira.example.com"]);
+        let live = LinkDnsState {
+            default_route: Some(false),
+            ..live(&["10.0.0.1"], &["jira.example.com"])
+        };
+        assert_eq!(compare_drift(&live, Some(&applied)), DriftVerdict::InSync);
+    }
+
+    #[test]
+    fn drift_unknown_default_route_is_never_a_leak() {
+        // `None` means the read-back did not learn the flag (an older peer, a
+        // transient failure) or the platform has no link-level catch-all (macOS).
+        // Unknown must never fabricate drift, mirroring the read-back-degrades-to-
+        // empty ethos — so a matching belief stays InSync.
+        let applied = believed(&["10.0.0.1"], &["jira.example.com"]);
+        let live = LinkDnsState {
+            default_route: None,
+            ..live(&["10.0.0.1"], &["jira.example.com"])
+        };
+        assert_eq!(compare_drift(&live, Some(&applied)), DriftVerdict::InSync);
+    }
+
+    #[test]
+    fn drift_default_route_with_route_all_belief_is_not_a_leak() {
+        // A belief that is itself route-all (a deliberate full-tunnel split, e.g. a
+        // hand-edited `~.`) WANTS the link to be the catch-all, so default-route on
+        // it is correct, not a leak. Guards against a false positive for that case.
+        let applied = believed(&["10.0.0.1"], &["~."]);
+        let live = LinkDnsState {
+            default_route: Some(true),
+            ..live(&["10.0.0.1"], &["."])
+        };
+        assert_eq!(compare_drift(&live, Some(&applied)), DriftVerdict::InSync);
+    }
+
+    #[test]
+    fn drift_catch_all_leak_combines_with_a_missing_server() {
+        // `unrouted_domains` and `default_route_leak` are mutually exclusive: a
+        // catch-all link routes *everything*, so it covers every believed domain
+        // (none unrouted) precisely when the leak fires. The leak can still combine
+        // with a missing server, so both of those are reported together.
+        let applied = believed(&["10.0.0.1", "10.0.0.2"], &["jira.example.com"]);
+        let live = LinkDnsState {
+            default_route: Some(true),
+            ..live(&["10.0.0.1"], &["jira.example.com"])
+        };
+        assert_eq!(
+            compare_drift(&live, Some(&applied)),
+            DriftVerdict::Drifted {
+                missing_servers: vec!["10.0.0.2".to_string()],
+                unrouted_domains: vec![],
+                default_route_leak: true,
+            }
         );
     }
 

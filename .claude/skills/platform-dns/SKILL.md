@@ -11,10 +11,11 @@ Curated facts for Splitway's platform layer. When something here disagrees with 
 
 - `resolvectl dns <iface> <server...>` — set per-link DNS servers
 - `resolvectl domain <iface> <domain...>` — set per-link domains. A bare `example.com` is both a *search* domain and a *routing* domain; `~example.com` is routing-only (queries for `*.example.com` go to this link's DNS, but the domain is not appended to bare hostnames); `~.` routes *all* queries to this link
-- `resolvectl revert <iface>` — drop per-link overrides, back to whatever the link's manager (NM/DHCP) configured
-- `resolvectl status <iface>` — current per-link DNS state
+- `resolvectl revert <iface>` — drop per-link overrides, back to whatever the link's manager (NM/DHCP) configured. Also clears the per-link default-route override (below), so it is the only revert step needed
+- `resolvectl status <iface>` — current per-link DNS state. The `Default Route: yes/no` line and the `Protocols: ±DefaultRoute` token report the catch-all flag below
+- `resolvectl default-route <iface> <bool>` — get/set whether the link is the DNS **default route** (catch-all). **Critical for split-DNS on a full-tunnel VPN:** systemd-resolved sends every query that matches *no* link's routing domain to all links flagged as the default route, and it auto-sets this flag `yes` on the link carrying the default *IP* route (a full-tunnel VPN). So setting per-link DNS + routing domains is **not enough** — the link is still the catch-all and *all* DNS leaks to the VPN resolver. Splitway's apply runs `resolvectl default-route <iface> false` so the link resolves only its routing domains. See [`docs/design/linux-default-route-catch-all.md`](../../../docs/design/linux-default-route-catch-all.md)
 - Needs privileges (root or polkit) for mutating calls
-- **Known improvement, deferred (behavior change, not Phase 1):** Splitway currently passes config domains bare; routing-only `~domain` is the more correct split-DNS semantic — it avoids polluting the search list
+- **Implemented:** Splitway applies config domains routing-only (`~domain`) — routes `*.domain` without polluting the search list — and reads back the default-route flag into `LinkDnsState.default_route` so `compare_drift` flags a catch-all leak (a link that re-becomes the default route, e.g. after an NM reconnect re-asserts the flag)
 
 ## NetworkManager D-Bus (Linux VpnDetector)
 

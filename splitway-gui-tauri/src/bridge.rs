@@ -386,6 +386,7 @@ mod tests {
                 live: LinkDnsState {
                     servers: vec!["10.0.0.1".to_string()],
                     routing_domains: vec!["corp.example.com".to_string()],
+                    default_route: Some(false),
                 },
                 drift: DriftVerdict::InSync,
             })),

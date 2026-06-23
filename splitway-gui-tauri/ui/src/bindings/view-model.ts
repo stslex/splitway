@@ -81,13 +81,26 @@ export interface ConfigFields {
 export interface LinkDnsState {
   servers: string[];
   routing_domains: string[];
+  // The systemd-resolved DNS default-route (catch-all) flag: true = the link
+  // resolves every unmatched name (an implicit ~.), false = only its routing
+  // domains, null = unknown / not applicable (read-back did not learn it, or
+  // macOS, which has no link-level catch-all). Always present on the wire.
+  default_route: boolean | null;
 }
 
 // DriftVerdict: externally-tagged Rust enum.
 export type DriftVerdict =
   | "NotApplicable"
   | "InSync"
-  | { Drifted: { missing_servers: string[]; unrouted_domains: string[] } };
+  | {
+      Drifted: {
+        missing_servers: string[];
+        unrouted_domains: string[];
+        // The live link is the DNS default route (catch-all) while the believed
+        // split is narrow — it resolves every unmatched name through the VPN.
+        default_route_leak: boolean;
+      };
+    };
 
 // VerifyView: internally tagged on "state" (Tauri-side type).
 export type VerifyView =
