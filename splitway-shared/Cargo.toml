@@ -2,6 +2,8 @@
 name = "splitway-shared"
 version = "0.0.1"
 edition = "2021"
+license = "MIT"
+description = "Splitway shared types, config parsing, and platform traits"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

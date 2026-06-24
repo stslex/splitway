@@ -2,6 +2,8 @@
 name = "splitway-cli"
 version = "0.0.1"
 edition = "2021"
+license = "MIT"
+description = "Splitway CLI — IPC client over the daemon's control socket (installs as `splitway`)"
 
 # The user-facing command is `splitway` (matching the clap name and the docs),
 # even though the crate is `splitway-cli`.

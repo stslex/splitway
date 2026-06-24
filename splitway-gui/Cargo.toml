@@ -2,6 +2,8 @@
 name = "splitway-gui"
 version = "0.0.1"
 edition = "2021"
+license = "MIT"
+description = "Splitway interim egui GUI — a privilege-free IPC client over the daemon socket"
 
 [[bin]]
 name = "splitway-gui"
