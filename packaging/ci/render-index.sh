@@ -75,7 +75,26 @@ gpgkey=${BASE}/splitway.gpg
 EOF
 sudo dnf install splitway</pre>
 
-<!-- ARCH_SECTION -->
+<h2>Arch Linux (pacman, x86_64)</h2>
+<h3>Signed repository (recommended)</h3>
+<pre>curl -fsSL ${BASE}/splitway.gpg -o /tmp/splitway.gpg
+sudo pacman-key --add /tmp/splitway.gpg
+sudo pacman-key --lsign-key ${FPR}
+sudo tee -a /etc/pacman.conf <<'EOF'
+
+[splitway]
+SigLevel = Required DatabaseOptional
+Server = ${BASE}/arch/release/\$arch
+EOF
+sudo pacman -Sy splitway        # add splitway-gui for the desktop app</pre>
+<p>The hosted pacman repo is <strong>x86_64 only</strong>. On aarch64, build the
+in-repo PKGBUILD below or use <code>splitway-bin</code> (prebuilt from the
+release tarball).</p>
+<h3>Build from the in-repo PKGBUILD</h3>
+<pre>git clone https://github.com/stslex/splitway
+cd splitway/packaging/aur/splitway && makepkg -si</pre>
+<p>AUR packages (<code>splitway</code>, <code>splitway-bin</code>,
+<code>splitway-gui</code>) are pending AUR account registration reopening.</p>
 
 <h2>Other</h2>
 <p>NixOS: use the flake's <code>nixosModules.default</code> (see the
