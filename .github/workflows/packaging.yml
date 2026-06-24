@@ -142,8 +142,8 @@ jobs:
           # GUI Depends splitway (>= <built version>): for dev the floor must be
           # the ~dev version so the same-run dev core satisfies it (a clean
           # release core, sorting higher, satisfies it too). No-op for release.
-          sed -i "s|splitway (>= [^)]*)|splitway (>= ${PKGVER})|" splitway-gui/Cargo.toml
-          sed -i "s|splitway = \">= [^\"]*\"|splitway = \">= ${PKGVER}\"|" splitway-gui/Cargo.toml
+          sed -i "s|splitway (>= [^)]*)|splitway (>= ${PKGVER})|g" splitway-gui/Cargo.toml
+          sed -i "s|splitway = \">= [^\"]*\"|splitway = \">= ${PKGVER}\"|g" splitway-gui/Cargo.toml
           grep -n "splitway (>=\|splitway = \">=" splitway-gui/Cargo.toml
       - name: Package deb + rpm + tarball
         run: |
@@ -456,6 +456,8 @@ jobs:
   # gh-pages is persistent state, MERGED not wiped, so old versions + the other
   # channel survive.
   publish-pages:
+    # test-arm64-smoke is intentionally NOT a gate: it is best-effort
+    # (continue-on-error under QEMU) and must not block a publish.
     needs: [meta, build-core, build-gui, build-arch, test-install, test-signed-repo, test-arch]
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
