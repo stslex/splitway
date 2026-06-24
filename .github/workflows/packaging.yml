@@ -1,0 +1,332 @@
+name: Packaging (deb / rpm)
+
+# Builds the distro packages, runs install tests, and (on push) publishes the
+# signed apt/dnf repos to GitHub Pages. Split by trust:
+#   * meta / build-* / test-*  — run on PRs too, NO secrets (gate the PR).
+#   * publish-pages            — push/dispatch only, uses GPG secrets (see the
+#                                publish job; added in the signing commit).
+on:
+  push:
+    branches: [master, dev]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded PR runs; never auto-cancel push runs (a push may publish).
+# The publish job additionally serializes deploys via its own concurrency group.
+concurrency:
+  group: packaging-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      pkgver: ${{ steps.v.outputs.pkgver }}
+      channel: ${{ steps.v.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: v
+        shell: bash
+        run: |
+          bash packaging/ci/compute-version.sh "${{ github.event_name }}" "${{ github.ref }}" \
+            | tee -a "$GITHUB_OUTPUT"
+
+  # --- core `splitway` package: daemon + CLI, musl-static, amd64 + arm64 ------
+  build-core:
+    needs: meta
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+            rpmarch: x86_64
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+            rpmarch: aarch64
+    env:
+      PKGVER: ${{ needs.meta.outputs.pkgver }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross,cargo-deb,cargo-generate-rpm
+      - name: Build (musl, static) via cross
+        run: cross build --release --target ${{ matrix.target }} -p splitway-daemon -p splitway-cli
+      - name: Verify static linkage
+        run: |
+          for b in splitway-daemon splitway; do
+            f="target/${{ matrix.target }}/release/$b"
+            file "$f"
+            file "$f" | grep -q "statically linked" || { echo "ERROR: $b is not static"; exit 1; }
+          done
+      - name: Package deb + rpm + tarball
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # --target remaps target/release -> target/<triple>/release and sets
+          # the package arch; --deb-version / --set-metadata stamp the channel
+          # version (deb + rpm accept the ~dev suffix; Cargo.toml stays semver).
+          cargo deb --no-build --no-strip -p splitway-daemon \
+            --target ${{ matrix.target }} --deb-version "$PKGVER" \
+            -o "dist/splitway_${PKGVER}_${{ matrix.arch }}.deb"
+          cargo generate-rpm -p splitway-daemon \
+            --target ${{ matrix.target }} \
+            --set-metadata "version = \"$PKGVER\"" \
+            -o "dist/splitway-${PKGVER}.${{ matrix.rpmarch }}.rpm"
+          TARDIR="splitway-${PKGVER}-linux-${{ matrix.arch }}"
+          mkdir -p "stage/$TARDIR"
+          cp "target/${{ matrix.target }}/release/splitway-daemon" \
+             "target/${{ matrix.target }}/release/splitway" \
+             packaging/systemd/splitway.service LICENSE README.md "stage/$TARDIR/"
+          tar -C stage -czf "dist/${TARDIR}.tar.gz" "$TARDIR"
+          ls -la dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: pkg-core-${{ matrix.arch }}
+          path: dist/*
+
+  # --- desktop `splitway-gui` package: egui, glibc, built on the low baseline -
+  # Built inside a debian:bullseye container (glibc 2.31 floor) so the package's
+  # libc6 (>= 2.31) Depends / rpm GLIBC requires are actually true. amd64 runs
+  # the container on the x86_64 runner; arm64 on a native arm64 runner (no QEMU).
+  build-gui:
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            rpmarch: x86_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            rpmarch: aarch64
+    env:
+      PKGVER: ${{ needs.meta.outputs.pkgver }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+      - name: Build GUI at the glibc 2.31 floor (debian:bullseye)
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD":/w -w /w debian:bullseye bash -euc '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              curl ca-certificates build-essential pkg-config \
+              libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
+              libxkbcommon-dev libwayland-dev
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+            . "$HOME/.cargo/env"
+            cargo build --release -p splitway-gui
+          '
+          sudo chown -R "$(id -u):$(id -g)" target
+          file target/release/splitway-gui
+      - name: Stamp the core-package dependency floor for this channel
+        run: |
+          set -euo pipefail
+          # GUI Depends splitway (>= <built version>): for dev the floor must be
+          # the ~dev version so the same-run dev core satisfies it (a clean
+          # release core, sorting higher, satisfies it too). No-op for release.
+          sed -i "s|splitway (>= [^)]*)|splitway (>= ${PKGVER})|" splitway-gui/Cargo.toml
+          sed -i "s|splitway = \">= [^\"]*\"|splitway = \">= ${PKGVER}\"|" splitway-gui/Cargo.toml
+          grep -n "splitway (>=\|splitway = \">=" splitway-gui/Cargo.toml
+      - name: Package deb + rpm + tarball
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Native arch (runner matches matrix arch), so no --target: cargo-deb
+          # takes the host arch; cargo-generate-rpm's builtin auto-req reads the
+          # bullseye-built binary's symbol versions (correct 2.31 floor).
+          cargo deb --no-build --no-strip -p splitway-gui \
+            --deb-version "$PKGVER" \
+            -o "dist/splitway-gui_${PKGVER}_${{ matrix.arch }}.deb"
+          cargo generate-rpm -p splitway-gui \
+            --set-metadata "version = \"$PKGVER\"" \
+            -o "dist/splitway-gui-${PKGVER}.${{ matrix.rpmarch }}.rpm"
+          TARDIR="splitway-gui-${PKGVER}-linux-${{ matrix.arch }}"
+          mkdir -p "stage/$TARDIR"
+          cp target/release/splitway-gui \
+             packaging/desktop/io.github.stslex.splitway.desktop LICENSE "stage/$TARDIR/"
+          cp -r packaging/icons/hicolor "stage/$TARDIR/"
+          tar -C stage -czf "dist/${TARDIR}.tar.gz" "$TARDIR"
+          ls -la dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: pkg-gui-${{ matrix.arch }}
+          path: dist/*
+
+  # --- install the built artifacts directly (no repo, no signing) ------------
+  test-install:
+    needs: [build-core, build-gui]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:bookworm
+            kind: deb
+          - image: ubuntu:22.04
+            kind: deb
+          - image: fedora:latest
+            kind: rpm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: pkg-*-amd64
+          path: art
+          merge-multiple: true
+      - name: Install + smoke-test in ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD":/w -w /w -e KIND=${{ matrix.kind }} ${{ matrix.image }} \
+            bash -euxc '
+              if [ "$KIND" = deb ]; then
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update
+                apt-get install -y --no-install-recommends \
+                  ./art/splitway_*_amd64.deb ./art/splitway-gui_*_amd64.deb \
+                  systemd desktop-file-utils
+              else
+                dnf -y install ./art/splitway-*.x86_64.rpm ./art/splitway-gui-*.x86_64.rpm \
+                  systemd desktop-file-utils
+              fi
+              # binaries present + executable
+              command -v splitway
+              command -v splitway-daemon
+              command -v splitway-gui
+              splitway --help >/dev/null 2>&1 || splitway --version >/dev/null 2>&1 || true
+              # unit + drop-in installed and valid
+              test -f /usr/lib/systemd/system/splitway.service
+              test -f /etc/systemd/system/splitway.service.d/socket-group.conf
+              systemd-analyze verify /usr/lib/systemd/system/splitway.service || true
+              # the GUI created the empty opt-in group, no members
+              getent group splitway
+              [ -z "$(getent group splitway | cut -d: -f4)" ] || { echo "group not empty"; exit 1; }
+              # .desktop validates
+              desktop-file-validate /usr/share/applications/io.github.stslex.splitway.desktop
+              echo "INSTALL OK on ${{ matrix.image }}"
+            '
+
+  # --- signed-repo round trip with a THROWAWAY key (no production secret) -----
+  # Proves metadata + signing + verify + install end-to-end on every PR.
+  test-signed-repo:
+    needs: [build-core, build-gui]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: pkg-*-amd64
+          path: art
+          merge-multiple: true
+      - name: Install repo tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils createrepo-c gnupg
+      - name: Generate a throwaway signing key
+        run: |
+          set -euo pipefail
+          cat > /tmp/keygen <<'EOF'
+          %no-protection
+          Key-Type: eddsa
+          Key-Curve: ed25519
+          Key-Usage: sign
+          Name-Real: Splitway CI Throwaway
+          Name-Email: ci@example.com
+          Expire-Date: 0
+          %commit
+          EOF
+          gpg --batch --gen-key /tmp/keygen
+          KEYID=$(gpg --list-keys --with-colons ci@example.com | awk -F: '/^pub:/{print $5; exit}')
+          echo "KEYID=$KEYID" >> "$GITHUB_ENV"
+          gpg --export --armor "$KEYID" > /tmp/splitway.gpg
+      - name: Build signed apt + dnf repos from the artifacts
+        run: |
+          set -euo pipefail
+          # apt
+          mkdir -p repo/deb/pool/main
+          cp art/*.deb repo/deb/pool/main/
+          bash packaging/ci/build-apt-repo.sh repo/deb "$KEYID"
+          cp /tmp/splitway.gpg repo/splitway.gpg
+          # dnf
+          mkdir -p repo/rpm
+          cp art/*.rpm repo/rpm/
+          bash packaging/ci/build-dnf-repo.sh repo/rpm "$KEYID"
+      - name: Serve the repo on localhost
+        run: |
+          ( cd repo && python3 -m http.server 8080 >/tmp/http.log 2>&1 & )
+          sleep 2
+      - name: apt install over the signed repo (verification ON)
+        run: |
+          set -euo pipefail
+          docker run --rm --network host -v /tmp/splitway.gpg:/k.gpg:ro debian:bookworm \
+            bash -euxc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends ca-certificates gnupg
+              install -m 0644 /k.gpg /usr/share/keyrings/splitway.gpg
+              echo "deb [signed-by=/usr/share/keyrings/splitway.gpg] http://localhost:8080/deb stable main" \
+                > /etc/apt/sources.list.d/splitway.list
+              apt-get update
+              apt-get install -y splitway
+              command -v splitway-daemon
+              echo "SIGNED APT INSTALL OK"
+            '
+      - name: dnf install over the signed repo (verification ON)
+        run: |
+          set -euo pipefail
+          docker run --rm --network host -v /tmp/splitway.gpg:/k.gpg:ro fedora:latest \
+            bash -euxc '
+              rpm --import /k.gpg
+              cat > /etc/yum.repos.d/splitway.repo <<EOF
+          [splitway]
+          name=Splitway
+          baseurl=http://localhost:8080/rpm
+          enabled=1
+          gpgcheck=1
+          repo_gpgcheck=1
+          gpgkey=file:///k.gpg
+          EOF
+              dnf -y install splitway
+              command -v splitway-daemon
+              echo "SIGNED DNF INSTALL OK"
+            '
+
+  # --- arm64 best-effort: install the arm64 artifacts under QEMU --------------
+  test-arm64-smoke:
+    needs: [build-core, build-gui]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: pkg-*-arm64
+          path: art
+          merge-multiple: true
+      - uses: docker/setup-qemu-action@v3
+      - name: Install arm64 deb under QEMU
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/arm64 -v "$PWD":/w -w /w debian:bookworm \
+            bash -euxc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends ./art/splitway_*_arm64.deb
+              command -v splitway-daemon
+              echo "ARM64 INSTALL OK"
+            '
