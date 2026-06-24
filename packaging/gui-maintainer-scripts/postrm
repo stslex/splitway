@@ -1,0 +1,39 @@
+#!/bin/sh
+# splitway-gui postrm — undo the socket-group opt-in, reverting the daemon to
+# the default root-only (0600) socket.
+set -e
+
+DROPIN_DIR=/etc/systemd/system/splitway.service.d
+DROPIN="$DROPIN_DIR/socket-group.conf"
+
+case "$1" in
+  remove|purge)
+    # Remove the drop-in so the daemon reverts to the default 0600 root socket.
+    rm -f "$DROPIN"
+    rmdir --ignore-fail-on-non-empty "$DROPIN_DIR" 2>/dev/null || true
+
+    # Drop the group ONLY if it has no members (preserve any opt-in users).
+    if getent group splitway >/dev/null 2>&1; then
+      members=$(getent group splitway | awk -F: '{print $4}')
+      if [ -z "$members" ]; then
+        groupdel splitway >/dev/null 2>&1 || true
+      fi
+    fi
+
+    # Reapply: reload + restart the (still-installed) daemon back to root-only.
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl try-restart splitway.service >/dev/null 2>&1 || true
+    fi
+
+    # Refresh desktop + icon caches (best-effort).
+    if command -v update-desktop-database >/dev/null 2>&1; then
+      update-desktop-database -q /usr/share/applications || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+      gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor || true
+    fi
+    ;;
+esac
+
+exit 0

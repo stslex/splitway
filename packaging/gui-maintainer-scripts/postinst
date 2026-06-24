@@ -1,0 +1,61 @@
+#!/bin/sh
+# splitway-gui postinst — opt-in socket-group plumbing.
+#
+# EMPTY-GROUP INVARIANT: this creates an EMPTY `splitway` group and installs the
+# socket-group drop-in. With no members the drop-in is a no-op and the socket
+# posture is identical to the default 0600 root-only. This script NEVER adds a
+# user — the only grant is a human running `usermod -aG splitway <user>` and
+# re-logging in. Group membership is equivalent to control of system split-DNS.
+set -e
+
+DROPIN_DIR=/etc/systemd/system/splitway.service.d
+DROPIN="$DROPIN_DIR/socket-group.conf"
+
+case "$1" in
+  configure)
+    # 1. Ensure the (empty) system group exists.
+    getent group splitway >/dev/null 2>&1 || groupadd --system splitway
+
+    # 2. Install the drop-in that switches the daemon to group-socket mode.
+    install -d -m 0755 "$DROPIN_DIR"
+    install -m 0644 /usr/share/splitway/socket-group.conf "$DROPIN"
+
+    # 3. Apply: reload units and restart the daemon if it is running.
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl try-restart splitway.service >/dev/null 2>&1 || true
+    fi
+
+    # 4. Refresh desktop + icon caches (best-effort).
+    if command -v update-desktop-database >/dev/null 2>&1; then
+      update-desktop-database -q /usr/share/applications || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+      gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor || true
+    fi
+
+    # 5. Loudly tell the human how to actually opt in (first install only).
+    if [ -z "$2" ]; then
+      cat <<'EOM'
+
+  ============================================================================
+   splitway-gui installed.
+
+   The daemon's control socket is still ROOT-ONLY. To let your user drive
+   Splitway from the GUI/CLI without sudo, join the `splitway` group and
+   re-login:
+
+       sudo usermod -aG splitway "$USER"
+       # then log out and back in (or reboot)
+
+   Until a user is added the `splitway` group is empty and the socket posture
+   is identical to the default 0600 root-only. Group membership is equivalent
+   to control of system split-DNS routing.
+  ============================================================================
+
+EOM
+    fi
+    ;;
+esac
+
+exit 0
