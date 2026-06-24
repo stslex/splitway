@@ -34,7 +34,11 @@ pub fn run() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([540.0, 720.0])
             .with_min_inner_size([420.0, 480.0])
-            .with_title("Splitway"),
+            .with_title("Splitway")
+            // Wayland app_id: maps the window to the installed
+            // `io.github.stslex.splitway.desktop` entry + hicolor icon (the deb/
+            // rpm/pacman GUI package ships both under that basename).
+            .with_app_id("io.github.stslex.splitway"),
         ..Default::default()
     };
     eframe::run_native(
