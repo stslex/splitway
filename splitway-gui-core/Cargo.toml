@@ -2,6 +2,8 @@
 name = "splitway-gui-core"
 version = "0.0.1"
 edition = "2021"
+license = "MIT"
+description = "Framework-agnostic Splitway GUI view-model and truth-contract orchestration"
 
 # Framework-agnostic GUI logic: the view-model and the truth-contract
 # orchestration (connection state, reconnect-edge refetch, reply folding,

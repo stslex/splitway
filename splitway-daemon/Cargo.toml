@@ -2,6 +2,8 @@
 name = "splitway-daemon"
 version = "0.0.5"
 edition = "2021"
+license = "MIT"
+description = "Domain-based split-DNS daemon: route selected domains through the VPN's DNS, everything else direct"
 
 [dependencies]
 splitway-shared = { path = "../splitway-shared" }
@@ -42,3 +44,112 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 system-configuration = "0.7"
 core-foundation = "0.9"
+
+# ---------------------------------------------------------------------------
+# Distribution packaging — the `splitway` core package (daemon + CLI + unit).
+#
+# This crate's metadata defines the deb/rpm package named `splitway` that ships
+# BOTH binaries (`splitway-daemon` and the `splitway` CLI built from
+# splitway-cli), the systemd unit, and the README/LICENSE. It is built
+# musl-static (*-unknown-linux-musl) so it carries no shared-library deps and
+# runs on any glibc/musl baseline. The desktop GUI is a SEPARATE package
+# (splitway-gui/Cargo.toml) that Depends on this one.
+# See docs/design/linux-distro-packaging.md.
+#
+# CI builds both binaries for the target triple, then runs `cargo deb` /
+# `cargo generate-rpm` with `--target <triple>`, which remaps the
+# `target/release/...` asset paths below to `target/<triple>/release/...` and
+# stamps the package architecture. Version is stamped at the packaging layer
+# (`cargo deb --deb-version` / `cargo generate-rpm --set-metadata version=...`)
+# so dev builds get `<ver>~dev.<utc>.<sha>` without putting a non-semver string
+# in this file.
+# ---------------------------------------------------------------------------
+
+[package.metadata.deb]
+name = "splitway"
+maintainer = "stslex <ilya977.077@gmail.com>"
+copyright = "2026, stslex"
+# Generates /usr/share/doc/splitway/copyright from the MIT text (skip 0 header
+# lines). This is the Debian-policy license file, so LICENSE is not shipped
+# again as a separate asset (avoids lintian extra-license-file).
+# NOTE: cargo-deb resolves non-`target/` paths relative to THIS crate's
+# manifest dir, so workspace-root files need `../` (verified with cargo-deb
+# 3.7.0). cargo-generate-rpm instead resolves relative to the invocation dir
+# (workspace root), so its block below uses bare paths — intentional skew.
+license-file = ["../LICENSE", "0"]
+section = "net"
+priority = "optional"
+extended-description = """\
+Splitway routes selected domains through the VPN's DNS while everything else \
+resolves directly. The root daemon detects the VPN (NetworkManager or a \
+standalone OpenVPN management interface) and applies/reverts split-DNS rules \
+via systemd-resolved; the splitway CLI drives it over a 0600 Unix socket. This \
+package contains the daemon, the CLI, and the systemd service. Install \
+splitway-gui for the desktop GUI."""
+# musl-static binary => no dynamic library dependencies (verified in CI with
+# `file`). NetworkManager and systemd-resolved are runtime prerequisites for
+# actually applying rules, but stay Recommends (not Depends) so the package
+# installs on hosts using other resolvers or for inspection.
+depends = ""
+recommends = "network-manager, systemd-resolved"
+# Required for the systemd-units block below to actually GENERATE the
+# postinst/postrm enable/start/restart/stop scriptlets (cargo-deb's
+# dh_installsystemd integration only runs when maintainer-scripts is set). The
+# directory is empty, so cargo-deb writes the scripts from scratch.
+maintainer-scripts = "../packaging/deb-maintainer-scripts"
+assets = [
+    ["target/release/splitway-daemon", "usr/bin/", "755"],
+    ["target/release/splitway", "usr/bin/", "755"],
+    ["../README.md", "usr/share/doc/splitway/README.md", "644"],
+]
+
+# cargo-deb's systemd integration installs packaging/systemd/splitway.service
+# and generates the maintainer scripts: daemon-reload + enable + start on first
+# install, restart after upgrade, stop + disable on removal. (The unit is NOT
+# listed in `assets` above — this block installs it.)
+[package.metadata.deb.systemd-units]
+unit-name = "splitway"
+unit-scripts = "../packaging/systemd"
+enable = true
+start = true
+restart-after-upgrade = true
+
+[package.metadata.generate-rpm]
+name = "splitway"
+summary = "Domain-based split-DNS daemon and CLI"
+# Static musl binary => disable the automatic dependency scan, which would
+# otherwise add interpreter/rpmlib requires that a static binary does not need.
+auto-req = "no"
+# systemd scriptlets. cargo-generate-rpm builds the RPM directly, so these run
+# as raw /bin/sh (default RPM scriptlet interpreter) — RPM macros like
+# %systemd_post are NOT expanded, hence the explicit systemctl calls. $1 is the
+# RPM scriptlet count: %post 1=install 2=upgrade; %preun/%postun 0=erase
+# 1=upgrade. Keys precede the [.recommends] sub-table per TOML ordering rules.
+post_install_script = """
+systemctl daemon-reload >/dev/null 2>&1 || :
+if [ "$1" = 1 ]; then
+    systemctl enable --now splitway.service >/dev/null 2>&1 || :
+else
+    systemctl try-restart splitway.service >/dev/null 2>&1 || :
+fi
+"""
+pre_uninstall_script = """
+if [ "$1" = 0 ]; then
+    systemctl --no-reload disable --now splitway.service >/dev/null 2>&1 || :
+fi
+"""
+post_uninstall_script = """
+systemctl daemon-reload >/dev/null 2>&1 || :
+"""
+assets = [
+    { source = "target/release/splitway-daemon", dest = "/usr/bin/splitway-daemon", mode = "755" },
+    { source = "target/release/splitway", dest = "/usr/bin/splitway", mode = "755" },
+    { source = "packaging/systemd/splitway.service", dest = "/usr/lib/systemd/system/splitway.service", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/splitway/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/splitway/LICENSE", mode = "644", doc = true },
+]
+
+# Weak deps (RPM Recommends) — same rationale as the deb Recommends above.
+[package.metadata.generate-rpm.recommends]
+NetworkManager = "*"
+systemd-resolved = "*"
