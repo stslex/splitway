@@ -240,6 +240,78 @@ nix develop    # dev shell with cargo, rustc, rustfmt, clippy, rust-analyzer
 The flake also exposes `nixosModules.default` for installing Splitway as a
 systemd service on a NixOS host — see [Install (NixOS)](#install-nixos) below.
 
+## Install (Debian/Ubuntu, Fedora, Arch)
+
+Signed apt / dnf / pacman repositories on GitHub Pages, in two channels —
+**release** (stable) and **dev** (every push to `dev`). Two packages:
+`splitway` (daemon + CLI + service) and `splitway-gui` (the desktop app, which
+depends on `splitway`). See the
+[landing page](https://stslex.github.io/splitway/) for the full snippets and the
+signing-key fingerprint, and [packaging/](packaging/README.md) for the details.
+
+Verify the key fingerprint (`gpg --show-keys splitway.gpg`) against the
+maintainer's published value before trusting the repo.
+
+### Debian / Ubuntu (apt)
+
+```sh
+curl -fsSL https://stslex.github.io/splitway/splitway.gpg \
+  | sudo tee /usr/share/keyrings/splitway.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/splitway.gpg] https://stslex.github.io/splitway/deb/release stable main" \
+  | sudo tee /etc/apt/sources.list.d/splitway.list
+sudo apt-get update
+sudo apt-get install splitway          # add splitway-gui for the desktop app
+```
+
+For the dev channel, point at `…/deb/dev` instead.
+
+### Fedora / RHEL (dnf)
+
+```sh
+sudo tee /etc/yum.repos.d/splitway.repo <<'EOF'
+[splitway]
+name=Splitway
+baseurl=https://stslex.github.io/splitway/rpm/release
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://stslex.github.io/splitway/splitway.gpg
+EOF
+sudo dnf install splitway              # add splitway-gui for the desktop app
+```
+
+For the dev channel, use `…/rpm/dev`. The core package is musl-static (runs on
+any glibc baseline, including RHEL 8); the GUI targets glibc 2.31+, so RHEL 8 is
+uncovered for `splitway-gui` only.
+
+### Arch Linux (pacman, x86_64)
+
+Self-hosted signed pacman repo (AUR packages are pending AUR registration
+reopening):
+
+```sh
+curl -fsSL https://stslex.github.io/splitway/splitway.gpg -o /tmp/splitway.gpg
+sudo pacman-key --add /tmp/splitway.gpg
+sudo pacman-key --lsign-key <FINGERPRINT>      # from gpg --show-keys /tmp/splitway.gpg
+sudo tee -a /etc/pacman.conf <<'EOF'
+
+[splitway]
+SigLevel = Required DatabaseOptional
+Server = https://stslex.github.io/splitway/arch/release/$arch
+EOF
+sudo pacman -Sy splitway               # add splitway-gui for the desktop app
+```
+
+x86_64 only. On aarch64, or to build from source, use the in-repo PKGBUILDs:
+
+```sh
+cd packaging/aur/splitway && makepkg -si   # or splitway-bin (prebuilt), splitway-gui
+```
+
+The `splitway-gui` package adds an opt-in `splitway` group; it starts **empty**,
+so the daemon socket stays root-only until you run
+`sudo usermod -aG splitway "$USER"` and re-login.
+
 ## Install (NixOS)
 
 On NixOS the flake's `nixosModules.default` takes you from zero to a running
