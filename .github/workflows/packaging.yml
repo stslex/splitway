@@ -242,10 +242,14 @@ jobs:
       - name: Generate a throwaway signing key
         run: |
           set -euo pipefail
+          # RSA, not EdDSA: rpm's header signing (rpm --addsign) only produces a
+          # verifiable signature with an RSA key — an EdDSA key silently yields
+          # no RPMTAG_RSAHEADER (verified locally). The maintainer's real key
+          # (GPG_PRIVATE_KEY) must be RSA for the same reason.
           cat > /tmp/keygen <<'EOF'
           %no-protection
-          Key-Type: eddsa
-          Key-Curve: ed25519
+          Key-Type: RSA
+          Key-Length: 3072
           Key-Usage: sign
           Name-Real: Splitway CI Throwaway
           Name-Email: ci@example.com
@@ -330,3 +334,134 @@ jobs:
               command -v splitway-daemon
               echo "ARM64 INSTALL OK"
             '
+
+  # --- publish the signed apt/dnf repos to GitHub Pages (push-only, SECRETS) --
+  # Never runs on pull_request. Serialized via a single concurrency group so two
+  # near-simultaneous deploys queue instead of clobbering gh-pages. Drops into
+  # the correct channel pool and regenerates ONLY that channel's metadata —
+  # gh-pages is persistent state, MERGED not wiped, so old versions + the other
+  # channel survive.
+  publish-pages:
+    needs: [meta, build-core, build-gui, test-install, test-signed-repo]
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: pages-deploy
+      cancel-in-progress: false
+    env:
+      CHANNEL: ${{ needs.meta.outputs.channel }}
+      PKGVER: ${{ needs.meta.outputs.pkgver }}
+      BASE: https://stslex.github.io/splitway
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: pkg-*
+          path: art
+          merge-multiple: true
+      - name: Install repo tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils createrepo-c gnupg rpm
+      - name: Import signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          # GPG_PRIVATE_KEY must be an RSA key: rpm --addsign only signs with RSA
+          # (see the throwaway-key note in test-signed-repo).
+          GNUPGHOME="$(mktemp -d)"; chmod 700 "$GNUPGHOME"; export GNUPGHOME
+          echo "allow-loopback-pinentry" > "$GNUPGHOME/gpg-agent.conf"
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          FPR="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')"
+          PPF="$GNUPGHOME/passphrase"; printf '%s' "$GPG_PASSPHRASE" > "$PPF"; chmod 600 "$PPF"
+          gpg --batch --yes --armor --export "$FPR" > /tmp/splitway.gpg
+          # Hand these to the later steps (GNUPGHOME holds the imported secret key).
+          {
+            echo "GNUPGHOME=$GNUPGHOME"
+            echo "GPG_FPR=$FPR"
+            echo "SPLITWAY_GPG_PASSFILE=$PPF"
+          } >> "$GITHUB_ENV"
+      - name: Prepare gh-pages (clone, or bootstrap an orphan branch)
+        run: |
+          set -euo pipefail
+          REMOTE="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          if git ls-remote --exit-code --heads "$REMOTE" gh-pages >/dev/null 2>&1; then
+            git clone --branch gh-pages --depth 1 "$REMOTE" gh-pages
+          else
+            mkdir gh-pages
+            git -C gh-pages init -b gh-pages
+            git -C gh-pages remote add origin "$REMOTE"
+          fi
+      - name: Drop artifacts into the channel pool (merge, never wipe)
+        run: |
+          set -euo pipefail
+          mkdir -p "gh-pages/deb/$CHANNEL/pool/main" "gh-pages/rpm/$CHANNEL"
+          cp art/*.deb "gh-pages/deb/$CHANNEL/pool/main/"
+          cp art/*.rpm "gh-pages/rpm/$CHANNEL/"
+      - name: Regenerate + sign ONLY this channel's metadata
+        run: |
+          set -euo pipefail
+          bash packaging/ci/build-apt-repo.sh "gh-pages/deb/$CHANNEL" "$GPG_FPR"
+          bash packaging/ci/build-dnf-repo.sh "gh-pages/rpm/$CHANNEL" "$GPG_FPR"
+          cp /tmp/splitway.gpg gh-pages/splitway.gpg
+          bash packaging/ci/render-index.sh "$GPG_FPR" > gh-pages/index.html
+      - name: Commit + push gh-pages
+        run: |
+          set -euo pipefail
+          cd gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no changes to publish"; exit 0
+          fi
+          git commit -m "publish: $CHANNEL $PKGVER"
+          git push origin HEAD:gh-pages
+      - name: Attach tarballs to the GitHub Release (release channel only)
+        if: ${{ needs.meta.outputs.channel == 'release' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.meta.outputs.version }}
+          name: v${{ needs.meta.outputs.version }}
+          files: art/*.tar.gz
+          fail_on_unmatched_files: true
+      - name: Post-deploy smoke (live repo, real key, verify ON)
+        run: |
+          set -euo pipefail
+          # GitHub Pages publishes asynchronously; wait until the just-uploaded
+          # package is live before testing the install.
+          url="$BASE/deb/$CHANNEL/pool/main/splitway_${PKGVER}_amd64.deb"
+          for i in $(seq 1 60); do
+            if curl -fsI "$url" >/dev/null 2>&1; then echo "live after ${i}0s"; break; fi
+            sleep 10
+            [ "$i" = 60 ] && { echo "ERROR: package not live after 10m"; exit 1; }
+          done
+          docker run --rm debian:bookworm bash -euxc "
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg
+            curl -fsSL $BASE/splitway.gpg -o /usr/share/keyrings/splitway.gpg
+            echo 'deb [signed-by=/usr/share/keyrings/splitway.gpg] $BASE/deb/$CHANNEL stable main' \
+              > /etc/apt/sources.list.d/splitway.list
+            apt-get update && apt-get install -y splitway
+            command -v splitway-daemon
+            echo LIVE_APT_OK
+          "
+          docker run --rm fedora:latest bash -euxc "
+            rpm --import $BASE/splitway.gpg
+            cat > /etc/yum.repos.d/splitway.repo <<EOF
+          [splitway]
+          name=Splitway
+          baseurl=$BASE/rpm/$CHANNEL
+          enabled=1
+          gpgcheck=1
+          repo_gpgcheck=1
+          gpgkey=$BASE/splitway.gpg
+          EOF
+            dnf -y install splitway
+            command -v splitway-daemon
+            echo LIVE_DNF_OK
+          "

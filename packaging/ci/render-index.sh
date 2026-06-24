@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Render the GitHub Pages landing page (index.html) with copy-paste add-repo
+# snippets for every distro/channel. Emits HTML to stdout.
+#
+#   render-index.sh <gpg-fingerprint>
+#
+# The fingerprint and the public Pages URL are public project infrastructure
+# (not secrets). The page is regenerated on every deploy so it always reflects
+# the current signing key.
+set -euo pipefail
+
+FPR="${1:?usage: render-index.sh <gpg-fingerprint>}"
+BASE="https://stslex.github.io/splitway"
+
+cat <<HTML
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Splitway — package repositories</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.6rem; } h2 { margin-top: 2rem; } h3 { margin-top: 1.2rem; color: #444; }
+  code, pre { font-family: ui-monospace, monospace; }
+  pre { background: #f4f4f6; padding: 0.8rem 1rem; border-radius: 6px; overflow-x: auto; }
+  .key { font-size: 0.9rem; color: #555; word-break: break-all; }
+  a { color: #4a4ad0; }
+</style>
+</head>
+<body>
+<h1>Splitway package repositories</h1>
+<p>Domain-based split-DNS for Linux desktops. Two packages, lockstep-versioned:
+<code>splitway</code> (daemon + CLI + service) and <code>splitway-gui</code> (desktop GUI).
+All packages are GPG-signed. The signing key is published at
+<a href="${BASE}/splitway.gpg">${BASE}/splitway.gpg</a>.</p>
+<p class="key">Key fingerprint: <code>${FPR}</code> — verify with
+<code>gpg --show-keys splitway.gpg</code>.</p>
+<p>Two channels: <strong>release</strong> (stable) and <strong>dev</strong>
+(every push to <code>dev</code>; <code>~dev</code> versions sort below release).</p>
+
+<h2>Debian / Ubuntu (apt)</h2>
+<h3>Release channel</h3>
+<pre>curl -fsSL ${BASE}/splitway.gpg | sudo tee /usr/share/keyrings/splitway.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/splitway.gpg] ${BASE}/deb/release stable main" \\
+  | sudo tee /etc/apt/sources.list.d/splitway.list
+sudo apt-get update
+sudo apt-get install splitway        # add splitway-gui for the desktop app</pre>
+<h3>Dev channel</h3>
+<pre>echo "deb [signed-by=/usr/share/keyrings/splitway.gpg] ${BASE}/deb/dev stable main" \\
+  | sudo tee /etc/apt/sources.list.d/splitway-dev.list
+sudo apt-get update && sudo apt-get install splitway</pre>
+
+<h2>Fedora / RHEL (dnf)</h2>
+<h3>Release channel</h3>
+<pre>sudo tee /etc/yum.repos.d/splitway.repo <<'EOF'
+[splitway]
+name=Splitway
+baseurl=${BASE}/rpm/release
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=${BASE}/splitway.gpg
+EOF
+sudo dnf install splitway            # add splitway-gui for the desktop app</pre>
+<h3>Dev channel</h3>
+<pre>sudo tee /etc/yum.repos.d/splitway-dev.repo <<'EOF'
+[splitway-dev]
+name=Splitway (dev)
+baseurl=${BASE}/rpm/dev
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=${BASE}/splitway.gpg
+EOF
+sudo dnf install splitway</pre>
+
+<!-- ARCH_SECTION -->
+
+<h2>Other</h2>
+<p>NixOS: use the flake's <code>nixosModules.default</code> (see the
+<a href="https://github.com/stslex/splitway">repository</a>). The core package
+is musl-static, so it runs on any glibc/musl baseline; the GUI targets glibc
+2.31+ (RHEL 8 is intentionally uncovered for the GUI — the core still works).</p>
+</body>
+</html>
+HTML

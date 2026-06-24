@@ -21,6 +21,15 @@ SUITE="stable"
 COMP="main"
 ARCHES="amd64 arm64"
 
+# Sign with the given key, non-interactively. If SPLITWAY_GPG_PASSFILE points at
+# a passphrase file (the real key has a passphrase), feed it via loopback; the
+# ephemeral CI key has none, so the var is unset and no passphrase is needed.
+gpg_sign() {
+    local extra=()
+    [ -n "${SPLITWAY_GPG_PASSFILE:-}" ] && extra=(--passphrase-file "$SPLITWAY_GPG_PASSFILE")
+    gpg --batch --yes --pinentry-mode loopback "${extra[@]}" --default-key "$KEY" "$@"
+}
+
 [ -d "$ROOT/pool/main" ] || { echo "error: $ROOT/pool/main does not exist (no packages)" >&2; exit 1; }
 cd "$ROOT"
 
@@ -61,10 +70,8 @@ apt-ftparchive \
 
 if [ -n "$KEY" ]; then
     rm -f "dists/$SUITE/InRelease" "dists/$SUITE/Release.gpg"
-    gpg --batch --yes --pinentry-mode loopback --default-key "$KEY" \
-        --clearsign -o "dists/$SUITE/InRelease" "dists/$SUITE/Release"
-    gpg --batch --yes --pinentry-mode loopback --default-key "$KEY" \
-        -abs -o "dists/$SUITE/Release.gpg" "dists/$SUITE/Release"
+    gpg_sign --clearsign -o "dists/$SUITE/InRelease" "dists/$SUITE/Release"
+    gpg_sign -abs -o "dists/$SUITE/Release.gpg" "dists/$SUITE/Release"
     echo "apt repo signed with key $KEY -> $ROOT/dists/$SUITE/{InRelease,Release.gpg}"
 else
     echo "apt repo built (unsigned) -> $ROOT/dists/$SUITE/Release"
