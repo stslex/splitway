@@ -18,15 +18,21 @@ KEY="${2:-}"
 
 [ -d "$ROOT" ] || { echo "error: $ROOT does not exist" >&2; exit 1; }
 
+# Optional passphrase file for the real (passphrase-protected) key; unset for
+# the ephemeral CI key.
+PASS_OPT=""
+[ -n "${SPLITWAY_GPG_PASSFILE:-}" ] && PASS_OPT="--passphrase-file ${SPLITWAY_GPG_PASSFILE}"
+
 if [ -n "$KEY" ]; then
-    # Header-sign every rpm in place (idempotent; re-signing is harmless). %_gpg_name
-    # selects the key; loopback pinentry feeds GPG_PASSPHRASE non-interactively.
+    # Header-sign every rpm in place (idempotent; re-signing is harmless).
+    # %_gpg_name selects the key; loopback pinentry + the passphrase file feed
+    # the passphrase non-interactively.
     shopt -s nullglob
     rpms=("$ROOT"/*.rpm)
     if [ ${#rpms[@]} -gt 0 ]; then
         rpm \
             --define "_gpg_name $KEY" \
-            --define "__gpg_sign_cmd %{__gpg} gpg --batch --no-armor --pinentry-mode loopback --no-secmem-warning -u %{_gpg_name} -sbo %{__signature_filename} %{__plaintext_filename}" \
+            --define "__gpg_sign_cmd %{__gpg} gpg --batch --no-armor ${PASS_OPT} --pinentry-mode loopback --no-secmem-warning -u %{_gpg_name} -sbo %{__signature_filename} %{__plaintext_filename}" \
             --addsign "${rpms[@]}"
     fi
 fi
@@ -36,7 +42,8 @@ createrepo_c --update "$ROOT"
 
 if [ -n "$KEY" ]; then
     rm -f "$ROOT/repodata/repomd.xml.asc"
-    gpg --batch --yes --pinentry-mode loopback --default-key "$KEY" \
+    # shellcheck disable=SC2086  # PASS_OPT is intentionally word-split (0 or 2 args)
+    gpg --batch --yes --pinentry-mode loopback $PASS_OPT --default-key "$KEY" \
         --detach-sign --armor "$ROOT/repodata/repomd.xml"
     echo "dnf repo signed with key $KEY -> $ROOT/repodata/{repomd.xml,repomd.xml.asc}"
 else
