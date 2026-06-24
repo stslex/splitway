@@ -1,0 +1,42 @@
+# Maintainer: stslex <ilya977.077@gmail.com>
+#
+# Source build of the Splitway core: daemon + CLI + systemd unit. Build it now
+# with `cd packaging/aur/splitway && makepkg -si`; this PKGBUILD is also what
+# the AUR `splitway` package will use once AUR registration reopens. The hosted
+# signed pacman repo (https://stslex.github.io/splitway/arch) ships a prebuilt
+# copy of this same package.
+pkgname=splitway
+pkgver=0.0.5
+pkgrel=1
+pkgdesc="Domain-based split-DNS daemon + CLI: route selected domains through the VPN's DNS, everything else direct"
+arch=('x86_64' 'aarch64')
+url="https://github.com/stslex/splitway"
+license=('MIT')
+makedepends=('cargo')
+optdepends=('networkmanager: VPN detection via D-Bus'
+            'systemd-resolvconf: split-DNS via systemd-resolved')
+install="$pkgname.install"
+source=("$pkgname-$pkgver.tar.gz::https://github.com/stslex/splitway/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release -p splitway-daemon -p splitway-cli
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 target/release/splitway-daemon "$pkgdir/usr/bin/splitway-daemon"
+    install -Dm755 target/release/splitway "$pkgdir/usr/bin/splitway"
+    install -Dm644 packaging/systemd/splitway.service "$pkgdir/usr/lib/systemd/system/splitway.service"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

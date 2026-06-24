@@ -335,6 +335,120 @@ jobs:
               echo "ARM64 INSTALL OK"
             '
 
+  # --- Arch: makepkg the source PKGBUILDs (x86_64) -----------------------------
+  # pacman has no dev channel (vercmp does not treat ~ as a pre-release marker),
+  # so Arch always uses the CLEAN version. Builds from THIS checkout (the release
+  # tag may not exist yet on dev/PR) by pre-placing the source archive makepkg
+  # expects.
+  build-arch:
+    needs: meta
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - name: Install build tooling
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel git rust namcap sudo \
+            libglvnd libxkbcommon wayland libx11 libxcursor libxi libxrandr
+      - uses: actions/checkout@v5
+      - name: Set up a non-root build user (makepkg refuses root)
+        run: |
+          useradd -m builder
+          chown -R builder:builder .
+      - name: makepkg splitway + splitway-gui (local source, clean pkgver)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for pkg in splitway splitway-gui; do
+            # The PKGBUILD's source filename is <pkgname>-<pkgver>.tar.gz with a
+            # top-level dir splitway-<pkgver>; pre-place it so makepkg builds the
+            # checkout instead of downloading the tag.
+            sudo -u builder git config --global --add safe.directory "$PWD"
+            sudo -u builder git archive --format=tar.gz --prefix="splitway-$VERSION/" \
+              -o "packaging/aur/$pkg/$pkg-$VERSION.tar.gz" HEAD
+            ( cd "packaging/aur/$pkg" \
+              && sudo -u builder makepkg -f --noconfirm --nodeps --skipinteg \
+              && sudo -u builder bash -c 'makepkg --printsrcinfo > .SRCINFO' )
+            cp "packaging/aur/$pkg"/*.pkg.tar.zst dist/
+            # Advisory lint (dlopen'd GL libs make namcap noisy; do not gate).
+            namcap "packaging/aur/$pkg/PKGBUILD" || true
+            namcap "packaging/aur/$pkg"/*.pkg.tar.zst || true
+          done
+          ls -la dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: pkg-arch-x86_64
+          path: dist/*
+
+  # --- Arch: local install + ephemeral-key signed pacman repo (no secrets) -----
+  test-arch:
+    needs: build-arch
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          name: pkg-arch-x86_64
+          path: art
+      - name: Tooling
+        run: pacman -Syu --noconfirm --needed systemd python gnupg
+      - name: Local pacman -U install
+        run: |
+          set -euo pipefail
+          # Pull the GUI's runtime libs from the official repos, then install the
+          # built packages directly.
+          pacman -S --noconfirm --needed libglvnd libxkbcommon wayland libx11 libxcursor libxi libxrandr
+          pacman -U --noconfirm art/*.pkg.tar.zst
+          command -v splitway-daemon
+          command -v splitway
+          command -v splitway-gui
+          test -f /usr/lib/systemd/system/splitway.service
+          # GUI scriptlet created the empty opt-in group
+          getent group splitway
+          [ -z "$(getent group splitway | cut -d: -f4)" ] || { echo "group not empty"; exit 1; }
+          pacman -R --noconfirm splitway-gui splitway
+      - name: Ephemeral-key signed pacman repo (verification ON)
+        run: |
+          set -euo pipefail
+          export GNUPGHOME; GNUPGHOME="$(mktemp -d)"; chmod 700 "$GNUPGHOME"
+          cat > "$GNUPGHOME/keygen" <<'EOF'
+          %no-protection
+          Key-Type: RSA
+          Key-Length: 3072
+          Key-Usage: sign
+          Name-Real: Splitway CI Throwaway
+          Name-Email: ci@example.com
+          Expire-Date: 0
+          %commit
+          EOF
+          gpg --batch --gen-key "$GNUPGHOME/keygen"
+          FPR=$(gpg --list-keys --with-colons ci@example.com | awk -F: '/^fpr:/{print $5; exit}')
+          gpg --export --armor "$FPR" > /tmp/key.gpg
+          # Build a signed local repo: detach-sign each package, then repo-add.
+          mkdir -p repo && cp art/*.pkg.tar.zst repo/
+          for p in repo/*.pkg.tar.zst; do
+            gpg --batch --yes --pinentry-mode loopback --default-key "$FPR" --detach-sign "$p"
+          done
+          ( cd repo && repo-add --sign --key "$FPR" splitway.db.tar.gz ./*.pkg.tar.zst )
+          ( cd repo && python -m http.server 8081 >/tmp/http.log 2>&1 & )
+          sleep 2
+          # Trust the throwaway key in pacman's keyring.
+          pacman-key --init
+          pacman-key --add /tmp/key.gpg
+          pacman-key --lsign-key "$FPR"
+          cat >> /etc/pacman.conf <<'EOF'
+
+          [splitway]
+          SigLevel = Required DatabaseOptional
+          Server = http://localhost:8081
+          EOF
+          pacman -Sy --noconfirm splitway
+          command -v splitway-daemon
+          echo "SIGNED PACMAN INSTALL OK"
+
   # --- publish the signed apt/dnf repos to GitHub Pages (push-only, SECRETS) --
   # Never runs on pull_request. Serialized via a single concurrency group so two
   # near-simultaneous deploys queue instead of clobbering gh-pages. Drops into
@@ -342,7 +456,7 @@ jobs:
   # gh-pages is persistent state, MERGED not wiped, so old versions + the other
   # channel survive.
   publish-pages:
-    needs: [meta, build-core, build-gui, test-install, test-signed-repo]
+    needs: [meta, build-core, build-gui, build-arch, test-install, test-signed-repo, test-arch]
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     permissions:
@@ -409,6 +523,36 @@ jobs:
           bash packaging/ci/build-dnf-repo.sh "gh-pages/rpm/$CHANNEL" "$GPG_FPR"
           cp /tmp/splitway.gpg gh-pages/splitway.gpg
           bash packaging/ci/render-index.sh "$GPG_FPR" > gh-pages/index.html
+      - name: Publish the signed pacman repo (release channel only, x86_64)
+        if: ${{ needs.meta.outputs.channel == 'release' }}
+        run: |
+          set -euo pipefail
+          ARCHDIR="gh-pages/arch/release/x86_64"
+          mkdir -p "$ARCHDIR"
+          cp art/*.pkg.tar.zst "$ARCHDIR"/                 # merge: old packages persist
+          # Detach-sign each package with the real key (pacman SigLevel=Required).
+          for p in "$ARCHDIR"/*.pkg.tar.zst; do
+            rm -f "$p.sig"
+            gpg --batch --yes --pinentry-mode loopback --passphrase-file "$SPLITWAY_GPG_PASSFILE" \
+              --default-key "$GPG_FPR" --detach-sign "$p"
+          done
+          # repo-add is an Arch tool; run it in a container over the mounted dir.
+          # Incremental: it updates entries in place and keeps old packages.
+          docker run --rm -v "$PWD/$ARCHDIR":/repo -w /repo archlinux:latest \
+            bash -c 'repo-add splitway.db.tar.gz ./*.pkg.tar.zst'
+          sudo chown -R "$(id -u):$(id -g)" "$ARCHDIR"
+          # GitHub Pages does not serve symlinks; replace repo-add's db/files
+          # symlinks with real copies, and sign the DB (DatabaseOptional).
+          for n in db files; do
+            if [ -L "$ARCHDIR/splitway.$n" ]; then
+              rm -f "$ARCHDIR/splitway.$n"
+              cp "$ARCHDIR/splitway.$n.tar.gz" "$ARCHDIR/splitway.$n"
+            fi
+          done
+          rm -f "$ARCHDIR/splitway.db.tar.gz.sig"
+          gpg --batch --yes --pinentry-mode loopback --passphrase-file "$SPLITWAY_GPG_PASSFILE" \
+            --default-key "$GPG_FPR" --detach-sign "$ARCHDIR/splitway.db.tar.gz"
+          cp "$ARCHDIR/splitway.db.tar.gz.sig" "$ARCHDIR/splitway.db.sig"
       - name: Commit + push gh-pages
         run: |
           set -euo pipefail
@@ -465,3 +609,23 @@ jobs:
             command -v splitway-daemon
             echo LIVE_DNF_OK
           "
+      - name: Post-deploy pacman smoke (release channel only)
+        if: ${{ needs.meta.outputs.channel == 'release' }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if curl -fsI "$BASE/arch/release/x86_64/splitway.db" >/dev/null 2>&1; then break; fi
+            sleep 10
+            [ "$i" = 60 ] && { echo "ERROR: pacman repo not live after 10m"; exit 1; }
+          done
+          docker run --rm -e BASE="$BASE" -e FPR="$GPG_FPR" archlinux:latest bash -euxc '
+            pacman -Sy --noconfirm
+            curl -fsSL "$BASE/splitway.gpg" -o /tmp/key.gpg
+            pacman-key --init
+            pacman-key --add /tmp/key.gpg
+            pacman-key --lsign-key "$FPR"
+            printf "\n[splitway]\nSigLevel = Required DatabaseOptional\nServer = %s/arch/release/x86_64\n" "$BASE" >> /etc/pacman.conf
+            pacman -Sy --noconfirm splitway
+            command -v splitway-daemon
+            echo LIVE_PACMAN_OK
+          '

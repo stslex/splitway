@@ -1,0 +1,52 @@
+# pacman install scriptlet for splitway-gui — opt-in socket-group plumbing.
+#
+# EMPTY-GROUP INVARIANT: this creates an EMPTY `splitway` group and installs the
+# socket-group drop-in. With no members the drop-in is a no-op and the socket
+# posture is identical to the default 0600 root-only. This script NEVER adds a
+# user — the only grant is a human running `usermod -aG splitway <user>` and
+# re-logging in. Mirrors the deb/rpm maintainer scripts.
+
+_apply_dropin() {
+    getent group splitway >/dev/null 2>&1 || groupadd --system splitway
+    install -d -m 0755 /etc/systemd/system/splitway.service.d
+    install -m 0644 /usr/share/splitway/socket-group.conf \
+        /etc/systemd/system/splitway.service.d/socket-group.conf
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl try-restart splitway.service >/dev/null 2>&1 || true
+    update-desktop-database -q /usr/share/applications 2>/dev/null || true
+    gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor 2>/dev/null || true
+}
+
+post_install() {
+    _apply_dropin
+    cat <<'EOM'
+
+  splitway-gui installed. The daemon socket is still ROOT-ONLY. To drive it
+  without sudo, join the (empty) splitway group and re-login:
+
+      sudo usermod -aG splitway "$USER"
+
+  Until a user is added the group is empty and the posture is identical to
+  0600 root-only. Group membership == control of system split-DNS.
+EOM
+}
+
+post_upgrade() {
+    _apply_dropin
+}
+
+pre_remove() {
+    rm -f /etc/systemd/system/splitway.service.d/socket-group.conf
+    rmdir --ignore-fail-on-non-empty /etc/systemd/system/splitway.service.d 2>/dev/null || true
+    if getent group splitway >/dev/null 2>&1 && \
+       [ -z "$(getent group splitway | awk -F: '{print $4}')" ]; then
+        groupdel splitway >/dev/null 2>&1 || true
+    fi
+}
+
+post_remove() {
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl try-restart splitway.service >/dev/null 2>&1 || true
+    update-desktop-database -q /usr/share/applications 2>/dev/null || true
+    gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor 2>/dev/null || true
+}

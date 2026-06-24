@@ -1,0 +1,32 @@
+# Maintainer: stslex <ilya977.077@gmail.com>
+#
+# Prebuilt Splitway core (daemon + CLI + unit) from the GitHub Release tarball —
+# no Rust toolchain needed. Useful for aarch64 / ALARM (the hosted pacman repo
+# is x86_64-only). Build with `cd packaging/aur/splitway-bin && makepkg -si`.
+pkgname=splitway-bin
+pkgver=0.0.5
+pkgrel=1
+pkgdesc="Domain-based split-DNS daemon + CLI (prebuilt from the release tarball)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/stslex/splitway"
+license=('MIT')
+provides=('splitway')
+conflicts=('splitway')
+install="$pkgname.install"
+source_x86_64=("https://github.com/stslex/splitway/releases/download/v$pkgver/splitway-$pkgver-linux-amd64.tar.gz")
+source_aarch64=("https://github.com/stslex/splitway/releases/download/v$pkgver/splitway-$pkgver-linux-arm64.tar.gz")
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+    case "$CARCH" in
+        x86_64)  local _dir="splitway-$pkgver-linux-amd64" ;;
+        aarch64) local _dir="splitway-$pkgver-linux-arm64" ;;
+    esac
+    cd "$_dir"
+    install -Dm755 splitway-daemon "$pkgdir/usr/bin/splitway-daemon"
+    install -Dm755 splitway "$pkgdir/usr/bin/splitway"
+    install -Dm644 splitway.service "$pkgdir/usr/lib/systemd/system/splitway.service"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/splitway/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/splitway/README.md"
+}
