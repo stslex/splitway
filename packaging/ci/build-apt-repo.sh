@@ -42,7 +42,7 @@ filter_arch() { # <arch>  (reads a Packages file on stdin)
             arch = ""
             n = split($0, lines, "\n")
             for (i = 1; i <= n; i++)
-                if (lines[i] ~ /^Architecture: /) { arch = lines[i]; sub(/^Architecture: /, "", arch) }
+                if (lines[i] ~ /^Architecture: /) { arch = lines[i]; sub(/^Architecture: /, "", arch); break }
             if (arch == want || arch == "all") print
         }'
 }
