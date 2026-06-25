@@ -29,7 +29,11 @@ jobs:
       channel: ${{ steps.v.outputs.channel }}
     steps:
       - uses: actions/checkout@v5
-      - name: Check the AUR PKGBUILD pkgver matches the daemon version
+        with:
+          # fetch-depth: 0 pulls tags too — check-pkgver-sync.sh resolves the
+          # release tag the AUR PKGBUILDs must pin (the repo is small).
+          fetch-depth: 0
+      - name: Check the AUR PKGBUILD pkgver names an existing release tag
         run: bash packaging/ci/check-pkgver-sync.sh
       - id: v
         shell: bash
