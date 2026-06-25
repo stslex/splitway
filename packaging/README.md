@@ -29,6 +29,15 @@ read-only `/etc` config. The daemon creates an empty config there on first run.
 See [docs/architecture.md](../docs/architecture.md) ("Config is the single
 source of truth").
 
+> **Migrating from a manual install.** If you previously ran `splitway-daemon`
+> by hand as root *without* `--config`, it stored its config at the XDG fallback
+> `/root/.config/splitway/config.json` (and logged a warning). The packaged unit
+> reads `/var/lib/splitway/config.json` instead, so move your file once after
+> installing the package:
+> `sudo install -D -m600 /root/.config/splitway/config.json /var/lib/splitway/config.json`.
+> This affects only hand-run pre-packaging setups — packaged installs start fresh
+> at the `/var/lib` path.
+
 ### Socket security model
 
 The daemon is privileged; the CLI is not. The Unix control socket is the

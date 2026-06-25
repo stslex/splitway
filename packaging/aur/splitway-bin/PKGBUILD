@@ -10,7 +10,11 @@ pkgdesc="Domain-based split-DNS daemon + CLI (prebuilt from the release tarball)
 arch=('x86_64' 'aarch64')
 url="https://github.com/stslex/splitway"
 license=('MIT')
-provides=('splitway')
+# Versioned provision: splitway-gui depends on `splitway>=$pkgver`, and pacman
+# only satisfies a versioned dependency from a versioned provision — an
+# unversioned `provides=('splitway')` would NOT let splitway-gui install against
+# this prebuilt core. conflicts stays unversioned (mutually exclusive cores).
+provides=("splitway=$pkgver")
 conflicts=('splitway')
 install="$pkgname.install"
 source_x86_64=("https://github.com/stslex/splitway/releases/download/v$pkgver/splitway-$pkgver-linux-amd64.tar.gz")
