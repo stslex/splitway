@@ -9,12 +9,14 @@
 #   check-pkgver-sync.sh
 set -euo pipefail
 
-ver="$(grep '^version' splitway-daemon/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')"
+# awk (not `grep | head -1`): SIGPIPE-free under `set -o pipefail` if a second
+# `^version` line ever appears. Mirrors compute-version.sh / sync-pkgver.sh.
+ver="$(awk -F'"' '/^version/{print $2; exit}' splitway-daemon/Cargo.toml)"
 [ -n "$ver" ] || { echo "ERROR: could not read daemon version" >&2; exit 1; }
 
 rc=0
 for pb in packaging/aur/*/PKGBUILD; do
-    pv="$(grep '^pkgver=' "$pb" | head -1 | cut -d= -f2)"
+    pv="$(awk -F= '/^pkgver=/{print $2; exit}' "$pb")"
     if [ "$pv" != "$ver" ]; then
         echo "ERROR: $pb has pkgver=$pv but daemon version=$ver (lockstep drift)" >&2
         rc=1

@@ -42,8 +42,9 @@ jobs:
         id: meta
         shell: bash
         run: |
-          VERSION=$(grep '^version' splitway-daemon/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          # awk (not `grep | head -1`): SIGPIPE-free version read under pipefail.
+          VERSION=$(awk -F'"' '/^version/{print $2; exit}' splitway-daemon/Cargo.toml)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -89,9 +90,10 @@ jobs:
         id: meta
         shell: bash
         run: |
-          VERSION=$(grep '^version' splitway-daemon/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+          # awk (not `grep | head -1`): SIGPIPE-free version read under pipefail.
+          VERSION=$(awk -F'"' '/^version/{print $2; exit}' splitway-daemon/Cargo.toml)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
       - uses: actions/download-artifact@v8
         with:
@@ -119,7 +121,8 @@ jobs:
       - name: Bump patch version in Cargo.toml files
         shell: bash
         run: |
-          VERSION=$(grep '^version' splitway-daemon/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          # awk (not `grep | head -1`): SIGPIPE-free version read under pipefail.
+          VERSION=$(awk -F'"' '/^version/{print $2; exit}' splitway-daemon/Cargo.toml)
           MAJOR=$(echo "$VERSION" | cut -d. -f1)
           MINOR=$(echo "$VERSION" | cut -d. -f2)
           PATCH=$(echo "$VERSION" | cut -d. -f3)

@@ -10,6 +10,11 @@ pkgdesc="Domain-based split-DNS daemon + CLI (prebuilt from the release tarball)
 arch=('x86_64' 'aarch64')
 url="https://github.com/stslex/splitway"
 license=('MIT')
+# Same runtime prerequisite hints as the source `splitway` PKGBUILD (and the
+# deb/rpm Recommends) — the prebuilt core ships the identical daemon, so surface
+# the same resolver / VPN-detection optdepends.
+optdepends=('networkmanager: VPN detection via D-Bus'
+            'systemd-resolvconf: split-DNS via systemd-resolved')
 # Versioned provision: splitway-gui depends on `splitway>=$pkgver`, and pacman
 # only satisfies a versioned dependency from a versioned provision — an
 # unversioned `provides=('splitway')` would NOT let splitway-gui install against

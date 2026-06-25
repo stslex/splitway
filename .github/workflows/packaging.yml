@@ -397,7 +397,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed \
             base-devel git rust namcap sudo \
-            libglvnd libxkbcommon wayland libx11 libxcursor libxi libxrandr
+            libglvnd libxkbcommon libxkbcommon-x11 wayland libx11 libxcursor libxi libxrandr
       - uses: actions/checkout@v5
       - name: Set up a non-root build user (makepkg refuses root)
         run: |
@@ -450,7 +450,7 @@ jobs:
           # must not lean on that — preinstall the full set the PKGBUILD declares
           # (GL/X11/wayland libs + hicolor-icon-theme/desktop-file-utils for the
           # .install icon-cache / desktop-database hooks), matching it exactly.
-          pacman -S --noconfirm --needed libglvnd libxkbcommon wayland libx11 libxcursor libxi libxrandr \
+          pacman -S --noconfirm --needed libglvnd libxkbcommon libxkbcommon-x11 wayland libx11 libxcursor libxi libxrandr \
             hicolor-icon-theme desktop-file-utils
           pacman -U --noconfirm art/*.pkg.tar.zst
           command -v splitway-daemon

@@ -471,9 +471,13 @@ window-rule {
 }
 ```
 
-Install it first — see [GUI (native Tauri)](#gui-native-tauri). (The interim egui
-GUI launches by spawning `splitway-gui` instead; it does **not** carry the
-`io.github.stslex.splitway` app id, so the window rule above is Tauri-only.)
+Install it first — see [GUI (native Tauri)](#gui-native-tauri). Note that the
+GUI shipped by the apt/dnf/pacman `splitway-gui` package today is the **interim
+egui** build (the native Tauri app is not yet packaged); it launches by spawning
+`splitway-gui` and now carries the **same** `io.github.stslex.splitway` app id
+(set via the window `app_id`, matched by the installed `.desktop`
+`StartupWMClass` + hicolor icons), so the window rule above applies to it too —
+just point the `spawn` binding at `splitway-gui`.
 
 **Unprivileged access (opt-in).** By default the control socket is `0600` and
 root-owned, so a CLI or GUI launched as your normal desktop user gets "permission

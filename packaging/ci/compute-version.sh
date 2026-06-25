@@ -18,7 +18,10 @@ set -euo pipefail
 event="${1:?usage: compute-version.sh <event_name> <ref>}"
 ref="${2:?usage: compute-version.sh <event_name> <ref>}"
 
-version="$(grep '^version' splitway-daemon/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')"
+# awk (not `grep | head -1`): under `set -o pipefail` head closing the pipe
+# early would SIGPIPE grep and fail the read if a second `^version` line ever
+# appeared; awk exits cleanly on the first match.
+version="$(awk -F'"' '/^version/{print $2; exit}' splitway-daemon/Cargo.toml)"
 
 if [ "$event" = "push" ] && [ "$ref" = "refs/heads/master" ]; then
     pkgver="$version"

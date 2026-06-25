@@ -13,8 +13,14 @@ DROPIN="$DROPIN_DIR/socket-group.conf"
 
 case "$1" in
   configure)
-    # 1. Ensure the (empty) system group exists.
-    getent group splitway >/dev/null 2>&1 || groupadd --system splitway
+    # 1. Ensure the (empty) system group exists. Unlike the best-effort steps
+    #    below, this one is allowed to abort the postinst (set -e) — without the
+    #    group the socket-group drop-in is meaningless — but make that failure
+    #    deliberate and diagnosable rather than a bare `set -e` exit.
+    getent group splitway >/dev/null 2>&1 || groupadd --system splitway || {
+      echo "splitway-gui: failed to create the 'splitway' system group" >&2
+      exit 1
+    }
 
     # 2. Install the drop-in that switches the daemon to group-socket mode.
     install -d -m 0755 "$DROPIN_DIR"
