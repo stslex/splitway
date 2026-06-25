@@ -88,7 +88,7 @@ sudo tee -a /etc/pacman.conf <<'EOF'
 SigLevel = Required DatabaseOptional
 Server = ${BASE}/arch/release/\$arch
 EOF
-sudo pacman -Sy splitway        # add splitway-gui for the desktop app</pre>
+sudo pacman -Syu splitway       # add splitway-gui for the desktop app</pre>
 <p>The hosted pacman repo is <strong>x86_64 only</strong>. On aarch64, build the
 in-repo PKGBUILD below or use <code>splitway-bin</code> (prebuilt from the
 release tarball).</p>
