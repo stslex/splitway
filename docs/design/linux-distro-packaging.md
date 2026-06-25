@@ -168,6 +168,20 @@ release tarball, x86_64 + aarch64), and `splitway-gui` (source), each with an
 CI builds the source PKGBUILDs from the checkout (the release tag may not exist
 on a dev/PR run) and validates `.SRCINFO` + `namcap`.
 
+The committed `pkgver=` pins a **released tag**, not the in-tree daemon version.
+The two differ on purpose: release.yml's post-release auto-bump moves
+`splitway-daemon/Cargo.toml` to the next (unreleased) version, so at rest on
+`master` the daemon is one patch ahead of the newest `v*` tag. Each PKGBUILD's
+`source=` fetches `v$pkgver`, so the pin must name a tag that exists. The
+bump-version job runs `sync-pkgver.sh` **before** the daemon bump, stamping the
+version just tagged — so on `master` at rest the pin is the *latest* release.
+The gate `check-pkgver-sync.sh` (packaging.yml `meta`, with tags fetched)
+enforces only the weaker, sufficient condition that the pinned tag **exists**
+(not that it is the latest): that keeps `makepkg -si` working while avoiding
+spurious failures on dev/PR branches or in the release-push window, where the
+PKGBUILDs legitimately still point at the previous release until the bump commit
+lands.
+
 **Deferred:** the automated `ssh://aur@aur.archlinux.org/<pkg>.git` push, blocked
 on AUR registration reopening. Design preserved for then: per package
 `makepkg --printsrcinfo > .SRCINFO`, commit + push idempotently, release-only.
