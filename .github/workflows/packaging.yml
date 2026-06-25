@@ -394,6 +394,8 @@ jobs:
     needs: meta
     runs-on: ubuntu-latest
     container: archlinux:latest
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
     steps:
       - name: Install build tooling
         run: |
@@ -411,18 +413,21 @@ jobs:
           mkdir -p dist
           sudo -u builder git config --global --add safe.directory "$PWD"
           for pkg in splitway splitway-gui; do
-            # The PKGBUILD's source filename is <pkgname>-<pkgver>.tar.gz with a
-            # top-level dir splitway-<pkgver>; pre-place it so makepkg builds the
-            # checkout instead of downloading the tag. Key it on the committed
-            # pkgver (read from the PKGBUILD), NOT the daemon version: after a
-            # release the two differ on purpose — the PKGBUILD pins the released
-            # tag while the daemon is bumped ahead (see check-pkgver-sync.sh) — so
-            # a name keyed on the daemon version would miss makepkg's expected
-            # source, and makepkg would silently fetch the old tag and ship stale
-            # Arch packages while this build still passes.
-            pkgver="$(awk -F= '/^pkgver=/{print $2; exit}' "packaging/aur/$pkg/PKGBUILD")"
-            sudo -u builder git archive --format=tar.gz --prefix="splitway-$pkgver/" \
-              -o "packaging/aur/$pkg/$pkg-$pkgver.tar.gz" HEAD
+            # Build + publish the CURRENT version (VERSION = the clean daemon/meta
+            # version), not the committed pin. The committed pkgver intentionally
+            # lags to the last released tag so a user's `makepkg -si` from a
+            # checkout resolves an existing tag (see check-pkgver-sync.sh) — but
+            # the hosted pacman repo must ship VERSION, or a release push would
+            # publish under the previous version and Arch users never get the new
+            # one. Stamp VERSION into the EPHEMERAL PKGBUILD (never committed) and
+            # pre-place the matching <pkgname>-<VERSION>.tar.gz (top-level dir
+            # splitway-<VERSION>); keying the archive on the same VERSION is what
+            # makes makepkg build THIS checkout instead of fetching the tag.
+            sudo -u builder sed -i \
+              -e "s/^pkgver=.*/pkgver=$VERSION/" -e "s/^pkgrel=.*/pkgrel=1/" \
+              "packaging/aur/$pkg/PKGBUILD"
+            sudo -u builder git archive --format=tar.gz --prefix="splitway-$VERSION/" \
+              -o "packaging/aur/$pkg/$pkg-$VERSION.tar.gz" HEAD
             ( cd "packaging/aur/$pkg" \
               && sudo -u builder makepkg -f --noconfirm --nodeps --skipinteg \
               && sudo -u builder bash -c 'makepkg --printsrcinfo > .SRCINFO' )
