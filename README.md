@@ -300,7 +300,7 @@ sudo tee -a /etc/pacman.conf <<'EOF'
 SigLevel = Required DatabaseOptional
 Server = https://stslex.github.io/splitway/arch/release/$arch
 EOF
-sudo pacman -Sy splitway               # add splitway-gui for the desktop app
+sudo pacman -Syu splitway              # add splitway-gui for the desktop app
 ```
 
 x86_64 only. On aarch64, or to build from source, use the in-repo PKGBUILDs:
