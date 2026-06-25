@@ -12,7 +12,14 @@ pkgdesc="Splitway desktop GUI (egui front-end over the daemon socket)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/stslex/splitway"
 license=('MIT')
-depends=('splitway' 'libglvnd' 'libxkbcommon' 'wayland' 'libx11' 'libxcursor' 'libxi' 'libxrandr')
+# `splitway>=$pkgver` mirrors the deb/rpm `>=` IPC-compat floor (a new GUI must
+# not pair with an older core that predates an IPC change); the hosted repo ships
+# both in lockstep, but the floor encodes the contract. desktop-file-utils backs
+# the update-desktop-database hook in .install; hicolor-icon-theme provides the
+# base theme (whose own pacman hook refreshes the icon cache — the .install's
+# gtk-update-icon-cache call is best-effort and stays guarded, not a hard dep).
+depends=("splitway>=$pkgver" 'libglvnd' 'libxkbcommon' 'wayland' 'libx11' 'libxcursor' 'libxi' 'libxrandr'
+         'hicolor-icon-theme' 'desktop-file-utils')
 makedepends=('cargo')
 optdepends=('xdg-desktop-portal: file dialog (a portal backend is also needed)')
 install="$pkgname.install"

@@ -58,6 +58,18 @@ for a in $ARCHES; do
 done
 rm -f "$allpkgs"
 
+# Valid-Until bounds the lifetime of the signed suite metadata: without it the
+# Release is trusted forever, which permits freeze/replay (a MITM or a stale
+# mirror pinning clients to an old, vulnerable version indefinitely). The window
+# is APT_VALID_DAYS (default 90); EVERY publish regenerates + re-signs Release,
+# so it is refreshed on each push — the maintainer must publish (or widen the
+# window) within it. Needs GNU date (CI runners have it).
+VALID_DAYS="${APT_VALID_DAYS:-90}"
+# LC_ALL=C: apt only accepts the English RFC1123 day/month names; without it a
+# non-English runner/container locale would emit localized names and apt would
+# reject the Release as unparseable.
+VALID_UNTIL="$(LC_ALL=C date -u -d "+${VALID_DAYS} days" "+%a, %d %b %Y %H:%M:%S UTC")"
+
 # Suite Release file (with checksums of the Packages indexes).
 apt-ftparchive \
     -o "APT::FTPArchive::Release::Origin=splitway" \
@@ -66,6 +78,7 @@ apt-ftparchive \
     -o "APT::FTPArchive::Release::Codename=$SUITE" \
     -o "APT::FTPArchive::Release::Components=$COMP" \
     -o "APT::FTPArchive::Release::Architectures=$ARCHES" \
+    -o "APT::FTPArchive::Release::Valid-Until=$VALID_UNTIL" \
     release "dists/$SUITE" > "dists/$SUITE/Release"
 
 if [ -n "$KEY" ]; then

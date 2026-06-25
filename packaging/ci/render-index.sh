@@ -41,13 +41,14 @@ All packages are GPG-signed. The signing key is published at
 
 <h2>Debian / Ubuntu (apt)</h2>
 <h3>Release channel</h3>
-<pre>curl -fsSL ${BASE}/splitway.gpg | sudo tee /usr/share/keyrings/splitway.gpg > /dev/null
+<pre>curl -fsSL ${BASE}/splitway.gpg | sudo gpg --dearmor --yes -o /usr/share/keyrings/splitway.gpg
 echo "deb [signed-by=/usr/share/keyrings/splitway.gpg] ${BASE}/deb/release stable main" \\
   | sudo tee /etc/apt/sources.list.d/splitway.list
 sudo apt-get update
 sudo apt-get install splitway        # add splitway-gui for the desktop app</pre>
 <h3>Dev channel</h3>
-<pre>echo "deb [signed-by=/usr/share/keyrings/splitway.gpg] ${BASE}/deb/dev stable main" \\
+<pre>curl -fsSL ${BASE}/splitway.gpg | sudo gpg --dearmor --yes -o /usr/share/keyrings/splitway.gpg
+echo "deb [signed-by=/usr/share/keyrings/splitway.gpg] ${BASE}/deb/dev stable main" \\
   | sudo tee /etc/apt/sources.list.d/splitway-dev.list
 sudo apt-get update && sudo apt-get install splitway</pre>
 
@@ -78,6 +79,7 @@ sudo dnf install splitway</pre>
 <h2>Arch Linux (pacman, x86_64)</h2>
 <h3>Signed repository (recommended)</h3>
 <pre>curl -fsSL ${BASE}/splitway.gpg -o /tmp/splitway.gpg
+sudo pacman-key --init          # no-op if the keyring is already initialised
 sudo pacman-key --add /tmp/splitway.gpg
 sudo pacman-key --lsign-key ${FPR}
 sudo tee -a /etc/pacman.conf <<'EOF'

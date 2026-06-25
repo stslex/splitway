@@ -29,6 +29,8 @@ jobs:
       channel: ${{ steps.v.outputs.channel }}
     steps:
       - uses: actions/checkout@v5
+      - name: Check the AUR PKGBUILD pkgver matches the daemon version
+        run: bash packaging/ci/check-pkgver-sync.sh
       - id: v
         shell: bash
         run: |
@@ -66,7 +68,14 @@ jobs:
           for b in splitway-daemon splitway; do
             f="target/${{ matrix.target }}/release/$b"
             file "$f"
-            file "$f" | grep -q "statically linked" || { echo "ERROR: $b is not static"; exit 1; }
+            # Assert the real intent: no dynamic interpreter. A musl release build
+            # is reported by file(1) as either "statically linked" (non-PIE, e.g.
+            # the aarch64 leg) or "static-pie linked" (PIE, e.g. the x86_64 leg);
+            # both are static. Matching the *absence* of "dynamically linked"
+            # accepts both forms (and any future phrasing) without a false abort.
+            if file "$f" | grep -q "dynamically linked"; then
+              echo "ERROR: $b is dynamically linked, expected a static binary"; exit 1
+            fi
           done
       - name: Package deb + rpm + tarball
         run: |
@@ -132,7 +141,18 @@ jobs:
             curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
               | sh -s -- -y --profile minimal --default-toolchain stable
             . "$HOME/.cargo/env"
-            cargo build --release -p splitway-gui
+            # Network resilience: a cold container build has no crates cache, so a
+            # single crates.io blip (HTTP2 reset, etc.) would fail the whole arch
+            # leg. Make cargos own fetch retry harder, and wrap the (locked) fetch
+            # in an outer retry, before building fully offline (--frozen).
+            export CARGO_NET_RETRY=10 CARGO_HTTP_MULTIPLEXING=false
+            for i in 1 2 3 4 5; do
+              cargo fetch --locked && break
+              [ "$i" = 5 ] && { echo "ERROR: cargo fetch exhausted retries"; exit 1; }
+              echo "cargo fetch failed (attempt $i/5); retrying in ${i}0s" >&2
+              sleep "${i}0"
+            done
+            cargo build --release --frozen -p splitway-gui
           '
           sudo chown -R "$(id -u):$(id -g)" target
           file target/release/splitway-gui
@@ -142,9 +162,22 @@ jobs:
           # GUI Depends splitway (>= <built version>): for dev the floor must be
           # the ~dev version so the same-run dev core satisfies it (a clean
           # release core, sorting higher, satisfies it too). No-op for release.
-          sed -i "s|splitway (>= [^)]*)|splitway (>= ${PKGVER})|g" splitway-gui/Cargo.toml
-          sed -i "s|splitway = \">= [^\"]*\"|splitway = \">= ${PKGVER}\"|g" splitway-gui/Cargo.toml
+          #
+          # Anchor each substitution to the actual dependency line (^depends = /
+          # ^splitway = ) so the explanatory comment that also mentions the floor
+          # is left untouched, then ASSERT the floor was rewritten to $PKGVER — a
+          # silent no-op (e.g. the floor-string format drifting) must fail loudly.
+          sed -i "/^depends = /s|splitway (>= [^)]*)|splitway (>= ${PKGVER})|" splitway-gui/Cargo.toml
+          sed -i "/^splitway = /s|\">= [^\"]*\"|\">= ${PKGVER}\"|" splitway-gui/Cargo.toml
           grep -n "splitway (>=\|splitway = \">=" splitway-gui/Cargo.toml
+          # Anchor the asserts to the dependency lines too: the explanatory comment
+          # also contains "splitway (>= 0.0.5)", so an unanchored grep would pass on
+          # the prose for a release build (PKGVER=0.0.5) even if the sed silently
+          # missed the real line — defeating the fail-loud intent.
+          grep -q "^depends = .*splitway (>= ${PKGVER})" splitway-gui/Cargo.toml \
+            || { echo "ERROR: deb core-dep floor not stamped to ${PKGVER}"; exit 1; }
+          grep -q "^splitway = \">= ${PKGVER}\"" splitway-gui/Cargo.toml \
+            || { echo "ERROR: rpm core-dep floor not stamped to ${PKGVER}"; exit 1; }
       - name: Package deb + rpm + tarball
         run: |
           set -euo pipefail
@@ -283,12 +316,19 @@ jobs:
             bash -euxc '
               export DEBIAN_FRONTEND=noninteractive
               apt-get update && apt-get install -y --no-install-recommends ca-certificates gnupg
-              install -m 0644 /k.gpg /usr/share/keyrings/splitway.gpg
+              # Dearmor into the binary keyring apt expects at a .gpg path. The
+              # published key is ASCII-armored (rpm --import / pacman-key need that
+              # form); dearmoring here makes the apt keyring correct on EVERY apt
+              # version, instead of relying on modern apt accepting armored keys.
+              gpg --dearmor < /k.gpg > /usr/share/keyrings/splitway.gpg
               echo "deb [signed-by=/usr/share/keyrings/splitway.gpg] http://localhost:8080/deb stable main" \
                 > /etc/apt/sources.list.d/splitway.list
               apt-get update
-              apt-get install -y splitway
+              # Install BOTH packages so the GUI header signature + its core-dep
+              # floor are exercised under signature enforcement too (not just core).
+              apt-get install -y splitway splitway-gui
               command -v splitway-daemon
+              command -v splitway-gui
               echo "SIGNED APT INSTALL OK"
             '
       - name: dnf install over the signed repo (verification ON)
@@ -306,8 +346,11 @@ jobs:
           repo_gpgcheck=1
           gpgkey=file:///k.gpg
           EOF
-              dnf -y install splitway
+              # Install BOTH so the GUI rpm header signature + Requires are
+              # verified under gpgcheck/repo_gpgcheck too (not just the core rpm).
+              dnf -y install splitway splitway-gui
               command -v splitway-daemon
+              command -v splitway-gui
               echo "SIGNED DNF INSTALL OK"
             '
 
@@ -425,7 +468,10 @@ jobs:
           %commit
           EOF
           gpg --batch --gen-key "$GNUPGHOME/keygen"
-          FPR=$(gpg --list-keys --with-colons ci@example.com | awk -F: '/^fpr:/{print $5; exit}')
+          # The fingerprint lives in field 10 of an fpr: record (fields 2-9 are
+          # empty there); field 5 is the long key id and would leave FPR empty,
+          # breaking lsign/repo-add. Matches the publish-pages job below.
+          FPR=$(gpg --list-keys --with-colons ci@example.com | awk -F: '/^fpr:/{print $10; exit}')
           gpg --export --armor "$FPR" > /tmp/key.gpg
           # Build a signed local repo: detach-sign each package, then repo-add.
           mkdir -p repo && cp art/*.pkg.tar.zst repo/
@@ -445,8 +491,12 @@ jobs:
           SigLevel = Required DatabaseOptional
           Server = http://localhost:8081
           EOF
-          pacman -Sy --noconfirm splitway
+          # Install BOTH so the GUI package's detached signature is verified
+          # under SigLevel=Required too (the GL/X11 runtime deps were pulled in
+          # by the local-install step above and persist in this job's container).
+          pacman -Sy --noconfirm splitway splitway-gui
           command -v splitway-daemon
+          command -v splitway-gui
           echo "SIGNED PACMAN INSTALL OK"
 
   # --- publish the signed apt/dnf repos to GitHub Pages (push-only, SECRETS) --
@@ -555,6 +605,41 @@ jobs:
           gpg --batch --yes --pinentry-mode loopback --passphrase-file "$SPLITWAY_GPG_PASSFILE" \
             --default-key "$GPG_FPR" --detach-sign "$ARCHDIR/splitway.db.tar.gz"
           cp "$ARCHDIR/splitway.db.tar.gz.sig" "$ARCHDIR/splitway.db.sig"
+      - name: Verify all signatures BEFORE publishing (fail closed)
+        run: |
+          set -euo pipefail
+          # Hard gate before the gh-pages push: never publish metadata we cannot
+          # verify. Catches a misconfigured signing key (e.g. a non-RSA key, which
+          # clearsigns apt fine but yields NO rpm header signature) HERE, instead
+          # of after the broken channel is already live for users (the post-deploy
+          # smoke ran only after the push). Uses the imported key in $GNUPGHOME.
+          # apt: clearsigned InRelease + detached Release.gpg.
+          gpg --verify "gh-pages/deb/$CHANNEL/dists/stable/InRelease"
+          gpg --verify "gh-pages/deb/$CHANNEL/dists/stable/Release.gpg" \
+                       "gh-pages/deb/$CHANNEL/dists/stable/Release"
+          # dnf: detached repomd.xml.asc, and every rpm must carry an RSA header
+          # signature (proof rpm --addsign actually signed, not silently no-op'd).
+          # NOTE: %{RSAHEADER:pgpsig} is the rpm<=5 tag (ubuntu-latest ships rpm 4);
+          # rpm 6 renames it toward OPENPGP, so revisit this query if a future
+          # runner upgrade makes it return empty for a validly-signed package.
+          gpg --verify "gh-pages/rpm/$CHANNEL/repodata/repomd.xml.asc" \
+                       "gh-pages/rpm/$CHANNEL/repodata/repomd.xml"
+          for r in gh-pages/rpm/"$CHANNEL"/*.rpm; do
+            sig="$(rpm -qp --nosignature --qf '%{RSAHEADER:pgpsig}' "$r" 2>/dev/null || true)"
+            case "$sig" in
+              ""|"(none)") echo "ERROR: $r has no RSA header signature"; exit 1 ;;
+              *) echo "ok: $(basename "$r") signed ($sig)" ;;
+            esac
+          done
+          # pacman (release only): detached db + per-package signatures.
+          if [ "$CHANNEL" = release ]; then
+            ARCHDIR="gh-pages/arch/release/x86_64"
+            gpg --verify "$ARCHDIR/splitway.db.tar.gz.sig" "$ARCHDIR/splitway.db.tar.gz"
+            for p in "$ARCHDIR"/*.pkg.tar.zst; do
+              gpg --verify "$p.sig" "$p"
+            done
+          fi
+          echo "all signatures verified — safe to publish"
       - name: Commit + push gh-pages
         run: |
           set -euo pipefail
@@ -589,7 +674,7 @@ jobs:
           docker run --rm debian:bookworm bash -euxc "
             export DEBIAN_FRONTEND=noninteractive
             apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg
-            curl -fsSL $BASE/splitway.gpg -o /usr/share/keyrings/splitway.gpg
+            curl -fsSL $BASE/splitway.gpg | gpg --dearmor -o /usr/share/keyrings/splitway.gpg
             echo 'deb [signed-by=/usr/share/keyrings/splitway.gpg] $BASE/deb/$CHANNEL stable main' \
               > /etc/apt/sources.list.d/splitway.list
             apt-get update && apt-get install -y splitway
