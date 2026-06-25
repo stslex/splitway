@@ -105,8 +105,10 @@ rationale is in
   `/bin/sh` scriptlets.
 - `splitway-gui` — the egui binary, **glibc**, built against a **2.31 floor**
   (`debian:bullseye` / `ubuntu:20.04`), so `Depends: splitway (>=), libc6 (>=
-  2.31), libgl1 …`. winit/glow `dlopen` the GL/X11/wayland libs, so they are not
-  in the ELF and must be hardcoded (dep auto-detection misses them). RHEL 8 is
+  2.31), libgl1, libegl1 …`. winit/glow `dlopen` the GL/X11/wayland libs, so
+  they are not in the ELF and must be hardcoded (dep auto-detection misses
+  them); `libegl1` is a separate dep from `libgl1` because glow/glutin uses EGL
+  on Wayland (GLX on X11). RHEL 8 is
   intentionally uncovered for the GUI; the musl core still works there.
 
 **GUI socket-group drop-in.** The `splitway-gui` package's maintainer scripts

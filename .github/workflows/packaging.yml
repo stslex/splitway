@@ -444,9 +444,14 @@ jobs:
       - name: Local pacman -U install
         run: |
           set -euo pipefail
-          # Pull the GUI's runtime libs from the official repos, then install the
-          # built packages directly.
-          pacman -S --noconfirm --needed libglvnd libxkbcommon wayland libx11 libxcursor libxi libxrandr
+          # Pull ALL of the GUI's declared runtime deps from the official repos,
+          # then install the built packages directly. `pacman -U` on local files
+          # only auto-resolves deps that exist in a synced repo DB, so the smoke
+          # must not lean on that — preinstall the full set the PKGBUILD declares
+          # (GL/X11/wayland libs + hicolor-icon-theme/desktop-file-utils for the
+          # .install icon-cache / desktop-database hooks), matching it exactly.
+          pacman -S --noconfirm --needed libglvnd libxkbcommon wayland libx11 libxcursor libxi libxrandr \
+            hicolor-icon-theme desktop-file-utils
           pacman -U --noconfirm art/*.pkg.tar.zst
           command -v splitway-daemon
           command -v splitway
