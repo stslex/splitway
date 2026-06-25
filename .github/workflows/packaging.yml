@@ -271,7 +271,10 @@ jobs:
       - name: Install repo tooling
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends apt-utils createrepo-c gnupg
+          # rpm is needed by build-dnf-repo.sh (rpm --addsign); ubuntu-latest
+          # currently pre-installs it, but install it explicitly so the dnf
+          # signing path does not depend on the runner image (matches publish).
+          sudo apt-get install -y --no-install-recommends apt-utils createrepo-c gnupg rpm
       - name: Generate a throwaway signing key
         run: |
           set -euo pipefail
