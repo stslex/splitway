@@ -10,8 +10,9 @@
 #   sync-pkgver.sh
 set -euo pipefail
 
-# Same read as check-pkgver-sync.sh — keep these two in step.
-ver="$(grep '^version' splitway-daemon/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')"
+# Same read as check-pkgver-sync.sh — keep these two in step. awk (not
+# `grep | head -1`) is SIGPIPE-free under `set -o pipefail`.
+ver="$(awk -F'"' '/^version/{print $2; exit}' splitway-daemon/Cargo.toml)"
 [ -n "$ver" ] || { echo "ERROR: could not read daemon version" >&2; exit 1; }
 
 for pb in packaging/aur/*/PKGBUILD; do

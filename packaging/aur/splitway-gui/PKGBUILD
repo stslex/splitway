@@ -18,7 +18,9 @@ license=('MIT')
 # the update-desktop-database hook in .install; hicolor-icon-theme provides the
 # base theme (whose own pacman hook refreshes the icon cache — the .install's
 # gtk-update-icon-cache call is best-effort and stays guarded, not a hard dep).
-depends=("splitway>=$pkgver" 'libglvnd' 'libxkbcommon' 'wayland' 'libx11' 'libxcursor' 'libxi' 'libxrandr'
+# libxkbcommon-x11 is a SEPARATE Arch package from libxkbcommon (it provides
+# libxkbcommon-x11.so) — winit's default x11 feature dlopens it on X11 sessions.
+depends=("splitway>=$pkgver" 'libglvnd' 'libxkbcommon' 'libxkbcommon-x11' 'wayland' 'libx11' 'libxcursor' 'libxi' 'libxrandr'
          'hicolor-icon-theme' 'desktop-file-utils')
 makedepends=('cargo')
 optdepends=('xdg-desktop-portal: file dialog (a portal backend is also needed)')
