@@ -42,8 +42,9 @@ jobs:
         id: meta
         shell: bash
         run: |
-          VERSION=$(grep '^version' splitway-daemon/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          # awk (not `grep | head -1`): SIGPIPE-free version read under pipefail.
+          VERSION=$(awk -F'"' '/^version/{print $2; exit}' splitway-daemon/Cargo.toml)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -89,9 +90,10 @@ jobs:
         id: meta
         shell: bash
         run: |
-          VERSION=$(grep '^version' splitway-daemon/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+          # awk (not `grep | head -1`): SIGPIPE-free version read under pipefail.
+          VERSION=$(awk -F'"' '/^version/{print $2; exit}' splitway-daemon/Cargo.toml)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
       - uses: actions/download-artifact@v8
         with:
@@ -116,10 +118,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Bump patch version in Cargo.toml files
+      - name: Pin AUR PKGBUILD pkgver to the just-released version
+        shell: bash
+        # MUST run before the daemon bump below: while Cargo.toml still holds the
+        # version we just tagged, sync-pkgver.sh stamps it into every PKGBUILD so
+        # `makepkg -si` fetches the `v$pkgver` tag / assets that now exist. The
+        # bump then moves the daemon ahead for the next dev cycle, leaving the
+        # PKGBUILDs deliberately one release behind (check-pkgver-sync.sh
+        # validates the pinned tag exists, not that it equals the daemon).
+        run: bash packaging/ci/sync-pkgver.sh
+
+      - name: Bump patch version in Cargo.toml for the next dev cycle
         shell: bash
         run: |
-          VERSION=$(grep '^version' splitway-daemon/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          # awk (not `grep | head -1`): SIGPIPE-free version read under pipefail.
+          VERSION=$(awk -F'"' '/^version/{print $2; exit}' splitway-daemon/Cargo.toml)
           MAJOR=$(echo "$VERSION" | cut -d. -f1)
           MINOR=$(echo "$VERSION" | cut -d. -f2)
           PATCH=$(echo "$VERSION" | cut -d. -f3)
@@ -128,11 +141,11 @@ jobs:
           sed -i "s/^version = \"$VERSION\"/version = \"$NEW_VERSION\"/" splitway-daemon/Cargo.toml
           echo "Bumped $VERSION -> $NEW_VERSION"
 
-      - name: Commit and push version bump
+      - name: Commit and push the AUR pin + version bump
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add splitway-daemon/Cargo.toml
-          git commit -m "chore: bump version after release"
+          git add splitway-daemon/Cargo.toml packaging/aur/*/PKGBUILD
+          git commit -m "chore: pin AUR pkgver to release, bump daemon for next cycle"
           git push

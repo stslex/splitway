@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Splitway
+GenericName=Split-DNS controller
+Comment=Route selected domains through the VPN's DNS, everything else direct
+# The egui binary shipped by the splitway-gui deb/rpm/pacman package. Matches
+# the app_id set on the ViewportBuilder (splitway-gui/src/app.rs) so Wayland
+# compositors map the window to this entry and the hicolor icon below.
+Exec=splitway-gui
+Icon=io.github.stslex.splitway
+Terminal=false
+Categories=Network;
+Keywords=DNS;VPN;split-dns;split;
+StartupNotify=true
+StartupWMClass=io.github.stslex.splitway

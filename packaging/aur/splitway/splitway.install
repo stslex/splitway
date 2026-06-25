@@ -1,0 +1,26 @@
+# pacman install scriptlet for the splitway core package.
+#
+# Per Arch policy the daemon is NOT auto-enabled/started on install — we only
+# print the one-liner. The socket stays root-only (0600) unless the splitway-gui
+# package's opt-in plumbing is also installed.
+
+post_install() {
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    cat <<'EOM'
+  splitway installed. Enable + start the daemon with:
+      sudo systemctl enable --now splitway.service
+EOM
+}
+
+post_upgrade() {
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl try-restart splitway.service >/dev/null 2>&1 || true
+}
+
+pre_remove() {
+    systemctl disable --now splitway.service >/dev/null 2>&1 || true
+}
+
+post_remove() {
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}

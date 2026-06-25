@@ -1,0 +1,60 @@
+# Maintainer: stslex <ilya977.077@gmail.com>
+#
+# Source build of the Splitway desktop GUI (egui). Build with
+# `cd packaging/aur/splitway-gui && makepkg -si`. Installing it adds the opt-in
+# socket-group plumbing (see splitway-gui.install) so an in-group user can drive
+# the daemon without sudo; the group starts EMPTY, so the default posture is
+# unchanged until you run `usermod -aG splitway <user>`.
+pkgname=splitway-gui
+pkgver=0.0.5
+pkgrel=1
+pkgdesc="Splitway desktop GUI (egui front-end over the daemon socket)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/stslex/splitway"
+license=('MIT')
+# `splitway>=$pkgver` mirrors the deb/rpm `>=` IPC-compat floor (a new GUI must
+# not pair with an older core that predates an IPC change); the hosted repo ships
+# both in lockstep, but the floor encodes the contract. desktop-file-utils backs
+# the update-desktop-database hook in .install; hicolor-icon-theme provides the
+# base theme (whose own pacman hook refreshes the icon cache — the .install's
+# gtk-update-icon-cache call is best-effort and stays guarded, not a hard dep).
+# libxkbcommon-x11 is a SEPARATE Arch package from libxkbcommon (it provides
+# libxkbcommon-x11.so) — winit's default x11 feature dlopens it on X11 sessions.
+depends=("splitway>=$pkgver" 'libglvnd' 'libxkbcommon' 'libxkbcommon-x11' 'wayland' 'libx11' 'libxcursor' 'libxi' 'libxrandr'
+         'hicolor-icon-theme' 'desktop-file-utils')
+makedepends=('cargo')
+optdepends=('xdg-desktop-portal: file dialog (a portal backend is also needed)')
+install="$pkgname.install"
+# Builds from the same repo tarball as `splitway`; its top-level dir is
+# splitway-$pkgver regardless of this package's name.
+source=("$pkgname-$pkgver.tar.gz::https://github.com/stslex/splitway/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "splitway-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "splitway-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release -p splitway-gui
+}
+
+package() {
+    cd "splitway-$pkgver"
+    install -Dm755 target/release/splitway-gui "$pkgdir/usr/bin/splitway-gui"
+    install -Dm644 packaging/desktop/io.github.stslex.splitway.desktop \
+        "$pkgdir/usr/share/applications/io.github.stslex.splitway.desktop"
+    install -Dm644 packaging/gui/socket-group.conf \
+        "$pkgdir/usr/share/splitway/socket-group.conf"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    # hicolor icons (8 PNG sizes + scalable SVG), named by the app_id.
+    local f rel
+    while IFS= read -r -d '' f; do
+        rel="${f#packaging/icons/}"
+        install -Dm644 "$f" "$pkgdir/usr/share/icons/$rel"
+    done < <(find packaging/icons/hicolor -type f -print0)
+}
