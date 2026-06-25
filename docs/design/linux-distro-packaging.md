@@ -171,6 +171,11 @@ on a dev/PR run) and validates `.SRCINFO` + `namcap`.
 **Deferred:** the automated `ssh://aur@aur.archlinux.org/<pkg>.git` push, blocked
 on AUR registration reopening. Design preserved for then: per package
 `makepkg --printsrcinfo > .SRCINFO`, commit + push idempotently, release-only.
+That same automation must also **pin real `sha256sums`** for the `splitway-bin`
+prebuilt tarballs (currently `SKIP`): the digest is only knowable after the
+release is built, and the publish job already holds the artifacts, so it should
+stamp the per-tag hashes — `SKIP` on a prebuilt privileged daemon trusts the
+Releases CDN for integrity, which transport TLS alone does not guarantee.
 
 ## The signing key
 

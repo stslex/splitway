@@ -256,7 +256,7 @@ maintainer's published value before trusting the repo.
 
 ```sh
 curl -fsSL https://stslex.github.io/splitway/splitway.gpg \
-  | sudo tee /usr/share/keyrings/splitway.gpg > /dev/null
+  | sudo gpg --dearmor --yes -o /usr/share/keyrings/splitway.gpg
 echo "deb [signed-by=/usr/share/keyrings/splitway.gpg] https://stslex.github.io/splitway/deb/release stable main" \
   | sudo tee /etc/apt/sources.list.d/splitway.list
 sudo apt-get update
@@ -291,6 +291,7 @@ reopening):
 
 ```sh
 curl -fsSL https://stslex.github.io/splitway/splitway.gpg -o /tmp/splitway.gpg
+sudo pacman-key --init                         # no-op if already initialised
 sudo pacman-key --add /tmp/splitway.gpg
 sudo pacman-key --lsign-key <FINGERPRINT>      # from gpg --show-keys /tmp/splitway.gpg
 sudo tee -a /etc/pacman.conf <<'EOF'

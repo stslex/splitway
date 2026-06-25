@@ -15,6 +15,14 @@ conflicts=('splitway')
 install="$pkgname.install"
 source_x86_64=("https://github.com/stslex/splitway/releases/download/v$pkgver/splitway-$pkgver-linux-amd64.tar.gz")
 source_aarch64=("https://github.com/stslex/splitway/releases/download/v$pkgver/splitway-$pkgver-linux-arm64.tar.gz")
+# TRUST ASSUMPTION: these are PREBUILT binaries of a privileged daemon fetched
+# from the Releases CDN, so 'SKIP' (no integrity check) means a re-tagged or
+# tampered asset would install silently — weaker than the source PKGBUILDs where
+# SKIP only waives a VCS-tag tarball. The real fix is to pin per-release digests:
+# the publish-pages job already has the artifacts, so when the deferred AUR-push
+# automation lands it must stamp the real sha256sums for each tag here (the hash
+# is only knowable after the release is built). Until then this is x86_64/aarch64
+# convenience packaging that trusts the HTTPS Releases endpoint + the tag.
 sha256sums_x86_64=('SKIP')
 sha256sums_aarch64=('SKIP')
 
