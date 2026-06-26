@@ -128,6 +128,9 @@ jobs:
         # validates the pinned tag exists, not that it equals the daemon).
         run: bash packaging/ci/sync-pkgver.sh
 
+      # cargo update (below) needs a toolchain; this job otherwise only runs bash.
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Bump patch version in Cargo.toml for the next dev cycle
         shell: bash
         run: |
@@ -139,13 +142,24 @@ jobs:
           NEW_PATCH=$((PATCH + 1))
           NEW_VERSION="$MAJOR.$MINOR.$NEW_PATCH"
           sed -i "s/^version = \"$VERSION\"/version = \"$NEW_VERSION\"/" splitway-daemon/Cargo.toml
-          echo "Bumped $VERSION -> $NEW_VERSION"
+          # Keep Cargo.lock in lockstep with the bumped member version. Without
+          # this, master is left with toml=NEW but lock=OLD, and the next
+          # dev->master merge tree inherits that drift — so `cargo fetch --locked`
+          # / `cargo build --frozen` abort in the packaging build-arch/build-gui
+          # jobs. --precise rewrites only splitway-daemon's lock entry.
+          cargo update -p splitway-daemon --precise "$NEW_VERSION"
+          echo "Bumped $VERSION -> $NEW_VERSION (Cargo.toml + Cargo.lock)"
 
       - name: Commit and push the AUR pin + version bump
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add splitway-daemon/Cargo.toml packaging/aur/*/PKGBUILD
-          git commit -m "chore: pin AUR pkgver to release, bump daemon for next cycle"
+          git add splitway-daemon/Cargo.toml Cargo.lock packaging/aur/*/PKGBUILD
+          # [skip ci]: this bot commit must never re-trigger release/packaging.
+          # A GITHUB_TOKEN push already does not start new workflow runs, but the
+          # marker makes that intent explicit (and holds if the push is ever moved
+          # to a PAT), so the next-cycle bump can never publish an unreleased
+          # version to the stable apt/dnf/pacman channels.
+          git commit -m "chore: pin AUR pkgver to release, bump daemon for next cycle [skip ci]"
           git push
