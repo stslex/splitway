@@ -65,6 +65,17 @@ landed, on the abstraction split that keeps each one a small isolated impl.
   - GUI: `vpn_name` picker over the live interface list (free-text fallback kept),
     a Resync button, immediate refresh after every change, and an opaque grouped
     visual pass.
+- **Phase 6 — Linux distribution packaging.** Signed apt / dnf / pacman repos on
+  GitHub Pages (release + dev channels), shipped as **two** lockstep-versioned
+  packages — `splitway` (daemon + CLI + unit, musl-static) and `splitway-gui`
+  (egui, glibc 2.31 floor) — plus in-repo Arch PKGBUILDs. This supersedes the
+  original "one package" sketch: the GUI's GL/glibc stack shouldn't burden a
+  headless or CLI-only install, and the security-critical core stays minimal and
+  statically linked; the `>=` GUI→core dep covers the version axis. The opt-in
+  socket-group lands as an empty-group + service drop-in in the GUI package
+  (no-op until a human joins the group). macOS Homebrew and the automated AUR
+  push are deferred. See
+  [docs/design/linux-distro-packaging.md](docs/design/linux-distro-packaging.md).
 
 ## Frontend: egui is interim, Tauri is the target
 
@@ -139,31 +150,25 @@ seam added in 5b.
   `read_link_state` reusing 5b's parsing approach — so the daemon can diff
   intended-vs-actual and surface drift: *reality* alongside Phase 5's *belief*.
 
-### Phase 6 — packaging (distribution to other users)
+### Phase 6 — packaging (Linux done; macOS Homebrew deferred)
 
-The author's daily-driver path **already exists** via the Phase 0.5 flake +
-`nixosModule` — that is the iteration channel. So this phase is **distribution to
-other users, not the author's iteration unblock**: general-distro packaging gets
-Splitway onto non-Nix machines, which is its own work because **generic Linux
-binaries do not run on NixOS** (the dynamic linker is in the Nix store, not
-`/lib64`) and immutable-`/usr` hosts need writable install paths.
+**Linux distro packaging shipped** — see the Done section above and
+[docs/design/linux-distro-packaging.md](docs/design/linux-distro-packaging.md).
+Generic Linux binaries don't run on NixOS (the dynamic linker is in the Nix
+store, not `/lib64`) and immutable-`/usr` hosts need writable install paths, so
+this was its own work alongside the flake. What landed: two lockstep-versioned
+packages (`splitway` musl-static + `splitway-gui` glibc), signed apt / dnf /
+pacman repos on GitHub Pages with **dev and release channels** as separate
+subtrees (merge-not-wipe deploys, sidestepping the "full-site replace" trap),
+and in-repo Arch PKGBUILDs.
 
-- **One package** `splitway` containing daemon + cli + gui + the service unit, at
-  a single version. This sidesteps the GUI↔daemon version matrix entirely: there
-  are no separately-versioned packages to mismatch. `postinst` restarts
-  `splitway.service` on upgrade so the running daemon always matches the new
-  binaries; the existing version-peek (`VERSION_MISMATCH_PREFIX`) covers the brief
-  upgrade window. **On NixOS the module is the single-version equivalent.**
-- **Linux first:** tarball + apt / dnf / pacman repos on GitHub Pages, with **dev
-  and release channels** as separate Pages subtrees. Pattern reusable from
-  `stslex/claude-desktop-linux` — take the packaging/publishing half, drop the
-  repackage half, and source artifacts from `cargo build --release`. Watch the
-  Pages "full-site replace" trap that makes concurrent dev + stable deploys
-  clobber each other.
-- **Then macOS:** Homebrew tap / `.pkg` + launchd, with the Gatekeeper /
+Remaining sub-track:
+
+- **macOS:** Homebrew tap / `.pkg` + launchd, with the Gatekeeper /
   notarization tail (unsigned vs Apple-Developer-signed) called out as a
   sub-decision.
-- The dev channel is for iteration now; the public `v0.1.0` tag waits for Tauri.
+
+The dev channel is for iteration now; the public `v0.1.0` tag waits for Tauri.
 
 ### Phase 7 — native Tauri GUI
 

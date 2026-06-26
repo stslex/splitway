@@ -10,7 +10,10 @@ Wants=network-online.target
 Type=simple
 # Installed to /usr/bin by deb/rpm/pacman packages. (The Nix build wires
 # its own ExecStart via the package store path; see nix/module.nix.)
-ExecStart=/usr/bin/splitway-daemon run
+# `--config` points the daemon at the persistent StateDirectory below so it
+# creates its config there on first run, instead of falling back to
+# /root/.config and logging a warning (mirrors nix/module.nix).
+ExecStart=/usr/bin/splitway-daemon run --config /var/lib/splitway/config.json
 Restart=on-failure
 RestartSec=2
 
@@ -19,6 +22,13 @@ RestartSec=2
 # part of the socket's defense in depth (see packaging/README.md).
 RuntimeDirectory=splitway
 RuntimeDirectoryMode=0700
+
+# Persistent state dir /var/lib/splitway (0700, root), created by systemd
+# before start and preserved across restarts. The daemon writes/reads its
+# config at <state>/config.json (see --config above); on first run it creates
+# an empty config there. Mirrors `StateDirectory` in nix/module.nix.
+StateDirectory=splitway
+StateDirectoryMode=0700
 
 # Unprivileged GUI/CLI access (opt-in): let a non-root user in a dedicated group
 # drive the daemon without sudo. To enable, create + join the group
@@ -29,7 +39,7 @@ RuntimeDirectoryMode=0700
 # membership ≈ control of system split-DNS routing (see packaging/README.md,
 # "Socket security model"). Default is root-only.
 #ExecStart=
-#ExecStart=/usr/bin/splitway-daemon run --socket-group splitway
+#ExecStart=/usr/bin/splitway-daemon run --config /var/lib/splitway/config.json --socket-group splitway
 #RuntimeDirectoryMode=0750
 #SupplementaryGroups=splitway
 

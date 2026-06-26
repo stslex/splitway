@@ -1,0 +1,747 @@
+name: Packaging (deb / rpm)
+
+# Builds the distro packages, runs install tests, and (on push) publishes the
+# signed apt/dnf repos to GitHub Pages. Split by trust:
+#   * meta / build-* / test-*  — run on PRs too, NO secrets (gate the PR).
+#   * publish-pages            — push/dispatch only, uses GPG secrets (see the
+#                                publish job; added in the signing commit).
+on:
+  push:
+    branches: [master, dev]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded PR runs; never auto-cancel push runs (a push may publish).
+# The publish job additionally serializes deploys via its own concurrency group.
+concurrency:
+  group: packaging-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      pkgver: ${{ steps.v.outputs.pkgver }}
+      channel: ${{ steps.v.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # fetch-depth: 0 pulls tags too — check-pkgver-sync.sh resolves the
+          # release tag the AUR PKGBUILDs must pin (the repo is small).
+          fetch-depth: 0
+      - name: Check the AUR PKGBUILD pkgver names an existing release tag
+        run: bash packaging/ci/check-pkgver-sync.sh
+      - id: v
+        shell: bash
+        run: |
+          bash packaging/ci/compute-version.sh "${{ github.event_name }}" "${{ github.ref }}" \
+            | tee -a "$GITHUB_OUTPUT"
+
+  # --- core `splitway` package: daemon + CLI, musl-static, amd64 + arm64 ------
+  build-core:
+    needs: meta
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+            rpmarch: x86_64
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+            rpmarch: aarch64
+    env:
+      PKGVER: ${{ needs.meta.outputs.pkgver }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross,cargo-deb,cargo-generate-rpm
+      - name: Build (musl, static) via cross
+        run: cross build --release --target ${{ matrix.target }} -p splitway-daemon -p splitway-cli
+      - name: Verify static linkage
+        run: |
+          for b in splitway-daemon splitway; do
+            f="target/${{ matrix.target }}/release/$b"
+            file "$f"
+            # Assert the real intent: no dynamic interpreter. A musl release build
+            # is reported by file(1) as either "statically linked" (non-PIE, e.g.
+            # the aarch64 leg) or "static-pie linked" (PIE, e.g. the x86_64 leg);
+            # both are static. Matching the *absence* of "dynamically linked"
+            # accepts both forms (and any future phrasing) without a false abort.
+            if file "$f" | grep -q "dynamically linked"; then
+              echo "ERROR: $b is dynamically linked, expected a static binary"; exit 1
+            fi
+          done
+      - name: Package deb + rpm + tarball
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # --target remaps target/release -> target/<triple>/release and sets
+          # the package arch; --deb-version / --set-metadata stamp the channel
+          # version (deb + rpm accept the ~dev suffix; Cargo.toml stays semver).
+          cargo deb --no-build --no-strip -p splitway-daemon \
+            --target ${{ matrix.target }} --deb-version "$PKGVER" \
+            -o "dist/splitway_${PKGVER}_${{ matrix.arch }}.deb"
+          cargo generate-rpm -p splitway-daemon \
+            --target ${{ matrix.target }} \
+            --set-metadata "version = \"$PKGVER\"" \
+            -o "dist/splitway-${PKGVER}.${{ matrix.rpmarch }}.rpm"
+          TARDIR="splitway-${PKGVER}-linux-${{ matrix.arch }}"
+          mkdir -p "stage/$TARDIR"
+          cp "target/${{ matrix.target }}/release/splitway-daemon" \
+             "target/${{ matrix.target }}/release/splitway" \
+             packaging/systemd/splitway.service LICENSE README.md "stage/$TARDIR/"
+          tar -C stage -czf "dist/${TARDIR}.tar.gz" "$TARDIR"
+          ls -la dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: pkg-core-${{ matrix.arch }}
+          path: dist/*
+
+  # --- desktop `splitway-gui` package: egui, glibc, built on the low baseline -
+  # Built inside a debian:bullseye container (glibc 2.31 floor) so the package's
+  # libc6 (>= 2.31) Depends / rpm GLIBC requires are actually true. amd64 runs
+  # the container on the x86_64 runner; arm64 on a native arm64 runner (no QEMU).
+  build-gui:
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            rpmarch: x86_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            rpmarch: aarch64
+    env:
+      PKGVER: ${{ needs.meta.outputs.pkgver }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+      - name: Build GUI at the glibc 2.31 floor (debian:bullseye)
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD":/w -w /w debian:bullseye bash -euc '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              curl ca-certificates build-essential pkg-config \
+              libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
+              libxkbcommon-dev libwayland-dev
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+            . "$HOME/.cargo/env"
+            # Network resilience: a cold container build has no crates cache, so a
+            # single crates.io blip (HTTP2 reset, etc.) would fail the whole arch
+            # leg. Make cargos own fetch retry harder, and wrap the (locked) fetch
+            # in an outer retry, before building fully offline (--frozen).
+            export CARGO_NET_RETRY=10 CARGO_HTTP_MULTIPLEXING=false
+            for i in 1 2 3 4 5; do
+              cargo fetch --locked && break
+              [ "$i" = 5 ] && { echo "ERROR: cargo fetch exhausted retries"; exit 1; }
+              echo "cargo fetch failed (attempt $i/5); retrying in ${i}0s" >&2
+              sleep "${i}0"
+            done
+            cargo build --release --frozen -p splitway-gui
+          '
+          sudo chown -R "$(id -u):$(id -g)" target
+          file target/release/splitway-gui
+      - name: Stamp the core-package dependency floor for this channel
+        run: |
+          set -euo pipefail
+          # GUI Depends splitway (>= <built version>): for dev the floor must be
+          # the ~dev version so the same-run dev core satisfies it (a clean
+          # release core, sorting higher, satisfies it too). No-op for release.
+          #
+          # Anchor each substitution to the actual dependency line (^depends = /
+          # ^splitway = ) so the explanatory comment that also mentions the floor
+          # is left untouched, then ASSERT the floor was rewritten to $PKGVER — a
+          # silent no-op (e.g. the floor-string format drifting) must fail loudly.
+          sed -i "/^depends = /s|splitway (>= [^)]*)|splitway (>= ${PKGVER})|" splitway-gui/Cargo.toml
+          sed -i "/^splitway = /s|\">= [^\"]*\"|\">= ${PKGVER}\"|" splitway-gui/Cargo.toml
+          grep -n "splitway (>=\|splitway = \">=" splitway-gui/Cargo.toml
+          # Anchor the asserts to the dependency lines too: the explanatory comment
+          # also contains "splitway (>= 0.0.5)", so an unanchored grep would pass on
+          # the prose for a release build (PKGVER=0.0.5) even if the sed silently
+          # missed the real line — defeating the fail-loud intent.
+          grep -q "^depends = .*splitway (>= ${PKGVER})" splitway-gui/Cargo.toml \
+            || { echo "ERROR: deb core-dep floor not stamped to ${PKGVER}"; exit 1; }
+          grep -q "^splitway = \">= ${PKGVER}\"" splitway-gui/Cargo.toml \
+            || { echo "ERROR: rpm core-dep floor not stamped to ${PKGVER}"; exit 1; }
+      - name: Package deb + rpm + tarball
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Native arch (runner matches matrix arch), so no --target: cargo-deb
+          # takes the host arch; cargo-generate-rpm's builtin auto-req reads the
+          # bullseye-built binary's symbol versions (correct 2.31 floor).
+          cargo deb --no-build --no-strip -p splitway-gui \
+            --deb-version "$PKGVER" \
+            -o "dist/splitway-gui_${PKGVER}_${{ matrix.arch }}.deb"
+          cargo generate-rpm -p splitway-gui \
+            --set-metadata "version = \"$PKGVER\"" \
+            -o "dist/splitway-gui-${PKGVER}.${{ matrix.rpmarch }}.rpm"
+          TARDIR="splitway-gui-${PKGVER}-linux-${{ matrix.arch }}"
+          mkdir -p "stage/$TARDIR"
+          cp target/release/splitway-gui \
+             packaging/desktop/io.github.stslex.splitway.desktop LICENSE "stage/$TARDIR/"
+          cp -r packaging/icons/hicolor "stage/$TARDIR/"
+          tar -C stage -czf "dist/${TARDIR}.tar.gz" "$TARDIR"
+          ls -la dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: pkg-gui-${{ matrix.arch }}
+          path: dist/*
+
+  # --- install the built artifacts directly (no repo, no signing) ------------
+  test-install:
+    needs: [build-core, build-gui]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:bookworm
+            kind: deb
+          - image: ubuntu:22.04
+            kind: deb
+          - image: fedora:latest
+            kind: rpm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: pkg-*-amd64
+          path: art
+          merge-multiple: true
+      - name: Install + smoke-test in ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD":/w -w /w -e KIND=${{ matrix.kind }} ${{ matrix.image }} \
+            bash -euxc '
+              if [ "$KIND" = deb ]; then
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update
+                apt-get install -y --no-install-recommends \
+                  ./art/splitway_*_amd64.deb ./art/splitway-gui_*_amd64.deb \
+                  systemd desktop-file-utils
+              else
+                dnf -y install ./art/splitway-*.x86_64.rpm ./art/splitway-gui-*.x86_64.rpm \
+                  systemd desktop-file-utils
+              fi
+              # binaries present + executable
+              command -v splitway
+              command -v splitway-daemon
+              command -v splitway-gui
+              splitway --help >/dev/null 2>&1 || splitway --version >/dev/null 2>&1 || true
+              # unit + drop-in installed and valid
+              test -f /usr/lib/systemd/system/splitway.service
+              test -f /etc/systemd/system/splitway.service.d/socket-group.conf
+              systemd-analyze verify /usr/lib/systemd/system/splitway.service || true
+              # the GUI created the empty opt-in group, no members
+              getent group splitway
+              [ -z "$(getent group splitway | cut -d: -f4)" ] || { echo "group not empty"; exit 1; }
+              # .desktop validates
+              desktop-file-validate /usr/share/applications/io.github.stslex.splitway.desktop
+              echo "INSTALL OK on ${{ matrix.image }}"
+            '
+
+  # --- signed-repo round trip with a THROWAWAY key (no production secret) -----
+  # Proves metadata + signing + verify + install end-to-end on every PR.
+  test-signed-repo:
+    needs: [build-core, build-gui]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: pkg-*-amd64
+          path: art
+          merge-multiple: true
+      - name: Install repo tooling
+        run: |
+          sudo apt-get update
+          # rpm is needed by build-dnf-repo.sh (rpm --addsign); ubuntu-latest
+          # currently pre-installs it, but install it explicitly so the dnf
+          # signing path does not depend on the runner image (matches publish).
+          sudo apt-get install -y --no-install-recommends apt-utils createrepo-c gnupg rpm
+      - name: Generate a throwaway signing key
+        run: |
+          set -euo pipefail
+          # RSA, not EdDSA: rpm's header signing (rpm --addsign) only produces a
+          # verifiable signature with an RSA key — an EdDSA key silently yields
+          # no RPMTAG_RSAHEADER (verified locally). The maintainer's real key
+          # (GPG_PRIVATE_KEY) must be RSA for the same reason.
+          cat > /tmp/keygen <<'EOF'
+          %no-protection
+          Key-Type: RSA
+          Key-Length: 3072
+          Key-Usage: sign
+          Name-Real: Splitway CI Throwaway
+          Name-Email: ci@example.com
+          Expire-Date: 0
+          %commit
+          EOF
+          gpg --batch --gen-key /tmp/keygen
+          KEYID=$(gpg --list-keys --with-colons ci@example.com | awk -F: '/^pub:/{print $5; exit}')
+          echo "KEYID=$KEYID" >> "$GITHUB_ENV"
+          gpg --export --armor "$KEYID" > /tmp/splitway.gpg
+      - name: Build signed apt + dnf repos from the artifacts
+        run: |
+          set -euo pipefail
+          # apt
+          mkdir -p repo/deb/pool/main
+          cp art/*.deb repo/deb/pool/main/
+          bash packaging/ci/build-apt-repo.sh repo/deb "$KEYID"
+          cp /tmp/splitway.gpg repo/splitway.gpg
+          # dnf
+          mkdir -p repo/rpm
+          cp art/*.rpm repo/rpm/
+          bash packaging/ci/build-dnf-repo.sh repo/rpm "$KEYID"
+      - name: Serve the repo on localhost
+        run: |
+          ( cd repo && python3 -m http.server 8080 >/tmp/http.log 2>&1 & )
+          sleep 2
+      - name: apt install over the signed repo (verification ON)
+        run: |
+          set -euo pipefail
+          docker run --rm --network host -v /tmp/splitway.gpg:/k.gpg:ro debian:bookworm \
+            bash -euxc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends ca-certificates gnupg
+              # Dearmor into the binary keyring apt expects at a .gpg path. The
+              # published key is ASCII-armored (rpm --import / pacman-key need that
+              # form); dearmoring here makes the apt keyring correct on EVERY apt
+              # version, instead of relying on modern apt accepting armored keys.
+              gpg --dearmor < /k.gpg > /usr/share/keyrings/splitway.gpg
+              echo "deb [signed-by=/usr/share/keyrings/splitway.gpg] http://localhost:8080/deb stable main" \
+                > /etc/apt/sources.list.d/splitway.list
+              apt-get update
+              # Install BOTH packages so the GUI header signature + its core-dep
+              # floor are exercised under signature enforcement too (not just core).
+              apt-get install -y splitway splitway-gui
+              command -v splitway-daemon
+              command -v splitway-gui
+              echo "SIGNED APT INSTALL OK"
+            '
+      - name: dnf install over the signed repo (verification ON)
+        run: |
+          set -euo pipefail
+          docker run --rm --network host -v /tmp/splitway.gpg:/k.gpg:ro fedora:latest \
+            bash -euxc '
+              rpm --import /k.gpg
+              cat > /etc/yum.repos.d/splitway.repo <<EOF
+          [splitway]
+          name=Splitway
+          baseurl=http://localhost:8080/rpm
+          enabled=1
+          gpgcheck=1
+          repo_gpgcheck=1
+          gpgkey=file:///k.gpg
+          EOF
+              # Install BOTH so the GUI rpm header signature + Requires are
+              # verified under gpgcheck/repo_gpgcheck too (not just the core rpm).
+              dnf -y install splitway splitway-gui
+              command -v splitway-daemon
+              command -v splitway-gui
+              echo "SIGNED DNF INSTALL OK"
+            '
+
+  # --- arm64 best-effort: install the arm64 artifacts under QEMU --------------
+  test-arm64-smoke:
+    needs: [build-core, build-gui]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: pkg-*-arm64
+          path: art
+          merge-multiple: true
+      - uses: docker/setup-qemu-action@v3
+      - name: Install arm64 deb under QEMU
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/arm64 -v "$PWD":/w -w /w debian:bookworm \
+            bash -euxc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends ./art/splitway_*_arm64.deb
+              command -v splitway-daemon
+              echo "ARM64 INSTALL OK"
+            '
+
+  # --- Arch: makepkg the source PKGBUILDs (x86_64) -----------------------------
+  # pacman has no dev channel (vercmp does not treat ~ as a pre-release marker),
+  # so Arch always uses the CLEAN version. Builds from THIS checkout (the release
+  # tag may not exist yet on dev/PR) by pre-placing the source archive makepkg
+  # expects.
+  build-arch:
+    needs: meta
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - name: Install build tooling
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel git rust namcap sudo \
+            libglvnd libxkbcommon libxkbcommon-x11 wayland libx11 libxcursor libxi libxrandr
+      - uses: actions/checkout@v5
+      - name: Set up a non-root build user (makepkg refuses root)
+        run: |
+          useradd -m builder
+          chown -R builder:builder .
+      - name: makepkg splitway + splitway-gui (local source, clean pkgver)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          sudo -u builder git config --global --add safe.directory "$PWD"
+          for pkg in splitway splitway-gui; do
+            # Build + publish the CURRENT version (VERSION = the clean daemon/meta
+            # version), not the committed pin. The committed pkgver intentionally
+            # lags to the last released tag so a user's `makepkg -si` from a
+            # checkout resolves an existing tag (see check-pkgver-sync.sh) — but
+            # the hosted pacman repo must ship VERSION, or a release push would
+            # publish under the previous version and Arch users never get the new
+            # one. Stamp VERSION into the EPHEMERAL PKGBUILD (never committed) and
+            # pre-place the matching <pkgname>-<VERSION>.tar.gz (top-level dir
+            # splitway-<VERSION>); keying the archive on the same VERSION is what
+            # makes makepkg build THIS checkout instead of fetching the tag.
+            sudo -u builder sed -i \
+              -e "s/^pkgver=.*/pkgver=$VERSION/" -e "s/^pkgrel=.*/pkgrel=1/" \
+              "packaging/aur/$pkg/PKGBUILD"
+            sudo -u builder git archive --format=tar.gz --prefix="splitway-$VERSION/" \
+              -o "packaging/aur/$pkg/$pkg-$VERSION.tar.gz" HEAD
+            ( cd "packaging/aur/$pkg" \
+              && sudo -u builder makepkg -f --noconfirm --nodeps --skipinteg \
+              && sudo -u builder bash -c 'makepkg --printsrcinfo > .SRCINFO' )
+            cp "packaging/aur/$pkg"/*.pkg.tar.zst dist/
+            # Advisory lint (dlopen'd GL libs make namcap noisy; do not gate).
+            namcap "packaging/aur/$pkg/PKGBUILD" || true
+            namcap "packaging/aur/$pkg"/*.pkg.tar.zst || true
+          done
+          ls -la dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: pkg-arch-x86_64
+          path: dist/*
+
+  # --- Arch: local install + ephemeral-key signed pacman repo (no secrets) -----
+  test-arch:
+    needs: build-arch
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          name: pkg-arch-x86_64
+          path: art
+      - name: Tooling
+        run: pacman -Syu --noconfirm --needed systemd python gnupg
+      - name: Local pacman -U install
+        run: |
+          set -euo pipefail
+          # Pull ALL of the GUI's declared runtime deps from the official repos,
+          # then install the built packages directly. `pacman -U` on local files
+          # only auto-resolves deps that exist in a synced repo DB, so the smoke
+          # must not lean on that — preinstall the full set the PKGBUILD declares
+          # (GL/X11/wayland libs + hicolor-icon-theme/desktop-file-utils for the
+          # .install icon-cache / desktop-database hooks), matching it exactly.
+          pacman -S --noconfirm --needed libglvnd libxkbcommon libxkbcommon-x11 wayland libx11 libxcursor libxi libxrandr \
+            hicolor-icon-theme desktop-file-utils
+          pacman -U --noconfirm art/*.pkg.tar.zst
+          command -v splitway-daemon
+          command -v splitway
+          command -v splitway-gui
+          test -f /usr/lib/systemd/system/splitway.service
+          # GUI scriptlet created the empty opt-in group
+          getent group splitway
+          [ -z "$(getent group splitway | cut -d: -f4)" ] || { echo "group not empty"; exit 1; }
+          pacman -R --noconfirm splitway-gui splitway
+      - name: Ephemeral-key signed pacman repo (verification ON)
+        run: |
+          set -euo pipefail
+          export GNUPGHOME; GNUPGHOME="$(mktemp -d)"; chmod 700 "$GNUPGHOME"
+          cat > "$GNUPGHOME/keygen" <<'EOF'
+          %no-protection
+          Key-Type: RSA
+          Key-Length: 3072
+          Key-Usage: sign
+          Name-Real: Splitway CI Throwaway
+          Name-Email: ci@example.com
+          Expire-Date: 0
+          %commit
+          EOF
+          gpg --batch --gen-key "$GNUPGHOME/keygen"
+          # The fingerprint lives in field 10 of an fpr: record (fields 2-9 are
+          # empty there); field 5 is the long key id and would leave FPR empty,
+          # breaking lsign/repo-add. Matches the publish-pages job below.
+          FPR=$(gpg --list-keys --with-colons ci@example.com | awk -F: '/^fpr:/{print $10; exit}')
+          gpg --export --armor "$FPR" > /tmp/key.gpg
+          # Build a signed local repo: detach-sign each package, then repo-add.
+          mkdir -p repo && cp art/*.pkg.tar.zst repo/
+          for p in repo/*.pkg.tar.zst; do
+            gpg --batch --yes --pinentry-mode loopback --default-key "$FPR" --detach-sign "$p"
+          done
+          ( cd repo && repo-add --sign --key "$FPR" splitway.db.tar.gz ./*.pkg.tar.zst )
+          ( cd repo && python -m http.server 8081 >/tmp/http.log 2>&1 & )
+          sleep 2
+          # Trust the throwaway key in pacman's keyring.
+          pacman-key --init
+          pacman-key --add /tmp/key.gpg
+          pacman-key --lsign-key "$FPR"
+          cat >> /etc/pacman.conf <<'EOF'
+
+          [splitway]
+          SigLevel = Required DatabaseOptional
+          Server = http://localhost:8081
+          EOF
+          # Install BOTH so the GUI package's detached signature is verified
+          # under SigLevel=Required too (the GL/X11 runtime deps were pulled in
+          # by the local-install step above and persist in this job's container).
+          pacman -Sy --noconfirm splitway splitway-gui
+          command -v splitway-daemon
+          command -v splitway-gui
+          echo "SIGNED PACMAN INSTALL OK"
+
+  # --- publish the signed apt/dnf repos to GitHub Pages (push-only, SECRETS) --
+  # Never runs on pull_request. Serialized via a single concurrency group so two
+  # near-simultaneous deploys queue instead of clobbering gh-pages. Drops into
+  # the correct channel pool and regenerates ONLY that channel's metadata —
+  # gh-pages is persistent state, MERGED not wiped, so old versions + the other
+  # channel survive.
+  publish-pages:
+    # test-arm64-smoke is intentionally NOT a gate: it is best-effort
+    # (continue-on-error under QEMU) and must not block a publish.
+    needs: [meta, build-core, build-gui, build-arch, test-install, test-signed-repo, test-arch]
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: pages-deploy
+      cancel-in-progress: false
+    env:
+      CHANNEL: ${{ needs.meta.outputs.channel }}
+      PKGVER: ${{ needs.meta.outputs.pkgver }}
+      BASE: https://stslex.github.io/splitway
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: pkg-*
+          path: art
+          merge-multiple: true
+      - name: Install repo tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils createrepo-c gnupg rpm
+      - name: Import signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          # GPG_PRIVATE_KEY must be an RSA key: rpm --addsign only signs with RSA
+          # (see the throwaway-key note in test-signed-repo).
+          GNUPGHOME="$(mktemp -d)"; chmod 700 "$GNUPGHOME"; export GNUPGHOME
+          echo "allow-loopback-pinentry" > "$GNUPGHOME/gpg-agent.conf"
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          FPR="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')"
+          PPF="$GNUPGHOME/passphrase"; printf '%s' "$GPG_PASSPHRASE" > "$PPF"; chmod 600 "$PPF"
+          gpg --batch --yes --armor --export "$FPR" > /tmp/splitway.gpg
+          # Hand these to the later steps (GNUPGHOME holds the imported secret key).
+          {
+            echo "GNUPGHOME=$GNUPGHOME"
+            echo "GPG_FPR=$FPR"
+            echo "SPLITWAY_GPG_PASSFILE=$PPF"
+          } >> "$GITHUB_ENV"
+      - name: Prepare gh-pages (clone, or bootstrap an orphan branch)
+        run: |
+          set -euo pipefail
+          REMOTE="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          if git ls-remote --exit-code --heads "$REMOTE" gh-pages >/dev/null 2>&1; then
+            git clone --branch gh-pages --depth 1 "$REMOTE" gh-pages
+          else
+            mkdir gh-pages
+            git -C gh-pages init -b gh-pages
+            git -C gh-pages remote add origin "$REMOTE"
+          fi
+      - name: Drop artifacts into the channel pool (merge, never wipe)
+        run: |
+          set -euo pipefail
+          mkdir -p "gh-pages/deb/$CHANNEL/pool/main" "gh-pages/rpm/$CHANNEL"
+          cp art/*.deb "gh-pages/deb/$CHANNEL/pool/main/"
+          cp art/*.rpm "gh-pages/rpm/$CHANNEL/"
+      - name: Regenerate + sign ONLY this channel's metadata
+        run: |
+          set -euo pipefail
+          bash packaging/ci/build-apt-repo.sh "gh-pages/deb/$CHANNEL" "$GPG_FPR"
+          bash packaging/ci/build-dnf-repo.sh "gh-pages/rpm/$CHANNEL" "$GPG_FPR"
+          cp /tmp/splitway.gpg gh-pages/splitway.gpg
+          bash packaging/ci/render-index.sh "$GPG_FPR" > gh-pages/index.html
+      - name: Publish the signed pacman repo (release channel only, x86_64)
+        if: ${{ needs.meta.outputs.channel == 'release' }}
+        run: |
+          set -euo pipefail
+          ARCHDIR="gh-pages/arch/release/x86_64"
+          mkdir -p "$ARCHDIR"
+          cp art/*.pkg.tar.zst "$ARCHDIR"/                 # merge: old packages persist
+          # Detach-sign each package with the real key (pacman SigLevel=Required).
+          for p in "$ARCHDIR"/*.pkg.tar.zst; do
+            rm -f "$p.sig"
+            gpg --batch --yes --pinentry-mode loopback --passphrase-file "$SPLITWAY_GPG_PASSFILE" \
+              --default-key "$GPG_FPR" --detach-sign "$p"
+          done
+          # repo-add is an Arch tool; run it in a container over the mounted dir.
+          # Incremental: it updates entries in place and keeps old packages.
+          docker run --rm -v "$PWD/$ARCHDIR":/repo -w /repo archlinux:latest \
+            bash -c 'repo-add splitway.db.tar.gz ./*.pkg.tar.zst'
+          sudo chown -R "$(id -u):$(id -g)" "$ARCHDIR"
+          # GitHub Pages does not serve symlinks; replace repo-add's db/files
+          # symlinks with real copies, and sign the DB (DatabaseOptional).
+          for n in db files; do
+            if [ -L "$ARCHDIR/splitway.$n" ]; then
+              rm -f "$ARCHDIR/splitway.$n"
+              cp "$ARCHDIR/splitway.$n.tar.gz" "$ARCHDIR/splitway.$n"
+            fi
+          done
+          rm -f "$ARCHDIR/splitway.db.tar.gz.sig"
+          gpg --batch --yes --pinentry-mode loopback --passphrase-file "$SPLITWAY_GPG_PASSFILE" \
+            --default-key "$GPG_FPR" --detach-sign "$ARCHDIR/splitway.db.tar.gz"
+          cp "$ARCHDIR/splitway.db.tar.gz.sig" "$ARCHDIR/splitway.db.sig"
+      - name: Verify all signatures BEFORE publishing (fail closed)
+        run: |
+          set -euo pipefail
+          # Hard gate before the gh-pages push: never publish metadata we cannot
+          # verify. Catches a misconfigured signing key (e.g. a non-RSA key, which
+          # clearsigns apt fine but yields NO rpm header signature) HERE, instead
+          # of after the broken channel is already live for users (the post-deploy
+          # smoke ran only after the push). Uses the imported key in $GNUPGHOME.
+          # apt: clearsigned InRelease + detached Release.gpg.
+          gpg --verify "gh-pages/deb/$CHANNEL/dists/stable/InRelease"
+          gpg --verify "gh-pages/deb/$CHANNEL/dists/stable/Release.gpg" \
+                       "gh-pages/deb/$CHANNEL/dists/stable/Release"
+          # dnf: detached repomd.xml.asc, and every rpm must carry an RSA header
+          # signature (proof rpm --addsign actually signed, not silently no-op'd).
+          # NOTE: %{RSAHEADER:pgpsig} is the rpm<=5 tag (ubuntu-latest ships rpm 4);
+          # rpm 6 renames it toward OPENPGP, so revisit this query if a future
+          # runner upgrade makes it return empty for a validly-signed package.
+          gpg --verify "gh-pages/rpm/$CHANNEL/repodata/repomd.xml.asc" \
+                       "gh-pages/rpm/$CHANNEL/repodata/repomd.xml"
+          for r in gh-pages/rpm/"$CHANNEL"/*.rpm; do
+            sig="$(rpm -qp --nosignature --qf '%{RSAHEADER:pgpsig}' "$r" 2>/dev/null || true)"
+            case "$sig" in
+              ""|"(none)") echo "ERROR: $r has no RSA header signature"; exit 1 ;;
+              *) echo "ok: $(basename "$r") signed ($sig)" ;;
+            esac
+          done
+          # pacman (release only): detached db + per-package signatures.
+          if [ "$CHANNEL" = release ]; then
+            ARCHDIR="gh-pages/arch/release/x86_64"
+            gpg --verify "$ARCHDIR/splitway.db.tar.gz.sig" "$ARCHDIR/splitway.db.tar.gz"
+            for p in "$ARCHDIR"/*.pkg.tar.zst; do
+              gpg --verify "$p.sig" "$p"
+            done
+          fi
+          echo "all signatures verified — safe to publish"
+      - name: Commit + push gh-pages
+        run: |
+          set -euo pipefail
+          cd gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no changes to publish"; exit 0
+          fi
+          git commit -m "publish: $CHANNEL $PKGVER"
+          git push origin HEAD:gh-pages
+      - name: Attach tarballs to the GitHub Release (release channel only)
+        if: ${{ needs.meta.outputs.channel == 'release' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.meta.outputs.version }}
+          name: v${{ needs.meta.outputs.version }}
+          files: art/*.tar.gz
+          fail_on_unmatched_files: true
+      - name: Post-deploy smoke (live repo, real key, verify ON)
+        run: |
+          set -euo pipefail
+          # GitHub Pages publishes asynchronously; wait until the just-uploaded
+          # package is live before testing the install.
+          #
+          # Non-fatal on timeout: the deploy already pushed and every signature
+          # was verified above (fail-closed), so a good publish must never be
+          # reported failed just because Pages has not finished propagating — most
+          # acutely on the FIRST (root-commit) gh-pages deploy, when Pages may not
+          # be enabled/built yet. Warn and exit 0 (skipping the install below).
+          url="$BASE/deb/$CHANNEL/pool/main/splitway_${PKGVER}_amd64.deb"
+          for i in $(seq 1 60); do
+            if curl -fsI "$url" >/dev/null 2>&1; then echo "live after ${i}0s"; break; fi
+            sleep 10
+            [ "$i" = 60 ] && { echo "::warning::package not live after 10m (GitHub Pages propagation/enablement?) — publish succeeded, skipping live install smoke"; exit 0; }
+          done
+          docker run --rm debian:bookworm bash -euxc "
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg
+            curl -fsSL $BASE/splitway.gpg | gpg --dearmor -o /usr/share/keyrings/splitway.gpg
+            echo 'deb [signed-by=/usr/share/keyrings/splitway.gpg] $BASE/deb/$CHANNEL stable main' \
+              > /etc/apt/sources.list.d/splitway.list
+            apt-get update && apt-get install -y splitway
+            command -v splitway-daemon
+            echo LIVE_APT_OK
+          "
+          docker run --rm fedora:latest bash -euxc "
+            rpm --import $BASE/splitway.gpg
+            cat > /etc/yum.repos.d/splitway.repo <<EOF
+          [splitway]
+          name=Splitway
+          baseurl=$BASE/rpm/$CHANNEL
+          enabled=1
+          gpgcheck=1
+          repo_gpgcheck=1
+          gpgkey=$BASE/splitway.gpg
+          EOF
+            dnf -y install splitway
+            command -v splitway-daemon
+            echo LIVE_DNF_OK
+          "
+      - name: Post-deploy pacman smoke (release channel only)
+        if: ${{ needs.meta.outputs.channel == 'release' }}
+        run: |
+          set -euo pipefail
+          # Non-fatal on timeout, same rationale as the apt/dnf smoke above.
+          for i in $(seq 1 60); do
+            if curl -fsI "$BASE/arch/release/x86_64/splitway.db" >/dev/null 2>&1; then break; fi
+            sleep 10
+            [ "$i" = 60 ] && { echo "::warning::pacman repo not live after 10m (GitHub Pages propagation/enablement?) — publish succeeded, skipping live pacman smoke"; exit 0; }
+          done
+          docker run --rm -e BASE="$BASE" -e FPR="$GPG_FPR" archlinux:latest bash -euxc '
+            pacman -Sy --noconfirm
+            curl -fsSL "$BASE/splitway.gpg" -o /tmp/key.gpg
+            pacman-key --init
+            pacman-key --add /tmp/key.gpg
+            pacman-key --lsign-key "$FPR"
+            printf "\n[splitway]\nSigLevel = Required DatabaseOptional\nServer = %s/arch/release/x86_64\n" "$BASE" >> /etc/pacman.conf
+            pacman -Sy --noconfirm splitway
+            command -v splitway-daemon
+            echo LIVE_PACMAN_OK
+          '

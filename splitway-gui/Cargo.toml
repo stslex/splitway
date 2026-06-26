@@ -2,6 +2,8 @@
 name = "splitway-gui"
 version = "0.0.1"
 edition = "2021"
+license = "MIT"
+description = "Splitway interim egui GUI — a privilege-free IPC client over the daemon socket"
 
 [[bin]]
 name = "splitway-gui"
@@ -28,3 +30,188 @@ eframe = { version = "0.34", default-features = false, features = [
 rfd = "0.15"
 log = "0.4.20"
 env_logger = "0.11"
+
+# ---------------------------------------------------------------------------
+# Distribution packaging — the `splitway-gui` desktop package (egui, glibc).
+#
+# A SEPARATE package from the core `splitway` (splitway-daemon/Cargo.toml): it
+# Depends on it (`>=`, not `=`, to survive Pages-mirror skew + partial
+# upgrades), ships the egui binary + the .desktop + the hicolor icons, and
+# carries the socket-group opt-in plumbing (an EMPTY `splitway` group + a
+# service drop-in) via its maintainer scripts. Unlike the musl-static core,
+# the GUI is a dynamic glibc binary built against a low baseline
+# (debian:bullseye / ubuntu:20.04, glibc 2.31). See
+# docs/design/linux-distro-packaging.md.
+#
+# Path skew is intentional (verified with cargo-deb 3.7.0 /
+# cargo-generate-rpm 0.21.0): cargo-deb resolves non-`target/` paths relative
+# to THIS crate's dir (so `../`), cargo-generate-rpm relative to the workspace
+# root (bare). The `splitway (>= 0.0.5)` floor is rewritten by CI to the
+# exact built version for dev channels (so `0.0.5~dev...` core satisfies it).
+# ---------------------------------------------------------------------------
+
+[package.metadata.deb]
+name = "splitway-gui"
+maintainer = "stslex <ilya977.077@gmail.com>"
+copyright = "2026, stslex"
+license-file = ["../LICENSE", "0"]
+section = "net"
+priority = "optional"
+extended-description = """\
+The Splitway desktop GUI: a privilege-free egui front-end that drives the \
+splitway daemon over its control socket. Installing it adds an opt-in \
+`splitway` group + a systemd drop-in so an in-group user can control split-DNS \
+without sudo; the group starts empty, so the default posture is unchanged \
+until you run `usermod -aG splitway <user>`. Requires the splitway package."""
+# Hardcoded eframe/glow runtime libs (Debian names) rather than cargo-deb's
+# `$auto`. Two reasons: (1) $auto (dpkg-shlibdeps) needs the TARGET-arch libs
+# present, which is fragile for the arm64 cross build; (2) winit/glow dlopen
+# the windowing libs (libGL + libEGL, X11, wayland-client + wayland-egl,
+# xkbcommon + xkbcommon-x11) at runtime, so they are NOT in the ELF's DT_NEEDED
+# and $auto/shlibdeps would MISS them entirely (verified: the rpm's ELF-based
+# auto-req captured libc/libgcc but none of the GL/X11/wayland libs). libegl1 is
+# a SEPARATE dep from libgl1 because glow/glutin creates its GL context via EGL on
+# Wayland (GLX on X11), and libgl1 does NOT pull libegl1 — without it a
+# Wayland-only install succeeds and then fails at GL-context creation.
+# libwayland-egl1 (libwayland-egl.so.1, wl_egl_window_*) is SEPARATE again from
+# libwayland-client0: glutin's Wayland EGL platform binds the GL surface to the
+# wl_surface through it, and libwayland-client0 does NOT pull it — without it a
+# Wayland install likewise passes `command -v` smoke tests and then fails at
+# GL-context creation (verified: the binary dlopens libwayland-egl.so.1).
+# libxkbcommon-x11-0 is likewise SEPARATE from libxkbcommon0: winit's default
+# `x11` feature has xkbcommon-dl dlopen libxkbcommon-x11.so, which an X11 session
+# needs and libxkbcommon0 does not pull. `libc6 (>= 2.31)` pins the documented
+# glibc floor (debian:bullseye / ubuntu:20.04). The `>=` core dep is the real
+# IPC contract. `passwd` provides groupadd/groupdel, which the maintainer scripts
+# use to create/remove the opt-in `splitway` group (shadow-utils on rpm) — present
+# on normal systems but declared so a minimal image's postinst can't fail and
+# leave the socket-group drop-in with no group.
+depends = "splitway (>= 0.0.5), libc6 (>= 2.31), libgl1, libegl1, libx11-6, libxcursor1, libxi6, libxrandr2, libwayland-client0, libwayland-egl1, libxkbcommon0, libxkbcommon-x11-0, passwd"
+# rfd uses the XDG desktop portal for its file dialog here (no GTK linked); the
+# dialog silently no-ops without a running portal + backend, hence Recommends.
+recommends = "xdg-desktop-portal, xdg-desktop-portal-gtk | xdg-desktop-portal-wlr | xdg-desktop-portal-kde"
+maintainer-scripts = "../packaging/gui-maintainer-scripts"
+assets = [
+    ["target/release/splitway-gui", "usr/bin/", "755"],
+    ["../packaging/desktop/io.github.stslex.splitway.desktop", "usr/share/applications/io.github.stslex.splitway.desktop", "644"],
+    ["../packaging/gui/socket-group.conf", "usr/share/splitway/socket-group.conf", "644"],
+    ["../packaging/icons/hicolor/scalable/apps/io.github.stslex.splitway.svg", "usr/share/icons/hicolor/scalable/apps/io.github.stslex.splitway.svg", "644"],
+    ["../packaging/icons/hicolor/16x16/apps/io.github.stslex.splitway.png", "usr/share/icons/hicolor/16x16/apps/io.github.stslex.splitway.png", "644"],
+    ["../packaging/icons/hicolor/24x24/apps/io.github.stslex.splitway.png", "usr/share/icons/hicolor/24x24/apps/io.github.stslex.splitway.png", "644"],
+    ["../packaging/icons/hicolor/32x32/apps/io.github.stslex.splitway.png", "usr/share/icons/hicolor/32x32/apps/io.github.stslex.splitway.png", "644"],
+    ["../packaging/icons/hicolor/48x48/apps/io.github.stslex.splitway.png", "usr/share/icons/hicolor/48x48/apps/io.github.stslex.splitway.png", "644"],
+    ["../packaging/icons/hicolor/64x64/apps/io.github.stslex.splitway.png", "usr/share/icons/hicolor/64x64/apps/io.github.stslex.splitway.png", "644"],
+    ["../packaging/icons/hicolor/128x128/apps/io.github.stslex.splitway.png", "usr/share/icons/hicolor/128x128/apps/io.github.stslex.splitway.png", "644"],
+    ["../packaging/icons/hicolor/256x256/apps/io.github.stslex.splitway.png", "usr/share/icons/hicolor/256x256/apps/io.github.stslex.splitway.png", "644"],
+    ["../packaging/icons/hicolor/512x512/apps/io.github.stslex.splitway.png", "usr/share/icons/hicolor/512x512/apps/io.github.stslex.splitway.png", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "splitway-gui"
+summary = "Splitway desktop GUI (egui front-end over the daemon socket)"
+# Builtin ELF parse derives the libc/libgcc/libm soname Requires (and so pins
+# the glibc floor) directly from the binary — host- and arch-independent, and
+# correct as long as the binary is built on the low baseline. NOTE: winit/glow
+# dlopen the GL/X11/wayland libs at runtime, so they are NOT in DT_NEEDED and
+# auto-req CANNOT see them (verified) — those are listed explicitly in the
+# [requires] table below, exactly like the deb's hardcoded Depends.
+auto-req = "builtin"
+# socket-group plumbing (mirrors the deb maintainer scripts). $1: %post
+# 1=install 2=upgrade; %postun 0=erase 1=upgrade. Literal ''' string so the
+# shell `$`/heredoc pass through untouched.
+post_install_script = '''
+getent group splitway >/dev/null 2>&1 || groupadd --system splitway
+install -d -m 0755 /etc/systemd/system/splitway.service.d
+install -m 0644 /usr/share/splitway/socket-group.conf /etc/systemd/system/splitway.service.d/socket-group.conf
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || :
+    systemctl try-restart splitway.service >/dev/null 2>&1 || :
+fi
+command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q /usr/share/applications || :
+command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor || :
+if [ "$1" = 1 ]; then
+cat <<'EOM'
+
+  ==========================================================================
+   splitway-gui installed. The daemon socket is still ROOT-ONLY. To drive it
+   without sudo, join the (empty) splitway group and re-login:
+
+       sudo usermod -aG splitway "$USER"
+
+   Until a user is added the group is empty and the posture is identical to
+   0600 root-only. Group membership == control of system split-DNS.
+  ==========================================================================
+
+EOM
+fi
+'''
+post_uninstall_script = '''
+if [ "$1" = 0 ]; then
+    rm -f /etc/systemd/system/splitway.service.d/socket-group.conf
+    rmdir --ignore-fail-on-non-empty /etc/systemd/system/splitway.service.d 2>/dev/null || :
+    if getent group splitway >/dev/null 2>&1 && [ -z "$(getent group splitway | awk -F: '{print $4}')" ]; then
+        groupdel splitway >/dev/null 2>&1 || :
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || :
+        systemctl try-restart splitway.service >/dev/null 2>&1 || :
+    fi
+    command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q /usr/share/applications || :
+    command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor || :
+fi
+'''
+assets = [
+    { source = "target/release/splitway-gui", dest = "/usr/bin/splitway-gui", mode = "755" },
+    { source = "packaging/desktop/io.github.stslex.splitway.desktop", dest = "/usr/share/applications/io.github.stslex.splitway.desktop", mode = "644" },
+    { source = "packaging/gui/socket-group.conf", dest = "/usr/share/splitway/socket-group.conf", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/splitway-gui/LICENSE", mode = "644", doc = true },
+    { source = "packaging/icons/hicolor/scalable/apps/io.github.stslex.splitway.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.stslex.splitway.svg", mode = "644" },
+    { source = "packaging/icons/hicolor/16x16/apps/io.github.stslex.splitway.png", dest = "/usr/share/icons/hicolor/16x16/apps/io.github.stslex.splitway.png", mode = "644" },
+    { source = "packaging/icons/hicolor/24x24/apps/io.github.stslex.splitway.png", dest = "/usr/share/icons/hicolor/24x24/apps/io.github.stslex.splitway.png", mode = "644" },
+    { source = "packaging/icons/hicolor/32x32/apps/io.github.stslex.splitway.png", dest = "/usr/share/icons/hicolor/32x32/apps/io.github.stslex.splitway.png", mode = "644" },
+    { source = "packaging/icons/hicolor/48x48/apps/io.github.stslex.splitway.png", dest = "/usr/share/icons/hicolor/48x48/apps/io.github.stslex.splitway.png", mode = "644" },
+    { source = "packaging/icons/hicolor/64x64/apps/io.github.stslex.splitway.png", dest = "/usr/share/icons/hicolor/64x64/apps/io.github.stslex.splitway.png", mode = "644" },
+    { source = "packaging/icons/hicolor/128x128/apps/io.github.stslex.splitway.png", dest = "/usr/share/icons/hicolor/128x128/apps/io.github.stslex.splitway.png", mode = "644" },
+    { source = "packaging/icons/hicolor/256x256/apps/io.github.stslex.splitway.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.stslex.splitway.png", mode = "644" },
+    { source = "packaging/icons/hicolor/512x512/apps/io.github.stslex.splitway.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.github.stslex.splitway.png", mode = "644" },
+]
+
+# Core package dep (the real compat contract) + the dlopen'd eframe/glow
+# runtime libs that auto-req cannot detect (Fedora package names; mesa-libGL /
+# mesa-libEGL pull working GL/EGL via libglvnd — glow/glutin uses EGL on
+# Wayland, GLX on X11, and mesa-libGL alone does not pull the EGL loader).
+# libwayland-egl (libwayland-egl.so.1) is a separate Fedora package from
+# libwayland-client — glutin's Wayland EGL platform loads it for wl_egl_window,
+# and libwayland-client does not pull it.
+# libxkbcommon-x11 is a separate Fedora package from libxkbcommon — winit's x11
+# feature dlopens libxkbcommon-x11.so. rfd's file dialog needs an XDG portal +
+# backend (Recommends below).
+[package.metadata.generate-rpm.requires]
+splitway = ">= 0.0.5"
+mesa-libGL = "*"
+mesa-libEGL = "*"
+libX11 = "*"
+libXcursor = "*"
+libXi = "*"
+libXrandr = "*"
+libwayland-client = "*"
+libwayland-egl = "*"
+libxkbcommon = "*"
+libxkbcommon-x11 = "*"
+# shadow-utils provides groupadd/groupdel, which the %post/%postun scriptlets use
+# to create/remove the opt-in `splitway` group. It is present on normal
+# Fedora/RHEL but NOT guaranteed on minimal images — without it %post fails
+# (non-fatally), leaving the socket-group drop-in but no group, so the daemon
+# then exits on `--socket-group splitway`. (deb parity: the `passwd` Depends.)
+shadow-utils = "*"
+
+[package.metadata.generate-rpm.recommends]
+xdg-desktop-portal = "*"
+# Asymmetry vs the deb Recommends (which offers gtk | wlr | kde): a cargo-generate-rpm
+# `key = "*"` table has no boolean-OR, so we name the GTK portal — it works on most
+# desktops (rfd links no GTK; it speaks the portal over D-Bus). On a native KDE/wlroots
+# host this only *nudges* GTK (a weak dep); the native backend, if installed, is used.
+# A passthrough rpm rich-dep — `"(xdg-desktop-portal-gtk or xdg-desktop-portal-kde or
+# xdg-desktop-portal-wlr)" = "*"` — would mirror the deb, but is left out until verified
+# to emit correctly through cargo-generate-rpm (it would only surface at rpm-build time).
+xdg-desktop-portal-gtk = "*"

@@ -1,0 +1,5 @@
+# cargo-deb requires a maintainer-scripts directory to exist for its
+# systemd-units integration to GENERATE the postinst/postrm enable/start/
+# restart/stop scriptlets (dh_installsystemd style). This directory is
+# intentionally otherwise empty: cargo-deb writes the scripts from scratch.
+# (.gitkeep tracks the dir; cargo-deb ignores all but the known script names.)

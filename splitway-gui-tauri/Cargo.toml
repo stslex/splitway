@@ -2,6 +2,7 @@
 name = "splitway-gui-tauri"
 version = "0.0.1"
 edition = "2021"
+license = "MIT"
 description = "Tauri desktop shell for Splitway — a thin, read-only renderer of splitway-gui-core's view-model."
 
 # Deliberately excluded from the workspace `default-members` (see the root
