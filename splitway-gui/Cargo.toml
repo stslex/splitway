@@ -82,8 +82,11 @@ until you run `usermod -aG splitway <user>`. Requires the splitway package."""
 # `x11` feature has xkbcommon-dl dlopen libxkbcommon-x11.so, which an X11 session
 # needs and libxkbcommon0 does not pull. `libc6 (>= 2.31)` pins the documented
 # glibc floor (debian:bullseye / ubuntu:20.04). The `>=` core dep is the real
-# IPC contract.
-depends = "splitway (>= 0.0.5), libc6 (>= 2.31), libgl1, libegl1, libx11-6, libxcursor1, libxi6, libxrandr2, libwayland-client0, libwayland-egl1, libxkbcommon0, libxkbcommon-x11-0"
+# IPC contract. `passwd` provides groupadd/groupdel, which the maintainer scripts
+# use to create/remove the opt-in `splitway` group (shadow-utils on rpm) — present
+# on normal systems but declared so a minimal image's postinst can't fail and
+# leave the socket-group drop-in with no group.
+depends = "splitway (>= 0.0.5), libc6 (>= 2.31), libgl1, libegl1, libx11-6, libxcursor1, libxi6, libxrandr2, libwayland-client0, libwayland-egl1, libxkbcommon0, libxkbcommon-x11-0, passwd"
 # rfd uses the XDG desktop portal for its file dialog here (no GTK linked); the
 # dialog silently no-ops without a running portal + backend, hence Recommends.
 recommends = "xdg-desktop-portal, xdg-desktop-portal-gtk | xdg-desktop-portal-wlr | xdg-desktop-portal-kde"
@@ -195,6 +198,12 @@ libwayland-client = "*"
 libwayland-egl = "*"
 libxkbcommon = "*"
 libxkbcommon-x11 = "*"
+# shadow-utils provides groupadd/groupdel, which the %post/%postun scriptlets use
+# to create/remove the opt-in `splitway` group. It is present on normal
+# Fedora/RHEL but NOT guaranteed on minimal images — without it %post fails
+# (non-fatally), leaving the socket-group drop-in but no group, so the daemon
+# then exits on `--socket-group splitway`. (deb parity: the `passwd` Depends.)
+shadow-utils = "*"
 
 [package.metadata.generate-rpm.recommends]
 xdg-desktop-portal = "*"
