@@ -48,7 +48,10 @@ author's iteration channel.
    `splitway` group and installs a service drop-in enabling `--socket-group`.
    Empty group ⇒ posture identical to `0600 root` (a no-op). The only grant is
    a human running `usermod -aG splitway $USER` + re-login. Maintainer scripts
-   **never** add a user. Mirrors `nix/tests/socket-group.nix`.
+   **never** add a user. Mirrors `nix/tests/socket-group.nix`. The scriptlets use
+   `groupadd`/`groupdel`, so the GUI package depends on their provider — `passwd`
+   (deb) / `shadow-utils` (rpm) — which a minimal image may lack; without it the
+   group is never created and the daemon would fail on `--socket-group splitway`.
 
 ## Channel & version topology
 
