@@ -81,22 +81,28 @@ cargo-generate-rpm's ELF-based `auto-req` can see them — they **must be
 hardcoded**:
 
 - Debian: `libgl1, libegl1, libx11-6, libxcursor1, libxi6, libxrandr2,
-  libwayland-client0, libxkbcommon0, libxkbcommon-x11-0`, plus `libc6 (>= 2.31)`
-  to pin the floor.
+  libwayland-client0, libwayland-egl1, libxkbcommon0, libxkbcommon-x11-0`, plus
+  `libc6 (>= 2.31)` to pin the floor.
 - Fedora: `mesa-libGL, mesa-libEGL, libX11, libXcursor, libXi, libXrandr,
-  libwayland-client, libxkbcommon, libxkbcommon-x11` (auto-req still derives the
-  glibc/libgcc floor from the linked-against sonames).
+  libwayland-client, libwayland-egl, libxkbcommon, libxkbcommon-x11` (auto-req
+  still derives the glibc/libgcc floor from the linked-against sonames).
 - Arch: `libglvnd libxkbcommon libxkbcommon-x11 wayland libx11 libxcursor libxi
-  libxrandr` (`libglvnd` provides both GL and EGL).
+  libxrandr` (`libglvnd` provides both GL and EGL; the `wayland` package already
+  ships `libwayland-egl.so.1` alongside `libwayland-client`).
 
 `libegl1`/`mesa-libEGL` is listed **separately** from GL: glow/glutin creates its
 GL context via EGL on Wayland (GLX on X11), and the GL package does not pull EGL —
-without it a Wayland-only install fails at context creation. `libxkbcommon-x11`
-is likewise separate from `libxkbcommon0`: winit's `x11` feature `dlopen`s
-`libxkbcommon-x11.so`, which the base xkbcommon package does not pull. Keep these
-windowing-lib lists in sync with the GUI manifest `depends` / `[requires]` and
-the Arch PKGBUILD `depends` (whose `depends` additionally carry the
-`hicolor-icon-theme` / `desktop-file-utils` install-hook deps, out of scope here).
+without it a Wayland-only install fails at context creation. `libwayland-egl1`/
+`libwayland-egl` (`libwayland-egl.so.1`) is **separate again** from
+`libwayland-client0`: glutin's Wayland EGL platform binds the GL surface to the
+`wl_surface` through it (`wl_egl_window_*`), and the client lib does not pull it —
+without it a Wayland install passes the `command -v` smoke tests and then fails
+at GL-context creation. `libxkbcommon-x11` is likewise separate from
+`libxkbcommon0`: winit's `x11` feature `dlopen`s `libxkbcommon-x11.so`, which the
+base xkbcommon package does not pull. Keep these windowing-lib lists in sync with
+the GUI manifest `depends` / `[requires]` and the Arch PKGBUILD `depends` (whose
+`depends` additionally carry the `hicolor-icon-theme` / `desktop-file-utils`
+install-hook deps, out of scope here).
 
 `xdg-desktop-portal` + a backend (`-gtk`/`-wlr`/`-kde`) is `Recommends`: rfd's
 file dialog uses the portal here (no GTK linked) and **silently no-ops** without
