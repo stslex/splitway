@@ -10,9 +10,10 @@
 #
 # Release channel: push to master -> clean <X.Y.Z>.
 # Dev channel: everything else (push to dev, pull_request, workflow_dispatch) ->
-#   <X.Y.Z>~dev.<utcYYYYmmddHHMMSS>.<shortsha>. The `~dev` suffix sorts BELOW
-# the clean release in both dpkg and rpm (>=4.10), so a tester with both repos
-# enabled upgrades dev -> release cleanly.
+#   <X.Y.Z>~dev.<utcYYYYmmddHHMMSS>.<runNumber>.<shortsha>. The `~dev` suffix
+# sorts BELOW the clean release in both dpkg and rpm (>=4.10), so a tester with
+# both repos enabled upgrades dev -> release cleanly. <runNumber> keeps two
+# same-second builds monotonically ordered (see below).
 set -euo pipefail
 
 event="${1:?usage: compute-version.sh <event_name> <ref>}"
@@ -29,7 +30,12 @@ if [ "$event" = "push" ] && [ "$ref" = "refs/heads/master" ]; then
 else
     utc="$(date -u +%Y%m%d%H%M%S)"
     sha="$(git rev-parse --short HEAD)"
-    pkgver="${version}~dev.${utc}.${sha}"
+    # GITHUB_RUN_NUMBER increments per run, so two pushes that land in the same
+    # UTC second still order monotonically — without it dpkg/rpm fall back to
+    # comparing the short sha lexically, which is NOT monotonic with commit order
+    # and can pick the wrong "newest" build. Defaults to 0 outside Actions.
+    run="${GITHUB_RUN_NUMBER:-0}"
+    pkgver="${version}~dev.${utc}.${run}.${sha}"
     channel="dev"
 fi
 

@@ -18,10 +18,20 @@ KEY="${2:-}"
 
 [ -d "$ROOT" ] || { echo "error: $ROOT does not exist" >&2; exit 1; }
 
-# Optional passphrase file for the real (passphrase-protected) key; unset for
-# the ephemeral CI key.
-PASS_OPT=""
-[ -n "${SPLITWAY_GPG_PASSFILE:-}" ] && PASS_OPT="--passphrase-file ${SPLITWAY_GPG_PASSFILE}"
+# Optional passphrase for the real (passphrase-protected) key; unset for the
+# ephemeral CI key. Two forms for the two call sites:
+#   * pass_opt[]  — array for the direct gpg invocation below, robust to a path
+#                   with spaces (mirrors the gpg_sign array in build-apt-repo.sh).
+#   * pass_macro  — plain string for the rpm __gpg_sign_cmd macro: rpm tokenizes
+#                   the expanded macro itself (no bash array possible), so this
+#                   keeps the proven string form. The passphrase FILE path is
+#                   mktemp-derived ($GNUPGHOME/passphrase) and never has spaces.
+pass_opt=()
+pass_macro=""
+if [ -n "${SPLITWAY_GPG_PASSFILE:-}" ]; then
+    pass_opt=(--passphrase-file "$SPLITWAY_GPG_PASSFILE")
+    pass_macro="--passphrase-file ${SPLITWAY_GPG_PASSFILE}"
+fi
 
 if [ -n "$KEY" ]; then
     # Header-sign every rpm in place (idempotent; re-signing is harmless).
@@ -32,7 +42,7 @@ if [ -n "$KEY" ]; then
     if [ ${#rpms[@]} -gt 0 ]; then
         rpm \
             --define "_gpg_name $KEY" \
-            --define "__gpg_sign_cmd %{__gpg} gpg --batch --no-armor ${PASS_OPT} --pinentry-mode loopback --no-secmem-warning -u %{_gpg_name} -sbo %{__signature_filename} %{__plaintext_filename}" \
+            --define "__gpg_sign_cmd %{__gpg} gpg --batch --no-armor ${pass_macro} --pinentry-mode loopback --no-secmem-warning -u %{_gpg_name} -sbo %{__signature_filename} %{__plaintext_filename}" \
             --addsign "${rpms[@]}"
     fi
 fi
@@ -42,8 +52,7 @@ createrepo_c --update "$ROOT"
 
 if [ -n "$KEY" ]; then
     rm -f "$ROOT/repodata/repomd.xml.asc"
-    # shellcheck disable=SC2086  # PASS_OPT is intentionally word-split (0 or 2 args)
-    gpg --batch --yes --pinentry-mode loopback $PASS_OPT --default-key "$KEY" \
+    gpg --batch --yes --pinentry-mode loopback "${pass_opt[@]}" --default-key "$KEY" \
         --detach-sign --armor "$ROOT/repodata/repomd.xml"
     echo "dnf repo signed with key $KEY -> $ROOT/repodata/{repomd.xml,repomd.xml.asc}"
 else
