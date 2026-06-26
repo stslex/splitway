@@ -113,6 +113,29 @@ Description: Splitway interim egui GUI — a privilege-free IPC client over the 
  without sudo; the group starts empty, so the default posture is unchanged until
  you run `usermod -aG splitway <user>`. Requires the splitway package.
 
+Package: splitway-gui
+Architecture: arm64
+Version: 0.0.6~dev.20260626111028.20.d363052
+Priority: optional
+Section: net
+Maintainer: stslex <ilya977.077@gmail.com>
+Installed-Size: 15840
+Depends: libc6 (>= 2.31), libegl1, libgl1, libwayland-client0, libwayland-egl1, libx11-6, libxcursor1, libxi6, libxkbcommon-x11-0, libxkbcommon0, libxrandr2, splitway (>= 0.0.6~dev.20260626111028.20.d363052)
+Recommends: xdg-desktop-portal, xdg-desktop-portal-gtk | xdg-desktop-portal-wlr | xdg-desktop-portal-kde
+Filename: pool/main/splitway-gui_0.0.6~dev.20260626111028.20.d363052_arm64.deb
+Size: 4092108
+MD5sum: 7e3f9c465607475787b52d75ce7c6260
+SHA1: 4863823a819d29710508cd8aa1a2f41b10a193a7
+SHA256: e4ecfa6fe15df62bdd77a715b1b2f948c1dbec5f827a400110aee35b4d1a6f16
+SHA512: f199e1e7596fea4ea3283700fe3308e7e52b44328e786270125ee871101a2c2d80d7c30a2b0d733e4bf58bef4ff8270c0b8ed495a73fb3fc561ad8b20988769e
+Description: Splitway interim egui GUI — a privilege-free IPC client over the daemon
+ socket
+ The Splitway desktop GUI: a privilege-free egui front-end that drives the
+ splitway daemon over its control socket. Installing it adds an opt-in
+ `splitway` group + a systemd drop-in so an in-group user can control split-DNS
+ without sudo; the group starts empty, so the default posture is unchanged until
+ you run `usermod -aG splitway <user>`. Requires the splitway package.
+
 Package: splitway
 Architecture: arm64
 Version: 0.0.5~dev.20260625220053.b210631
@@ -224,6 +247,30 @@ MD5sum: e89de3faf5ee262d1bbcd0b051cc1553
 SHA1: 69ffd3d0ae91b78e1f23b7a3391c7230523b0afe
 SHA256: 87a674490a573510414028aca8170ce0741dd31fad044f5c565bb799a1b86955
 SHA512: 265689c8513f7ee8d532a1bc85aa181b06c9cf34f987e312381e10d2f1aedbcfd2a9a9e978ec82257ea927af0e7fd80b8205d81b1316223711ad391ab007df3c
+Description: Domain-based split-DNS daemon: route selected domains through the VPN's DNS,
+ everything else direct
+ Splitway routes selected domains through the VPN's DNS while everything else
+ resolves directly. The root daemon detects the VPN (NetworkManager or a
+ standalone OpenVPN management interface) and applies/reverts split-DNS rules
+ via systemd-resolved; the splitway CLI drives it over a 0600 Unix socket. This
+ package contains the daemon, the CLI, and the systemd service. Install
+ splitway-gui for the desktop GUI.
+
+Package: splitway
+Architecture: arm64
+Version: 0.0.6~dev.20260626111028.20.d363052
+Priority: optional
+Section: net
+Maintainer: stslex <ilya977.077@gmail.com>
+Installed-Size: 7728
+Depends:
+Recommends: network-manager, systemd-resolved
+Filename: pool/main/splitway_0.0.6~dev.20260626111028.20.d363052_arm64.deb
+Size: 1813936
+MD5sum: 7ff7fcacafe8c4ca41da8d95c217edc5
+SHA1: 95304fc498e4005b062a1fa6e2c39b342a249e09
+SHA256: 4dda0566ac42c34aee0e449c76a1c24af3cd85660ca651ff0b9410c9d7c4f1d6
+SHA512: a3674932e25fd40ee74d4b0ecc1b88965691a976e3b5b07b2f3f5c6af5b2d59c5ad3df5f234ec24acd7057e6689a24b5a79b84acfb9991517760ce6d497946b4
 Description: Domain-based split-DNS daemon: route selected domains through the VPN's DNS,
  everything else direct
  Splitway routes selected domains through the VPN's DNS while everything else
