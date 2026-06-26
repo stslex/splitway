@@ -55,8 +55,8 @@ author's iteration channel.
 | Trigger            | Channel | Version              | Publishes to |
 |--------------------|---------|----------------------|--------------|
 | push → `master`    | release | `<X.Y.Z>`            | `deb/release`, `rpm/release`, `arch/release/x86_64`, GitHub Release (tarballs) |
-| push → `dev`       | dev     | `<X.Y.Z>~dev.<utc>.<sha>` | `deb/dev`, `rpm/dev` |
-| pull_request       | —       | `<X.Y.Z>~dev.<utc>.<sha>` | nothing (build + test only) |
+| push → `dev`       | dev     | `<X.Y.Z>~dev.<utc>.<run>.<sha>` | `deb/dev`, `rpm/dev` |
+| pull_request       | —       | `<X.Y.Z>~dev.<utc>.<run>.<sha>` | nothing (build + test only) |
 
 `~dev` sorts **below** the clean release in dpkg and rpm (≥4.10), so a tester
 with both repos enabled upgrades dev → release cleanly.
@@ -80,12 +80,23 @@ windowing libraries at runtime**, so they are absent from the binary's ELF
 cargo-generate-rpm's ELF-based `auto-req` can see them — they **must be
 hardcoded**:
 
-- Debian: `libgl1, libx11-6, libxcursor1, libxi6, libxrandr2,
-  libwayland-client0, libxkbcommon0`, plus `libc6 (>= 2.31)` to pin the floor.
-- Fedora: `mesa-libGL, libX11, libXcursor, libXi, libXrandr, libwayland-client,
-  libxkbcommon` (auto-req still derives the glibc/libgcc floor from the
-  linked-against sonames).
-- Arch: `libglvnd libxkbcommon wayland libx11 libxcursor libxi libxrandr`.
+- Debian: `libgl1, libegl1, libx11-6, libxcursor1, libxi6, libxrandr2,
+  libwayland-client0, libxkbcommon0, libxkbcommon-x11-0`, plus `libc6 (>= 2.31)`
+  to pin the floor.
+- Fedora: `mesa-libGL, mesa-libEGL, libX11, libXcursor, libXi, libXrandr,
+  libwayland-client, libxkbcommon, libxkbcommon-x11` (auto-req still derives the
+  glibc/libgcc floor from the linked-against sonames).
+- Arch: `libglvnd libxkbcommon libxkbcommon-x11 wayland libx11 libxcursor libxi
+  libxrandr` (`libglvnd` provides both GL and EGL).
+
+`libegl1`/`mesa-libEGL` is listed **separately** from GL: glow/glutin creates its
+GL context via EGL on Wayland (GLX on X11), and the GL package does not pull EGL —
+without it a Wayland-only install fails at context creation. `libxkbcommon-x11`
+is likewise separate from `libxkbcommon0`: winit's `x11` feature `dlopen`s
+`libxkbcommon-x11.so`, which the base xkbcommon package does not pull. Keep these
+windowing-lib lists in sync with the GUI manifest `depends` / `[requires]` and
+the Arch PKGBUILD `depends` (whose `depends` additionally carry the
+`hicolor-icon-theme` / `desktop-file-utils` install-hook deps, out of scope here).
 
 `xdg-desktop-portal` + a backend (`-gtk`/`-wlr`/`-kde`) is `Recommends`: rfd's
 file dialog uses the portal here (no GTK linked) and **silently no-ops** without

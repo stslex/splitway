@@ -188,4 +188,11 @@ libxkbcommon-x11 = "*"
 
 [package.metadata.generate-rpm.recommends]
 xdg-desktop-portal = "*"
+# Asymmetry vs the deb Recommends (which offers gtk | wlr | kde): a cargo-generate-rpm
+# `key = "*"` table has no boolean-OR, so we name the GTK portal — it works on most
+# desktops (rfd links no GTK; it speaks the portal over D-Bus). On a native KDE/wlroots
+# host this only *nudges* GTK (a weak dep); the native backend, if installed, is used.
+# A passthrough rpm rich-dep — `"(xdg-desktop-portal-gtk or xdg-desktop-portal-kde or
+# xdg-desktop-portal-wlr)" = "*"` — would mirror the deb, but is left out until verified
+# to emit correctly through cargo-generate-rpm (it would only surface at rpm-build time).
 xdg-desktop-portal-gtk = "*"
