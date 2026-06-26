@@ -62,13 +62,16 @@ no view-model field is added, so the bindings contract is untouched.
   apply-or-rollback bar the daemon itself holds). The `bootout`→`bootstrap`
   relaunch settles (polls the service record to gone) and retries the transient
   launchd race so a re-install does not intermittently leave the daemon stopped.
-- **The root daemon binary must live in a root-only-writable directory.** It is
-  installed to `/usr/local/bin` `root:wheel 0755`, and the installer **pins that
-  directory to `root:wheel 0755` and aborts if it cannot** — otherwise, on the
-  Homebrew-on-Intel layout where `/usr/local/bin` is admin-writable, a non-root
-  process could swap the binary and have the root LaunchDaemon exec it at the next
-  boot (a persistent local privilege escalation — the launchd "unsafe binary
-  location" anti-pattern).
+- **The root daemon binary must live in a fully root-owned path.** It is installed
+  to `/usr/local/bin` `root:wheel 0755`, and the installer **pins that directory to
+  `root:wheel 0755` and verifies every parent component up to `/` is root-owned and
+  not group/other-writable, aborting before it touches ownership if any link is
+  not** — otherwise, on the Homebrew-on-Intel layout where `/usr/local` (or
+  `/usr/local/bin`) is admin-writable, a non-root process could swap the binary —
+  or, since renaming a directory entry needs write access to its *parent*, rename
+  the pinned `bin` out from under us and drop in its own — and have the root
+  LaunchDaemon exec it at the next boot (a persistent local privilege escalation —
+  the launchd "unsafe binary location" anti-pattern).
 - **An independent LaunchDaemon, group-reachable socket.** The GUI runs as the
   desktop user, so it reaches the root daemon only through the opt-in socket group
   (`--socket-group splitway` → `/var/run/splitway` `0750 root:splitway`, socket

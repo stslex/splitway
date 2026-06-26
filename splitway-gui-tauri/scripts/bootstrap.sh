@@ -36,6 +36,30 @@ readonly GROUP="splitway"
 log() { printf 'splitway-bootstrap: %s\n' "$*"; }
 die() { printf 'splitway-bootstrap: error: %s\n' "$*" >&2; exit 1; }
 
+# Walk every ancestor of $1 up to / and refuse unless each is root-owned and not
+# writable by group or other. Renaming or replacing a directory entry needs write
+# access to its PARENT, not to the entry itself — so pinning $BIN_DIR to
+# root:wheel is not enough: a single non-root-writable ancestor (e.g. /usr/local
+# left admin-owned by the Homebrew-on-Intel layout) still lets a non-root user
+# swap the directory out and have launchd exec their binary as root. We verify
+# (never chown) the parents: chowning /usr/local would break a real Homebrew, so
+# an unsafe chain is a hard refusal with an actionable message instead.
+assert_root_only_path() {
+    local dir="$1" owner perm
+    while :; do
+        owner="$(stat -f '%Su' "$dir" 2>/dev/null || true)"
+        perm="$(stat -f '%Lp' "$dir" 2>/dev/null || true)"
+        [ "$owner" = "root" ] || die "${dir} is owned by '${owner:-unknown}', not root; refusing — a non-root owner of an ancestor of ${BIN_DIR} could substitute the root-run daemon binary"
+        # 8#22 = group-write|other-write, base-8 on both operands so the mask is
+        # unambiguous regardless of leading-zero/octal shell quirks.
+        if [ -z "$perm" ] || [ "$(( 8#$perm & 8#22 ))" -ne 0 ]; then
+            die "${dir} (mode ${perm:-unknown}) is writable by group or other; refusing — a writable ancestor of ${BIN_DIR} lets a non-root user substitute the root-run daemon binary"
+        fi
+        [ "$dir" = "/" ] && break
+        dir="$(dirname "$dir")"
+    done
+}
+
 # --- install ---------------------------------------------------------------
 
 install_binaries() {
@@ -47,6 +71,12 @@ install_binaries() {
     # proceed if it cannot be made root-owned. BSD `install` has no -D, so the dir
     # is handled here.
     mkdir -p "$BIN_DIR"
+    # Verify the parent chain BEFORE touching ownership, so an unsafe layout (e.g.
+    # Homebrew-on-Intel's admin-owned /usr/local) is a clean refusal that has not
+    # already re-chowned a pre-existing $BIN_DIR out from under the user. A
+    # non-root-writable ancestor can rename/replace $BIN_DIR itself, so pinning it
+    # to root:wheel below is only sound once every parent is root-only.
+    assert_root_only_path "$(dirname "$BIN_DIR")"
     chown root:wheel "$BIN_DIR" || die "cannot make ${BIN_DIR} root-owned; refusing to install a root-run binary into a non-root-writable directory"
     chmod 755 "$BIN_DIR"
     local owner
