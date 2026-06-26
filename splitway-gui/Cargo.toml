@@ -66,18 +66,24 @@ until you run `usermod -aG splitway <user>`. Requires the splitway package."""
 # Hardcoded eframe/glow runtime libs (Debian names) rather than cargo-deb's
 # `$auto`. Two reasons: (1) $auto (dpkg-shlibdeps) needs the TARGET-arch libs
 # present, which is fragile for the arm64 cross build; (2) winit/glow dlopen
-# the windowing libs (libGL + libEGL, X11, wayland, xkbcommon + xkbcommon-x11)
-# at runtime, so they are NOT in the ELF's DT_NEEDED and $auto/shlibdeps would
-# MISS them entirely (verified: the rpm's ELF-based auto-req captured libc/libgcc
-# but none of the GL/X11/wayland libs). libegl1 is a SEPARATE dep from libgl1
-# because glow/glutin creates its GL context via EGL on Wayland (GLX on X11), and
-# libgl1 does NOT pull libegl1 — without it a Wayland-only install succeeds and
-# then fails at GL-context creation. libxkbcommon-x11-0 is likewise SEPARATE from
-# libxkbcommon0: winit's default `x11` feature has xkbcommon-dl dlopen
-# libxkbcommon-x11.so, which an X11 session needs and libxkbcommon0 does not pull.
-# `libc6 (>= 2.31)` pins the documented glibc floor (debian:bullseye /
-# ubuntu:20.04). The `>=` core dep is the real IPC contract.
-depends = "splitway (>= 0.0.5), libc6 (>= 2.31), libgl1, libegl1, libx11-6, libxcursor1, libxi6, libxrandr2, libwayland-client0, libxkbcommon0, libxkbcommon-x11-0"
+# the windowing libs (libGL + libEGL, X11, wayland-client + wayland-egl,
+# xkbcommon + xkbcommon-x11) at runtime, so they are NOT in the ELF's DT_NEEDED
+# and $auto/shlibdeps would MISS them entirely (verified: the rpm's ELF-based
+# auto-req captured libc/libgcc but none of the GL/X11/wayland libs). libegl1 is
+# a SEPARATE dep from libgl1 because glow/glutin creates its GL context via EGL on
+# Wayland (GLX on X11), and libgl1 does NOT pull libegl1 — without it a
+# Wayland-only install succeeds and then fails at GL-context creation.
+# libwayland-egl1 (libwayland-egl.so.1, wl_egl_window_*) is SEPARATE again from
+# libwayland-client0: glutin's Wayland EGL platform binds the GL surface to the
+# wl_surface through it, and libwayland-client0 does NOT pull it — without it a
+# Wayland install likewise passes `command -v` smoke tests and then fails at
+# GL-context creation (verified: the binary dlopens libwayland-egl.so.1).
+# libxkbcommon-x11-0 is likewise SEPARATE from libxkbcommon0: winit's default
+# `x11` feature has xkbcommon-dl dlopen libxkbcommon-x11.so, which an X11 session
+# needs and libxkbcommon0 does not pull. `libc6 (>= 2.31)` pins the documented
+# glibc floor (debian:bullseye / ubuntu:20.04). The `>=` core dep is the real
+# IPC contract.
+depends = "splitway (>= 0.0.5), libc6 (>= 2.31), libgl1, libegl1, libx11-6, libxcursor1, libxi6, libxrandr2, libwayland-client0, libwayland-egl1, libxkbcommon0, libxkbcommon-x11-0"
 # rfd uses the XDG desktop portal for its file dialog here (no GTK linked); the
 # dialog silently no-ops without a running portal + backend, hence Recommends.
 recommends = "xdg-desktop-portal, xdg-desktop-portal-gtk | xdg-desktop-portal-wlr | xdg-desktop-portal-kde"
@@ -171,6 +177,9 @@ assets = [
 # runtime libs that auto-req cannot detect (Fedora package names; mesa-libGL /
 # mesa-libEGL pull working GL/EGL via libglvnd — glow/glutin uses EGL on
 # Wayland, GLX on X11, and mesa-libGL alone does not pull the EGL loader).
+# libwayland-egl (libwayland-egl.so.1) is a separate Fedora package from
+# libwayland-client — glutin's Wayland EGL platform loads it for wl_egl_window,
+# and libwayland-client does not pull it.
 # libxkbcommon-x11 is a separate Fedora package from libxkbcommon — winit's x11
 # feature dlopens libxkbcommon-x11.so. rfd's file dialog needs an XDG portal +
 # backend (Recommends below).
@@ -183,6 +192,7 @@ libXcursor = "*"
 libXi = "*"
 libXrandr = "*"
 libwayland-client = "*"
+libwayland-egl = "*"
 libxkbcommon = "*"
 libxkbcommon-x11 = "*"
 
