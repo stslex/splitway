@@ -123,7 +123,7 @@ running `usermod -aG splitway <user>` + re-login (same contract as the NixOS
 deletes the drop-in and (if empty) the group, reverting to root-only.
 
 **Channels.** `release` (push → `master`, clean `<X.Y.Z>`) and `dev` (push →
-`dev`, `<X.Y.Z>~dev.<utc>.<sha>`) are separate Pages subtrees. `~dev` sorts
+`dev`, `<X.Y.Z>~dev.<utc>.<run>.<sha>`) are separate Pages subtrees. `~dev` sorts
 below the release in dpkg and rpm, so dev → release upgrades cleanly. Deploys
 **merge** the channel into persistent `gh-pages` state — old versions and the
 other channel survive.
