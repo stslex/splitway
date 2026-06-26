@@ -163,3 +163,51 @@ jobs:
           # version to the stable apt/dnf/pacman channels.
           git commit -m "chore: pin AUR pkgver to release, bump daemon for next cycle [skip ci]"
           git push
+
+  # After the post-release bump lands on master, dev is one bump behind. Open
+  # (or refresh) a PR that merges master back into dev so dev tracks the next dev
+  # cycle automatically — a PR rather than a direct push, because dev follows the
+  # branch -> PR workflow and may be protected. Best-effort auto-merge makes it
+  # hands-off where the repo allows it (no required checks); otherwise the PR just
+  # waits for a one-click merge. NOTE: this PR is opened by GITHUB_TOKEN, so it
+  # does NOT trigger pull_request CI on itself (GitHub suppresses that) — required
+  # checks would block auto-merge; use a PAT here if you want them to run.
+  sync-dev:
+    needs: bump-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Open/refresh a PR syncing the post-release bump into dev
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin master dev
+          # Nothing to sync if dev already contains master's tip.
+          if git merge-base --is-ancestor origin/master origin/dev; then
+            echo "dev already contains master — no sync PR needed"; exit 0
+          fi
+          # awk (not `grep | head -1`): SIGPIPE-free version read under pipefail.
+          VERSION=$(git show origin/master:splitway-daemon/Cargo.toml \
+            | awk -F'"' '/^version/{print $2; exit}')
+          num=$(gh pr list --base dev --head master --state open \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$num" ]; then
+            echo "sync PR #$num already open; the master push refreshed it"
+          else
+            url=$(gh pr create --base dev --head master \
+              --title "chore: sync post-release bump into dev (next cycle ${VERSION})" \
+              --body "Automated by release.yml after the release was tagged. Brings master's post-release auto-bump — splitway-daemon → ${VERSION}, regenerated Cargo.lock, AUR pkgver pins — back into \`dev\` so dev tracks the next dev cycle." \
+              ) || { echo "could not open sync PR (resolve manually): merge origin/master into dev"; exit 0; }
+            num=$(printf '%s' "$url" | sed -n 's#.*/pull/\([0-9][0-9]*\).*#\1#p')
+            echo "opened sync PR #${num} ($url)"
+          fi
+          # Best-effort: land it automatically once mergeable. No-op (PR waits for
+          # manual merge) if the repo lacks auto-merge or has required checks.
+          [ -n "$num" ] && { gh pr merge --auto --merge "$num" \
+            || echo "auto-merge unavailable; sync PR #${num} left for manual merge"; }
