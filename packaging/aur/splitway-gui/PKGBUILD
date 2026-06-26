@@ -6,7 +6,7 @@
 # the daemon without sudo; the group starts EMPTY, so the default posture is
 # unchanged until you run `usermod -aG splitway <user>`.
 pkgname=splitway-gui
-pkgver=0.0.5
+pkgver=0.0.6
 pkgrel=1
 pkgdesc="Splitway desktop GUI (egui front-end over the daemon socket)"
 arch=('x86_64' 'aarch64')
