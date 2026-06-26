@@ -1,23 +1,31 @@
 #!/usr/bin/env bash
-# Guard the AUR-pkgver invariant: the version pinned in every committed PKGBUILD
-# must name a release that ACTUALLY EXISTS, because each `source=` fetches the
-# `v$pkgver` git tag / release assets. release.yml's post-release auto-bump
+# Guard the AUR-pkgver invariant: the version pinned in the committed SOURCE
+# PKGBUILDs must name a release that ACTUALLY EXISTS, because each `source=`
+# fetches the `v$pkgver` git tag archive. release.yml's post-release auto-bump
 # pushes splitway-daemon/Cargo.toml to the NEXT (unreleased) version, so the
 # daemon version is deliberately one ahead of the latest release at rest on
 # master — the PKGBUILDs must therefore pin a real *released tag*, never the
 # in-tree daemon version (the write side, sync-pkgver.sh, stamps the version
 # being released). Fail the build on drift so `makepkg -si` from a checkout can
-# never point at a tag / assets that do not exist.
+# never point at a tag that does not exist.
+#
+# splitway-bin is EXCLUDED: it fetches release ASSET tarballs (attached later by
+# packaging.yml), so tag-existence — all this script cheaply checks — is
+# necessary but not sufficient for it, and it is allowed to lag the source
+# pkgver. Its asset-gated pin + sha256sums are owned by the (deferred) asset-aware
+# AUR-push automation (see splitway-bin/PKGBUILD and sync-pkgver.sh).
 #
 # Needs the tags fetched (packaging.yml's meta job uses fetch-depth: 0).
 #
 #   check-pkgver-sync.sh
 set -euo pipefail
 
-# All three PKGBUILDs describe one project at one version, so they must agree.
+# The source PKGBUILDs describe one project at one version, so they must agree.
 # awk (not `grep | head -1`) is SIGPIPE-free under `set -o pipefail`.
 pkgver=""
 for pb in packaging/aur/*/PKGBUILD; do
+    # See header: splitway-bin's pkgver is asset-gated and may lag — not checked here.
+    case "$pb" in */splitway-bin/PKGBUILD) continue ;; esac
     pv="$(awk -F= '/^pkgver=/{print $2; exit}' "$pb")"
     [ -n "$pv" ] || { echo "ERROR: $pb has no pkgver=" >&2; exit 1; }
     if [ -z "$pkgver" ]; then
