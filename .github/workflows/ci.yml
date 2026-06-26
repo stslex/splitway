@@ -33,8 +33,32 @@ jobs:
       # version bumped without relocking). --locked makes cargo refuse to update
       # the lock, so a stale lock errors here instead of surfacing later as a
       # `cargo fetch --locked` abort in the packaging build-arch/build-gui jobs.
+      #
+      # Resolving touches the registry index on a cold runner, so a transient
+      # crates.io blip (SSL eof, HTTP2 reset) could flake this check. Retry those,
+      # but fail FAST on a genuine drift (the `--locked` error), which no retry
+      # can fix.
       - name: Verify Cargo.lock is in sync with the manifests
-        run: cargo metadata --format-version 1 --locked > /dev/null
+        env:
+          CARGO_NET_RETRY: "10"
+          CARGO_HTTP_MULTIPLEXING: "false"
+        run: |
+          tmp_err="$(mktemp)"
+          for i in 1 2 3; do
+            if cargo metadata --format-version 1 --locked >/dev/null 2>"$tmp_err"; then
+              rm -f "$tmp_err"; exit 0
+            fi
+            cat "$tmp_err" >&2
+            # A genuine drift (the `--locked` refusal) no retry can fix — fail fast.
+            if grep -q -- '--locked' "$tmp_err"; then
+              echo "ERROR: Cargo.lock is out of sync with the manifests — relock (e.g. cargo update -p splitway-daemon) and commit Cargo.lock"
+              exit 1
+            fi
+            echo "cargo metadata failed (attempt $i/3) — likely a transient registry error; retrying in ${i}0s" >&2
+            sleep "${i}0"
+          done
+          echo "ERROR: cargo metadata --locked still failing after retries (registry unreachable?)"
+          exit 1
 
       # splitway-gui (eframe/egui, glow renderer) links a windowing/GL stack on
       # Linux; install the dev libraries so clippy/test/build compile it. macOS
