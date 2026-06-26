@@ -6,7 +6,7 @@
 # signed pacman repo (https://stslex.github.io/splitway/arch) ships a prebuilt
 # copy of this same package.
 pkgname=splitway
-pkgver=0.0.5
+pkgver=0.0.6
 pkgrel=1
 pkgdesc="Domain-based split-DNS daemon + CLI: route selected domains through the VPN's DNS, everything else direct"
 arch=('x86_64' 'aarch64')
