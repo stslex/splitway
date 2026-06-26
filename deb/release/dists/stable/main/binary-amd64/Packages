@@ -1,0 +1,47 @@
+Package: splitway-gui
+Architecture: amd64
+Version: 0.0.6
+Priority: optional
+Section: net
+Maintainer: stslex <ilya977.077@gmail.com>
+Installed-Size: 16839
+Depends: libc6 (>= 2.31), libegl1, libgl1, libwayland-client0, libwayland-egl1, libx11-6, libxcursor1, libxi6, libxkbcommon-x11-0, libxkbcommon0, libxrandr2, passwd, splitway (>= 0.0.6)
+Recommends: xdg-desktop-portal, xdg-desktop-portal-gtk | xdg-desktop-portal-wlr | xdg-desktop-portal-kde
+Filename: pool/main/splitway-gui_0.0.6_amd64.deb
+Size: 4484488
+MD5sum: 2fdbc50e10b7b0cd9497f8f21002f280
+SHA1: 13383777c22e1dbc26f054096fe07bd8f2bdff40
+SHA256: 909d06faa513ebef7135d1e1a7a412ad505f4a4686785bcdc1c20cd5b7b4e317
+SHA512: c1037cd04aa6cc1a384290b431f0a87393bf05f7a375978c96540e98247951906262e2ec8ea66b2bddb35414a6fd36426daac6bb57478c867202e6d4e26f2c13
+Description: Splitway interim egui GUI — a privilege-free IPC client over the daemon
+ socket
+ The Splitway desktop GUI: a privilege-free egui front-end that drives the
+ splitway daemon over its control socket. Installing it adds an opt-in
+ `splitway` group + a systemd drop-in so an in-group user can control split-DNS
+ without sudo; the group starts empty, so the default posture is unchanged until
+ you run `usermod -aG splitway <user>`. Requires the splitway package.
+
+Package: splitway
+Architecture: amd64
+Version: 0.0.6
+Priority: optional
+Section: net
+Maintainer: stslex <ilya977.077@gmail.com>
+Installed-Size: 7848
+Depends:
+Recommends: network-manager, systemd-resolved
+Filename: pool/main/splitway_0.0.6_amd64.deb
+Size: 1995908
+MD5sum: b9cde4321e7af09d72116fffb33b494e
+SHA1: d4352b54e0ebeca96761578c38d0f3e6f865ab84
+SHA256: 68d9ac6a4d3daac94b1b07114e09faa7ae8b037099d40242a58aa1eb7bd43e22
+SHA512: 409812319014bdaba14d3d99cacc009b806956b16ac64d7824a835c9bd5d21982e428b4ba0034f5c93a676815b5adef4d9424e071a1851b857375bfc5cea3b6f
+Description: Domain-based split-DNS daemon: route selected domains through the VPN's DNS,
+ everything else direct
+ Splitway routes selected domains through the VPN's DNS while everything else
+ resolves directly. The root daemon detects the VPN (NetworkManager or a
+ standalone OpenVPN management interface) and applies/reverts split-DNS rules
+ via systemd-resolved; the splitway CLI drives it over a 0600 Unix socket. This
+ package contains the daemon, the CLI, and the systemd service. Install
+ splitway-gui for the desktop GUI.
+
