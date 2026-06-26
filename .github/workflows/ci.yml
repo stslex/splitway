@@ -29,6 +29,13 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Fail loudly if Cargo.lock has drifted from the manifests (e.g. a member
+      # version bumped without relocking). --locked makes cargo refuse to update
+      # the lock, so a stale lock errors here instead of surfacing later as a
+      # `cargo fetch --locked` abort in the packaging build-arch/build-gui jobs.
+      - name: Verify Cargo.lock is in sync with the manifests
+        run: cargo metadata --format-version 1 --locked > /dev/null
+
       # splitway-gui (eframe/egui, glow renderer) links a windowing/GL stack on
       # Linux; install the dev libraries so clippy/test/build compile it. macOS
       # uses system frameworks (Cocoa/Metal) and needs none. rfd uses the XDG
