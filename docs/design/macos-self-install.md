@@ -83,6 +83,72 @@ no view-model field is added, so the bindings contract is untouched.
   leaves the binaries, group, membership, and config — so a re-install needs no
   re-prompt. Full uninstall is a separate, later step.
 
+## Trust boundary of the unsigned self-installer
+
+The `.app` is unsigned and built locally, so there is no cryptographic anchor over
+the bundle. Authenticating the `osascript` prompt delegates root to whatever
+currently sits in `Contents/Resources`: `osascript` runs
+`/bin/bash <bundle>/Contents/Resources/bootstrap.sh install` **as root**, and
+`splitway-daemon` is copied from that same directory. Codex flagged that this
+copies a bundled binary into a root-run location without verifying it; the residual
+risk is real, but it is a categorical limitation of the unsigned model, not a
+fixable gap in the script — so it is documented here rather than papered over with
+an in-bundle check.
+
+- **No in-bundle integrity check is attempted, by design — the load-bearing
+  reason is co-location.** `bootstrap.sh` is co-located with, and exactly as
+  writable as, the binaries it copies (and the GUI binary in `Contents/MacOS`).
+  Any principal who can replace `splitway-daemon` can equally rewrite
+  `bootstrap.sh`, so a compiled-in hash or an in-script source check is defeated
+  by the same write access: the attacker edits out the check, or replaces the
+  whole script with a root payload that runs before any check. This holds even for
+  a *narrower, non-breaking* source check (e.g. "refuse if the source is
+  group/other-writable, or owned by a principal other than the console user/root"):
+  in the only cross-user state where it would fire, the less-privileged writer
+  authored `bootstrap.sh` too and just deletes the check; and in the same-user
+  TOCTOU case it is a no-op (owner == console user, path not world-writable → it
+  passes). The verifier cannot sit outside the writable bundle, so it offers no
+  protection against the only attacker who can trigger the bug.
+
+- **A root-owned-source check would additionally break the feature.** A
+  drag-installed bundle's contents are owned by the *installing user*, not root, in
+  `/Applications` and `~/Applications` alike (the property that lets apps
+  self-update without admin; Finder copy preserves source perms). So a
+  root-owned / not-group-or-other-writable source check would reject every
+  supported install location while still being bypassable via the co-located
+  script — hence it is not adopted.
+
+- **Location is part of the boundary, but does not close the same-user case.**
+  `/Applications` is `drwxrwxr-x root:admin` (0775): a non-admin "other" cannot
+  create/replace entries there, and a drag-installed bundle's contents are not
+  group/other-writable, so a *different* non-admin user cannot tamper. But bundle
+  contents are owned by the installing user **regardless of `/Applications` vs
+  `~/Applications`**, so same-user TOCTOU — code running as the user who clicks
+  Install, riding their single legitimate authentication — is location-independent.
+
+- **The destination side IS hardened.** `bootstrap.sh` pins `/usr/local/bin` to
+  `root:wheel 0755` and re-verifies its ownership, and `assert_root_only_path`
+  verifies every ancestor (`/usr/local` up to `/`) is root-owned and not
+  group/other-writable before install. The asymmetry with the source is
+  fundamental: the destination is a fixed system path that root can soundly check
+  (a non-root principal cannot touch it); the source is, by the feature's premise,
+  a freshly built/copied user-writable bundle with no root-only path to verify
+  against.
+
+- **The residual risk and its only sound fix.** A genuine local privilege
+  escalation remains where a *less-privileged* principal can write the bundle and a
+  *more-privileged* one authenticates: a non-admin user's writable `~/Applications`
+  bundle (or a world-writable shared dir such as `/tmp` or `/Users/Shared`, 1777)
+  that an admin later authorizes, or non-root malware running as the admin user
+  riding the install prompt. This is closed only by an OS-enforced root of trust —
+  Developer-ID signing + notarization + `SMAppService`, where the kernel verifies a
+  signature the attacker cannot forge and binds the privileged helper to the signed
+  app — listed under [Scope / out of scope](#scope--out-of-scope). Until then,
+  operational guidance: an admin should not authenticate an install of a
+  `Splitway.app` that lives where a less-privileged principal can write it; a
+  read-only distribution medium (a signed DMG/PKG) would also close in-place source
+  tampering but is itself out of current scope.
+
 ## The re-login gotcha — observed behavior
 
 macOS materializes a process's supplementary group set into its kernel credential

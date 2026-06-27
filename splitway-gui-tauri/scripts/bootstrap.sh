@@ -83,6 +83,25 @@ install_binaries() {
     owner="$(stat -f '%Su:%Sg' "$BIN_DIR")"
     [ "$owner" = "root:wheel" ] || die "${BIN_DIR} is ${owner}, not root:wheel; refusing to install a root-run binary there"
 
+    # SECURITY (trust boundary): the source binaries below are trusted BY
+    # ASSUMPTION, not verified here, and that is deliberate. No in-bundle integrity
+    # check (a compiled-in hash, an in-script source-permission or source-ownership
+    # check) is attempted, because:
+    #  1. CO-LOCATION: this script lives in Contents/Resources beside the very
+    #     binaries it copies (and beside the GUI binary in Contents/MacOS) and is
+    #     run AS ROOT by osascript. The same write access that could swap
+    #     splitway-daemon could edit the check out of THIS script, or replace the
+    #     whole script with a root payload, before any check runs — so a verifier
+    #     that cannot sit outside the writable bundle protects nothing against the
+    #     only attacker who can trigger the bug.
+    #  2. A root-owned-source check would also reject every supported location: a
+    #     drag-installed .app is owned by the installing user, not root, in
+    #     /Applications and ~/Applications alike.
+    # The DESTINATION is what root CAN soundly verify and IS hardened above
+    # (BIN_DIR pinned + re-checked, assert_root_only_path on every ancestor). The
+    # sound source-side fix is an OS-enforced root of trust (Developer-ID signing +
+    # notarization + SMAppService), out of scope. See docs/design/macos-self-install.md
+    # ("Trust boundary of the unsigned self-installer").
     local name src dst
     for name in splitway-daemon splitway; do
         src="${SELF_DIR}/${name}"
