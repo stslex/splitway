@@ -63,8 +63,9 @@ pub(super) fn current_vpn_state() -> Result<Detected, PlatformError> {
 fn read_dns_model() -> Result<DnsModel, PlatformError> {
     let global_ipv4_dump = scutil_show("State:/Network/Global/IPv4")?;
     let primary_interface = parse_scalar_field(&global_ipv4_dump, "PrimaryInterface");
+    let primary_service = parse_scalar_field(&global_ipv4_dump, "PrimaryService");
 
-    // Enumerate every per-service DNS key and read its InterfaceName + servers.
+    // Enumerate every per-service DNS key and read its id + InterfaceName + servers.
     let listing = scutil_list("State:/Network/Service/.*/DNS")?;
     let mut services = Vec::new();
     for key in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
@@ -81,6 +82,7 @@ fn read_dns_model() -> Result<DnsModel, PlatformError> {
             continue; // a service with no DNS contributes nothing
         }
         services.push(ServiceDns {
+            service_id: service_id_from_key(key),
             interface_name: parse_scalar_field(&dump, "InterfaceName"),
             servers,
         });
@@ -88,8 +90,20 @@ fn read_dns_model() -> Result<DnsModel, PlatformError> {
 
     Ok(DnsModel {
         primary_interface,
+        primary_service,
         services,
     })
+}
+
+/// Extract the `<id>` from a `State:/Network/Service/<id>/DNS` key, so it can be
+/// matched against `PrimaryService`. Returns the whole key if it does not fit
+/// the expected shape (so an unexpected key never silently collides with a real
+/// service id).
+fn service_id_from_key(key: &str) -> String {
+    key.strip_prefix("State:/Network/Service/")
+        .and_then(|rest| rest.strip_suffix("/DNS"))
+        .unwrap_or(key)
+        .to_string()
 }
 
 /// Run `scutil` with a `show <key>` script over stdin and return the dump. A
@@ -141,4 +155,31 @@ fn scutil_script(script: &str) -> Result<String, PlatformError> {
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::service_id_from_key;
+
+    #[test]
+    fn service_id_from_key_extracts_the_id() {
+        assert_eq!(
+            service_id_from_key("State:/Network/Service/ABC-123/DNS"),
+            "ABC-123"
+        );
+    }
+
+    #[test]
+    fn service_id_from_key_returns_whole_key_when_shape_is_unexpected() {
+        // An unexpected key shape is returned verbatim, so it never collides with
+        // a real service id.
+        assert_eq!(
+            service_id_from_key("Setup:/Network/Foo"),
+            "Setup:/Network/Foo"
+        );
+        assert_eq!(
+            service_id_from_key("State:/Network/Service/ABC"),
+            "State:/Network/Service/ABC"
+        );
+    }
 }

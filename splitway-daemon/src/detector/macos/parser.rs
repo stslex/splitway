@@ -1,35 +1,46 @@
 //! Pure parsing of the macOS SystemConfiguration DNS model — no I/O, unit
 //! tested. This is the structural, vendor-neutral core of macOS VPN detection.
 //!
-//! # Why not `scutil --dns`
+//! # Why not `scutil --dns`, and why per-service (not the global default)
 //!
 //! The original detector filtered `scutil --dns` by a chosen `utun*` interface.
 //! That fails against a VPN client that hijacks the system **default** resolver
 //! instead of scoping its DNS to the tunnel: there is then *no* resolver scoped
 //! to any `utun` (the active tunnel `utun` index even varies between sessions),
 //! so an interface-keyed read finds nothing. We instead read the SystemConfig
-//! dynamic store directly and decide structurally:
+//! dynamic store directly and decide structurally over the **per-service** DNS:
 //!
-//! - `State:/Network/Global/DNS` `ServerAddresses` — the current system default
-//!   resolver(s).
-//! - `State:/Network/Global/IPv4` `PrimaryInterface` — the physical primary
-//!   interface (e.g. `en0`).
-//! - the physical interface's *own* DHCP resolver — the resolver that interface
-//!   would use if the default were not overridden.
+//! - `State:/Network/Global/IPv4` `PrimaryInterface` / `PrimaryService` — the
+//!   physical primary interface (e.g. `en0`) and its service id.
+//! - each `State:/Network/Service/<id>/DNS` — that service's `ServerAddresses`
+//!   and `InterfaceName`.
 //!
-//! If the global default differs from the physical interface's own DHCP
-//! resolver, the default has been overridden by a non-physical (VPN) service →
-//! **VPN is up**; the corp DNS is that global default, and the demote-target
-//! (where non-corp DNS should go, off-tunnel) is the physical DHCP resolver. The
-//! decision keys on this structural *difference*, never on any vendor/product
-//! string, so it generalises across VPN clients.
+//! The **physical service** is the one whose id is the primary service (falling
+//! back to the primary interface name); its resolver is the demote-target. A
+//! **VPN service** is any *other* service whose DNS differs from the physical
+//! resolver — a non-physical resolver is in play → **VPN is up**, and its
+//! resolver is the corp DNS. The decision keys on this structural *difference*,
+//! never on any vendor/product string, so it generalises across VPN clients.
+//!
+//! Detection deliberately does **not** read `State:/Network/Global/DNS`: Splitway's
+//! own demote overwrites the physical service's DNS, which can change the global
+//! default — so a Global-keyed detector would flip to "down" the instant our
+//! demote took effect, then revert → the VPN re-asserts → re-demote → oscillation.
+//! Reading the VPN's corp DNS from its *own* service entry (which our demote does
+//! not touch) keeps detection stable while the demote is in effect.
 
 /// One network service's DNS entry, as read from `State:/Network/Service/<id>/DNS`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ServiceDns {
+    /// The service id (the `<id>` in the `State:/Network/Service/<id>/DNS` key).
+    /// The authoritative anchor for the *physical* service: it equals the
+    /// `PrimaryService` from `State:/Network/Global/IPv4`. Preferred over the
+    /// interface name, which a VPN service can also report.
+    pub service_id: String,
     /// The `InterfaceName` the service is bound to (e.g. `en0`), if present.
-    /// Used only to identify the *physical* service (the one on the primary
-    /// interface); a VPN service is identified structurally, not by name.
+    /// The fallback anchor for the physical service when the primary service id
+    /// is unknown; a VPN service is otherwise identified structurally, not by
+    /// name.
     pub interface_name: Option<String>,
     /// The service's `ServerAddresses`.
     pub servers: Vec<String>,
@@ -52,10 +63,15 @@ pub(super) struct DnsModel {
     /// `State:/Network/Global/IPv4` `PrimaryInterface` (e.g. `en0`). `None` if
     /// the key or field is absent (no primary network — effectively offline).
     pub primary_interface: Option<String>,
+    /// `State:/Network/Global/IPv4` `PrimaryService` (the primary service id).
+    /// The authoritative anchor for the physical service in [`decide`]; a VPN
+    /// service can also report the primary interface name, so the service id is
+    /// preferred and the interface name is only a fallback.
+    pub primary_service: Option<String>,
     /// Every network service's DNS entry (from the per-service DNS keys). The
-    /// physical service is the one whose `interface_name` is the primary
-    /// interface; a VPN service is one whose DNS differs from the physical
-    /// service's (a non-physical resolver is in play).
+    /// physical service is the one whose `service_id` is the primary service
+    /// (or, failing that, whose `interface_name` is the primary interface); a
+    /// VPN service is one whose DNS differs from the physical service's.
     pub services: Vec<ServiceDns>,
 }
 
@@ -161,36 +177,44 @@ pub(crate) fn parse_scalar_field(dump: &str, field: &str) -> Option<String> {
 /// - no non-physical service whose DNS differs from the physical — no VPN.
 pub(super) fn decide(model: &DnsModel) -> Detected {
     // No primary network at all → nothing is in play.
-    let Some(primary) = model.primary_interface.as_deref() else {
+    // A primary network must exist to anchor on (offline → nothing in play).
+    if model.primary_interface.is_none() && model.primary_service.is_none() {
         return Detected::Down;
-    };
+    }
 
-    // The physical service: bound to the primary interface and carrying DNS.
-    // Its resolver is the demote-target (where non-corp DNS goes off-tunnel).
-    let physical_dns = model
-        .services
-        .iter()
-        .find(|s| s.interface_name.as_deref() == Some(primary) && !s.servers.is_empty())
-        .map(|s| &s.servers);
-    let Some(physical_dns) = physical_dns else {
+    // The physical service, anchored authoritatively by the primary SERVICE id
+    // when known (a VPN service can also report the primary interface name, so
+    // the id is preferred), falling back to the primary interface name. Its
+    // resolver is the demote-target (where non-corp DNS goes off-tunnel).
+    let physical = model.services.iter().find(|s| {
+        !s.servers.is_empty()
+            && match model.primary_service.as_deref() {
+                Some(id) => s.service_id == id,
+                None => s.interface_name.as_deref() == model.primary_interface.as_deref(),
+            }
+    });
+    let Some(physical) = physical else {
         // Without the physical resolver we cannot pick a safe demote-target.
         return Detected::Down;
     };
 
-    // A VPN service: any service whose DNS differs from the physical resolver
-    // (a non-physical resolver is in play). This signal is independent of the
-    // global default, so it survives our own demote of the physical service.
+    // A VPN service: a service OTHER than the physical one, carrying DNS that
+    // differs from the physical resolver (a non-physical resolver is in play).
+    // Excluding the physical service by id means the comparison survives our own
+    // demote (which sets the physical service's DNS to the fallback) — the VPN's
+    // own service still differs — and never mistakes the physical service for a
+    // VPN. This signal is independent of the mutable global default.
     let vpn_dns = model
         .services
         .iter()
-        .filter(|s| !s.servers.is_empty())
-        .find(|s| !same_set(&s.servers, physical_dns))
+        .filter(|s| s.service_id != physical.service_id && !s.servers.is_empty())
+        .find(|s| !same_set(&s.servers, &physical.servers))
         .map(|s| &s.servers);
 
     match vpn_dns {
         Some(corp_dns) => Detected::Up {
             corp_dns: corp_dns.clone(),
-            demote_target: physical_dns.clone(),
+            demote_target: physical.servers.clone(),
         },
         None => Detected::Down,
     }
@@ -318,18 +342,24 @@ mod tests {
 
     // --- the structural decision (per-service model) -------------------------
 
-    fn svc(iface: Option<&str>, servers: &[&str]) -> ServiceDns {
+    fn svc(id: &str, iface: Option<&str>, servers: &[&str]) -> ServiceDns {
         ServiceDns {
+            service_id: id.to_string(),
             interface_name: iface.map(str::to_string),
             servers: servers.iter().map(|s| s.to_string()).collect(),
         }
     }
 
-    /// Build a model from a primary interface and a list of (iface, servers)
+    /// Build a model from a primary interface, the primary service id, and the
     /// service entries.
-    fn model(primary: Option<&str>, services: Vec<ServiceDns>) -> DnsModel {
+    fn model(
+        primary_iface: Option<&str>,
+        primary_svc: Option<&str>,
+        services: Vec<ServiceDns>,
+    ) -> DnsModel {
         DnsModel {
-            primary_interface: primary.map(str::to_string),
+            primary_interface: primary_iface.map(str::to_string),
+            primary_service: primary_svc.map(str::to_string),
             services,
         }
     }
@@ -337,12 +367,14 @@ mod tests {
     #[test]
     fn detects_up_when_a_service_differs_from_the_physical() {
         // The breaking case: a (VPN) service carries corp DNS that differs from
-        // the physical en0 service's DHCP resolver.
+        // the physical en0 service's DHCP resolver. The physical service is the
+        // primary service (id "phys").
         let m = model(
             Some("en0"),
+            Some("phys"),
             vec![
-                svc(Some("en0"), &["198.51.100.1"]), // physical DHCP
-                svc(Some("en0"), &["192.0.2.53"]),   // VPN's own service (corp)
+                svc("phys", Some("en0"), &["198.51.100.1"]), // physical DHCP
+                svc("vpn", Some("en0"), &["192.0.2.53"]),    // VPN's own service (corp)
             ],
         );
         assert_eq!(
@@ -363,9 +395,53 @@ mod tests {
         // service still reads 192.0.2.53 → still Up, same verdict.
         let m = model(
             Some("en0"),
+            Some("phys"),
             vec![
-                svc(Some("en0"), &["198.51.100.1"]), // physical (== demoted value)
-                svc(Some("en0"), &["192.0.2.53"]),   // VPN service unchanged
+                svc("phys", Some("en0"), &["198.51.100.1"]), // physical (== demoted value)
+                svc("vpn", Some("en0"), &["192.0.2.53"]),    // VPN service unchanged
+            ],
+        );
+        assert_eq!(
+            decide(&m),
+            Detected::Up {
+                corp_dns: vec!["192.0.2.53".to_string()],
+                demote_target: vec!["198.51.100.1".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn physical_is_anchored_by_service_id_even_if_a_vpn_service_shares_the_interface() {
+        // The deeper P1 concern: a VPN service also reports the primary interface
+        // name. Anchoring the physical service on the primary SERVICE id (not the
+        // interface name) means the VPN service — listed FIRST here — is not
+        // mistaken for physical, so corp/fallback are never swapped.
+        let m = model(
+            Some("en0"),
+            Some("phys"),
+            vec![
+                svc("vpn", Some("en0"), &["192.0.2.53"]), // VPN, also on en0, listed first
+                svc("phys", Some("en0"), &["198.51.100.1"]), // the real physical service
+            ],
+        );
+        assert_eq!(
+            decide(&m),
+            Detected::Up {
+                corp_dns: vec!["192.0.2.53".to_string()],
+                demote_target: vec!["198.51.100.1".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn falls_back_to_interface_name_when_primary_service_is_unknown() {
+        // If PrimaryService is absent, anchor on the primary interface name.
+        let m = model(
+            Some("en0"),
+            None,
+            vec![
+                svc("phys", Some("en0"), &["198.51.100.1"]),
+                svc("vpn", Some("en0"), &["192.0.2.53"]),
             ],
         );
         assert_eq!(
@@ -380,7 +456,11 @@ mod tests {
     #[test]
     fn detects_down_when_only_the_physical_service_exists() {
         // No VPN: the only service with DNS is the physical interface's own.
-        let m = model(Some("en0"), vec![svc(Some("en0"), &["198.51.100.1"])]);
+        let m = model(
+            Some("en0"),
+            Some("phys"),
+            vec![svc("phys", Some("en0"), &["198.51.100.1"])],
+        );
         assert_eq!(decide(&m), Detected::Down);
     }
 
@@ -388,9 +468,10 @@ mod tests {
     fn detects_down_when_offline_no_primary() {
         let m = model(
             None,
+            None,
             vec![
-                svc(Some("en0"), &["198.51.100.1"]),
-                svc(Some("en0"), &["192.0.2.53"]),
+                svc("phys", Some("en0"), &["198.51.100.1"]),
+                svc("vpn", Some("en0"), &["192.0.2.53"]),
             ],
         );
         assert_eq!(decide(&m), Detected::Down);
@@ -402,9 +483,10 @@ mod tests {
         // even though some other service has DNS → conservative Down.
         let m = model(
             Some("en0"),
+            Some("phys"),
             vec![
-                svc(Some("en0"), &[]),             // physical, no DNS
-                svc(Some("en0"), &["192.0.2.53"]), // some other service
+                svc("phys", Some("en0"), &[]),              // physical, no DNS
+                svc("other", Some("en0"), &["192.0.2.53"]), // some other service
             ],
         );
         assert_eq!(decide(&m), Detected::Down);
@@ -416,9 +498,10 @@ mod tests {
         // a VPN → Down (no service differs from the physical resolver).
         let m = model(
             Some("en0"),
+            Some("phys"),
             vec![
-                svc(Some("en0"), &["198.51.100.1", "198.51.100.2"]),
-                svc(Some("en0"), &["198.51.100.2", "198.51.100.1"]),
+                svc("phys", Some("en0"), &["198.51.100.1", "198.51.100.2"]),
+                svc("other", Some("en0"), &["198.51.100.2", "198.51.100.1"]),
             ],
         );
         assert_eq!(decide(&m), Detected::Down);
@@ -427,16 +510,17 @@ mod tests {
     #[test]
     fn decision_ignores_utun_interfaces_entirely() {
         // Proof no `utun` is keyed on: the decision compares per-service DNS
-        // against the physical resolver, never a utun name. utun services with
-        // their own DNS that differs from physical still simply read as "a VPN
-        // service" structurally — by their DNS, not their name.
+        // against the physical resolver, never a utun name. A utun service with
+        // its own DNS that differs from physical reads as "a VPN service"
+        // structurally — by its DNS, not its name.
         let m = model(
             Some("en0"),
+            Some("phys"),
             vec![
-                svc(Some("en0"), &["198.51.100.1"]),
+                svc("phys", Some("en0"), &["198.51.100.1"]),
                 // Whatever the tunnel interface is named (utun index varies), it
                 // is recognised by its differing DNS, not its name.
-                svc(Some("utun7"), &["192.0.2.53"]),
+                svc("vpn", Some("utun7"), &["192.0.2.53"]),
             ],
         );
         assert_eq!(
@@ -450,10 +534,11 @@ mod tests {
 
     #[test]
     fn full_fixture_parse_then_decide_is_up() {
-        // End-to-end over the real-form dumps: parse the primary interface and
-        // the two service DNS dicts, assemble the per-service model, decide → Up
-        // with corp=192.0.2.53, demote=198.51.100.1.
-        let primary = parse_scalar_field(GLOBAL_IPV4, "PrimaryInterface");
+        // End-to-end over the real-form dumps: parse the primary interface +
+        // service id and the two service DNS dicts, assemble the per-service
+        // model, decide → Up with corp=192.0.2.53, demote=198.51.100.1.
+        let primary_iface = parse_scalar_field(GLOBAL_IPV4, "PrimaryInterface");
+        let primary_svc = parse_scalar_field(GLOBAL_IPV4, "PrimaryService");
         let physical = parse_array_field(PHYSICAL_DNS, "ServerAddresses");
         // The VPN's own service DNS dump (corp resolver), same form as the others.
         let vpn_service_dns = "\
@@ -464,14 +549,18 @@ mod tests {
   InterfaceName : en0
 }";
         let corp = parse_array_field(vpn_service_dns, "ServerAddresses");
+        let phys_id = primary_svc.clone().unwrap();
         let m = DnsModel {
-            primary_interface: primary,
+            primary_interface: primary_iface,
+            primary_service: primary_svc,
             services: vec![
                 ServiceDns {
+                    service_id: phys_id,
                     interface_name: Some("en0".to_string()),
                     servers: physical,
                 },
                 ServiceDns {
+                    service_id: "vpn-service".to_string(),
                     interface_name: Some("en0".to_string()),
                     servers: corp,
                 },

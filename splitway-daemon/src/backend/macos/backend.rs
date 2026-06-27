@@ -513,8 +513,8 @@ mod tests {
         // Transactional across both steps: a demote failure must undo the
         // resolver scope so the system is never left half-changed.
         let dir = temp_dir("apply-rollback");
-        let mut scutil = FakeScutil::up();
-        scutil.fail_on_set = true;
+        let scutil = FakeScutil::up();
+        scutil.fail_on_set();
         let snaps = MemSnapshots::default();
 
         let result = apply_with(

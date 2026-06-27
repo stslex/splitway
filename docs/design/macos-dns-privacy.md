@@ -82,12 +82,23 @@ mode) and decides **structurally**:
 - every network service's DNS entry — `State:/Network/Service/.*/DNS`
   (`InterfaceName` + `ServerAddresses`).
 
-The **physical service** is the one bound to the primary interface; its resolver
-is the demote-target. A **VPN service** is any *other* service whose DNS differs
-from the physical resolver — i.e. a non-physical resolver is in play. VPN is
-**up** iff such a service exists; its resolver is the corp DNS. The decision is a
-set comparison (order-insensitive), and it never references a `utun` name or a
-vendor string.
+The **physical service** is anchored authoritatively by the **primary service
+id** (`State:/Network/Global/IPv4` `PrimaryService`), falling back to the primary
+interface name only when the id is unknown — because a VPN service can *also*
+report the primary interface name, so matching on the interface alone could pick
+the wrong service and invert corp/fallback. Its resolver is the demote-target. A
+**VPN service** is any service *other than the physical one* (compared by id)
+whose DNS differs from the physical resolver — i.e. a non-physical resolver is in
+play. VPN is **up** iff such a service exists; its resolver is the corp DNS. The
+decision is a set comparison (order-insensitive), and it never references a
+`utun` name or a vendor string.
+
+When Splitway demotes the physical service, it **re-adds that service's
+`InterfaceName`** (the demote write would otherwise drop it, since it rebuilds a
+minimal DNS dict). Keeping `InterfaceName` — and anchoring on the service id —
+means the physical service stays identifiable on the next detection round, so our
+own demote never makes detection lose the physical service (which would invert
+corp/fallback or undo the demote).
 
 ### Why detection reads per-service DNS, not `State:/Network/Global/DNS`
 
@@ -134,8 +145,16 @@ re-apply per genuine change.
 Because the observed client did **not** re-assert in a tight loop, no
 sub-second re-apply guard is needed; a re-assert that arrives as a DNS-key change
 is handled by the normal event path. The demote is idempotent (re-setting the
-same fallback), and the snapshot is captured only on the *first* demote, so a
-re-apply never overwrites the original prior state with our own fallback.
+same fallback), and the snapshot is captured only on the *first* demote of a
+given service, so a re-apply never overwrites the original prior state with our
+own fallback.
+
+**Primary-service change.** If the primary network service itself changes while
+the VPN stays up (e.g. Wi-Fi → Ethernet) and a demote snapshot already exists for
+the *old* service, the demote first **restores the old service** from its
+snapshot (so it is not left pinned to Splitway's fallback), then snapshots and
+demotes the new primary. Exactly one service is ever demoted at a time, and no
+previous primary is stranded on the fallback.
 
 ## Reversibility (the operational-safety contract)
 
