@@ -184,7 +184,7 @@ reimplemented per frontend:
 - **7a — `splitway-gui-core`** (done): extract the framework-agnostic GUI logic
   (the pure view-model **and** the truth-contract orchestration) into a crate
   depending on `splitway-shared` only, so both egui and the future Tauri backend
-  drive one `GuiCore`. See [`docs/design/gui-core-extraction.md`](design/gui-core-extraction.md).
+  drive one `GuiCore`. See [`docs/design/gui-core-extraction.md`](docs/design/gui-core-extraction.md).
 - **7b — Tauri shell + read-only view** (done): the `splitway-gui-tauri` backend
   hosts `GuiCore` and pushes the full view-model to a vanilla-TS frontend that
   renders it read-only (no mutations — those are 7c). gui-core gained `Verify`
@@ -209,7 +209,7 @@ reimplemented per frontend:
   store. Frozen-on-malformed mutations are rejected with an on-disk-fix message
   and the frozen state is shown prominently. No protocol change (the verbs already
   exist at v6); egui stays a read/write reference, untouched. See
-  [`docs/design/tauri-mutations.md`](design/tauri-mutations.md).
+  [`docs/design/tauri-mutations.md`](docs/design/tauri-mutations.md).
 - **7d — visual design + window behavior** (done): the approved Variant B design as
   the real Tauri UI — full-window layout, the simplified interface-centric model
   (interface + domains; DNS auto-derived and shown read-only; no vpn-name/backend
@@ -220,7 +220,7 @@ reimplemented per frontend:
   authorized additive protocol bump (v6 → **v7**): `StatusInfo.detected_dns` exposes
   the selected interface's detected DNS independent of apply state, so the DNS
   readout is honest in the empty/disabled states too. See
-  [`docs/design/tauri-design-window.md`](design/tauri-design-window.md). (Manual-DNS
+  [`docs/design/tauri-design-window.md`](docs/design/tauri-design-window.md). (Manual-DNS
   override — for VPNs that connect but push no DNS — is deferred as a real future
   daemon feature, not built here.)
 - **7d-2 — bundling**: Nix packaging (two-stage frontend + Rust, `wrapGAppsHook3`,
@@ -241,7 +241,7 @@ reimplemented per frontend:
   keep the truth contract (do the work → refresh-now → never touch the VM). Split
   from 7d-2 because its real proof — the built `.app` driving the live install on
   macOS — is machine-bound. See
-  [`docs/design/macos-self-install.md`](design/macos-self-install.md). (Homebrew —
+  [`docs/design/macos-self-install.md`](docs/design/macos-self-install.md). (Homebrew —
   installing the same `.app` + binaries, with no competing `service` block — is the
   next phase.)
 
