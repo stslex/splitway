@@ -35,7 +35,7 @@ else leaves via the normal (physical) path and never traverses the tunnel.
 
 (Synthetic stand-ins used throughout: corp DNS `192.0.2.53`, physical DHCP DNS
 `198.51.100.1`, public-resolver override `203.0.113.9`, corp domains
-`corp.example.com` / `jira.corp.example.com`, interfaces `en0` / `utun0`.)
+`corp.example.com` / `jira.example.com`, interfaces `en0` / `utun0`.)
 
 ## The mechanism: demote + scope, transactional and reversible
 

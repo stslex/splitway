@@ -461,7 +461,7 @@ mod tests {
             &corp,
             &[
                 "corp.example.com".to_string(),
-                "jira.corp.example.com".to_string(),
+                "jira.example.com".to_string(),
             ],
             Some(&fallback),
             &scutil,
@@ -470,7 +470,7 @@ mod tests {
         .unwrap();
 
         // Scope: a managed resolver file per corp domain, pointing at corp DNS.
-        for domain in ["corp.example.com", "jira.corp.example.com"] {
+        for domain in ["corp.example.com", "jira.example.com"] {
             let body = fs::read_to_string(dir.join(domain)).unwrap();
             assert!(is_managed(&body));
             assert!(body.contains("nameserver 192.0.2.53"));
