@@ -104,13 +104,16 @@ test("Linux NotRunning keeps the systemctl command, no install action", () => {
   assert.equal(stage.blocker.action, undefined);
 });
 
-test("macOS PermissionDenied tells the user to sign out, not to run usermod", () => {
+test("macOS PermissionDenied gives sign-out guidance plus an install/repair action, not usermod", () => {
   const stage = stageFor(withHealth("PermissionDenied"), "macos");
   if (stage.kind !== "blocker") return assert.fail("expected a blocker");
   assert.equal(stage.blocker.variant, "no-permission");
-  // No usermod (wrong OS, already done); membership is already granted.
+  // No usermod (wrong OS); keep the sign-out guidance for the GUI-install path.
   assert.equal(stage.blocker.command, undefined);
   assert.match(stage.blocker.body, /sign out/i);
+  // ...and offer the idempotent install/repair action for the manual/sudo-daemon
+  // path (root-only socket), where signing out alone cannot grant GUI access.
+  assert.equal(stage.blocker.action?.key, "install");
 });
 
 test("Linux PermissionDenied keeps the usermod command", () => {

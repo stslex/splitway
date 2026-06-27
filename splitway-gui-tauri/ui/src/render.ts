@@ -175,18 +175,24 @@ function notRunningBlocker(platform: HostPlatform): BlockerView {
   };
 }
 
-/** The `PermissionDenied` blocker. On macOS the installer already added the user
- *  to the `splitway` group, but macOS only applies new group access at login —
- *  so the remaining step is a sign-out, NOT a `usermod` (which is the wrong OS and
- *  already done). On Linux, keep the add-to-group command + re-login guidance. */
+/** The `PermissionDenied` blocker. On macOS there are two ways to land here:
+ *  (a) the in-app installer added the user to the `splitway` group and macOS only
+ *  applies new group access at login — so the remaining step is a sign-out (NOT a
+ *  `usermod`, which is the wrong OS and already done); or (b) the user set up the
+ *  manual/sudo daemon, whose socket is root-only (no `--socket-group splitway`),
+ *  where signing out cannot help and re-running the installer migrates the service
+ *  to the group-reachable socket. So macOS offers BOTH the sign-out guidance and
+ *  the (idempotent) Install/repair action, since the view-model cannot tell the
+ *  two cases apart. On Linux, keep the add-to-group command + re-login guidance. */
 function permissionDeniedBlocker(platform: HostPlatform): BlockerView {
   if (platform === "macos") {
     return {
       variant: "no-permission",
       tone: "warn",
-      title: "Almost done — sign out to finish",
-      body: "Splitway is installed and your account was added to the {} group. macOS only applies new group access at login, so sign out and back in (or restart) to start controlling routing.",
+      title: "Almost done — one more step",
+      body: "Splitway is running but your account can't reach it yet. If you installed it from this app, your account was added to the {} group — macOS applies new group access at login, so sign out and back in (or restart). If you set the service up manually, install the managed service below to grant access without sudo.",
       codeWord: "splitway",
+      action: { key: "install", label: "Install / repair the Splitway service" },
     };
   }
   return {
