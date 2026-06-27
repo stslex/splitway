@@ -13,6 +13,7 @@ use splitway_shared::config::atomic_write;
 use splitway_shared::ipc::{LinkDnsState, ResolutionInfo};
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnInfo};
 
+use super::demote;
 use super::resolver::{is_managed, is_valid_domain, resolver_contents, resolver_path};
 use super::MacosBackend;
 
@@ -26,21 +27,29 @@ impl DnsBackend for MacosBackend {
                 "no DNS servers in VpnInfo".to_string(),
             ));
         }
-        apply_to_dir(Path::new(RESOLVER_DIR), &vpn_info.dns_servers, domains)?;
+        let fallback = vpn_info.demote_target.as_deref().filter(|f| !f.is_empty());
+        apply_with(
+            Path::new(RESOLVER_DIR),
+            &vpn_info.dns_servers,
+            domains,
+            fallback,
+            &demote::RealScutil,
+            &demote::FileSnapshotStore::new(),
+        )?;
         flush_dns_cache();
         Ok(())
     }
 
     fn revert_rules(&self, _interface: &str) -> Result<(), PlatformError> {
-        // There is no per-interface resolver state on macOS — resolver files
-        // are keyed by domain. Reverting removes every file we own.
-        let removed = remove_managed(Path::new(RESOLVER_DIR), None).map_err(|e| {
-            PlatformError::CommandFailed(format!("failed to remove resolver files: {e}"))
-        })?;
+        let removed = revert_with(
+            Path::new(RESOLVER_DIR),
+            &demote::RealScutil,
+            &demote::FileSnapshotStore::new(),
+        )?;
         if removed > 0 {
             flush_dns_cache();
         }
-        log::info!("reverted {removed} splitway resolver file(s)");
+        log::info!("reverted {removed} splitway resolver file(s) and restored any demoted default");
         Ok(())
     }
 
@@ -96,6 +105,64 @@ impl DnsBackend for MacosBackend {
             via_dns: None,
         })
     }
+}
+
+/// The apply pipeline, parameterized over the resolver dir and the demote seam
+/// so the scope+demote wiring is unit-testable without touching the live system.
+/// Two steps, transactional across both:
+///
+/// 1. **Scope** — `apply_to_dir` routes `domains` to `servers` via
+///    `/etc/resolver` (itself transactional; rolls back on any failure).
+/// 2. **Demote** — when `fallback` is `Some` (the VPN hijacked the system
+///    default), [`demote::demote`] sends non-corp DNS off-tunnel. If it fails,
+///    the resolver scope from step 1 is rolled back so the system is never left
+///    half-changed (scoped but with the default still hijacked), and the demote
+///    error is surfaced. The demote's own snapshot still lets a later revert
+///    restore the default even if this rollback is incomplete.
+fn apply_with(
+    dir: &Path,
+    servers: &[String],
+    domains: &[String],
+    fallback: Option<&[String]>,
+    scutil: &dyn demote::ScutilRunner,
+    snapshots: &dyn demote::SnapshotStore,
+) -> Result<(), PlatformError> {
+    apply_to_dir(dir, servers, domains)?;
+
+    if let Some(fallback) = fallback {
+        if let Err(e) = demote::demote(scutil, snapshots, fallback) {
+            // Undo the scope just written so no partial state remains.
+            if let Err(rollback_err) = remove_managed(dir, None) {
+                log::error!(
+                    "demote failed and rolling back the resolver scope also failed: {rollback_err}"
+                );
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// The revert pipeline, parameterized over the resolver dir and the demote seam.
+/// Removes every managed `/etc/resolver` file AND restores any demoted system
+/// default from the on-disk snapshot. Returns the number of resolver files
+/// removed (so the caller can decide whether a cache flush is warranted).
+///
+/// The restore runs even when no resolver files were removed: a prior run may
+/// have demoted without (or after pruning) resolver files, and the snapshot is
+/// the record of record. A restore failure is surfaced (not swallowed) so the
+/// caller retries rather than recording a clean revert over a still-demoted
+/// default.
+fn revert_with(
+    dir: &Path,
+    scutil: &dyn demote::ScutilRunner,
+    snapshots: &dyn demote::SnapshotStore,
+) -> Result<usize, PlatformError> {
+    let removed = remove_managed(dir, None).map_err(|e| {
+        PlatformError::CommandFailed(format!("failed to remove resolver files: {e}"))
+    })?;
+    demote::restore(scutil, snapshots)?;
+    Ok(removed)
 }
 
 /// Prior on-disk state of a resolver file before this apply touched it, used to
@@ -371,6 +438,138 @@ mod tests {
 
     fn servers() -> Vec<String> {
         vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()]
+    }
+
+    // --- scope + demote wiring (apply_with / revert_with) --------------------
+    //
+    // These exercise the two-step pipeline with the demote seam faked, so they
+    // assert BOTH the /etc/resolver files written and the exact scutil script
+    // issued — without touching the live system.
+
+    use super::demote::test_support::{FakeScutil, MemSnapshots};
+
+    #[test]
+    fn apply_with_scopes_and_demotes_to_the_fallback() {
+        let dir = temp_dir("apply-with-demote");
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        let corp = vec!["192.0.2.53".to_string()];
+        let fallback = vec!["198.51.100.1".to_string()];
+
+        apply_with(
+            &dir,
+            &corp,
+            &[
+                "corp.example.com".to_string(),
+                "jira.corp.example.com".to_string(),
+            ],
+            Some(&fallback),
+            &scutil,
+            &snaps,
+        )
+        .unwrap();
+
+        // Scope: a managed resolver file per corp domain, pointing at corp DNS.
+        for domain in ["corp.example.com", "jira.corp.example.com"] {
+            let body = fs::read_to_string(dir.join(domain)).unwrap();
+            assert!(is_managed(&body));
+            assert!(body.contains("nameserver 192.0.2.53"));
+        }
+        // Demote: exactly the set-fallback script on the primary service, and
+        // the prior default snapshotted for restore.
+        let scripts = scutil.scripts.borrow();
+        assert_eq!(scripts.len(), 1);
+        assert!(scripts[0].contains("d.add ServerAddresses * 198.51.100.1\n"));
+        assert!(scripts[0].contains("set State:/Network/Service/ABC/DNS\n"));
+        drop(scripts);
+        assert_eq!(
+            snaps.slot.borrow().as_ref().unwrap().prior_servers,
+            vec!["198.51.100.1".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_with_no_fallback_scopes_only_no_demote() {
+        let dir = temp_dir("apply-scope-only");
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        apply_with(
+            &dir,
+            &["192.0.2.53".to_string()],
+            &["corp.example.com".to_string()],
+            None,
+            &scutil,
+            &snaps,
+        )
+        .unwrap();
+        assert!(dir.join("corp.example.com").exists());
+        // No demote issued, nothing snapshotted.
+        assert!(scutil.scripts.borrow().is_empty());
+        assert!(snaps.slot.borrow().is_none());
+    }
+
+    #[test]
+    fn apply_with_rolls_back_the_scope_when_the_demote_fails() {
+        // Transactional across both steps: a demote failure must undo the
+        // resolver scope so the system is never left half-changed.
+        let dir = temp_dir("apply-rollback");
+        let mut scutil = FakeScutil::up();
+        scutil.fail_on_set = true;
+        let snaps = MemSnapshots::default();
+
+        let result = apply_with(
+            &dir,
+            &["192.0.2.53".to_string()],
+            &["corp.example.com".to_string()],
+            Some(&["198.51.100.1".to_string()]),
+            &scutil,
+            &snaps,
+        );
+        assert!(result.is_err(), "a demote failure fails the whole apply");
+        // The scope was rolled back — no managed resolver file remains.
+        assert!(
+            !dir.join("corp.example.com").exists(),
+            "the resolver scope must be rolled back on demote failure"
+        );
+    }
+
+    #[test]
+    fn revert_with_removes_files_and_restores_the_default() {
+        let dir = temp_dir("revert-with");
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        // Apply (scope + demote), then revert.
+        apply_with(
+            &dir,
+            &["192.0.2.53".to_string()],
+            &["corp.example.com".to_string()],
+            Some(&["198.51.100.1".to_string()]),
+            &scutil,
+            &snaps,
+        )
+        .unwrap();
+        scutil.scripts.borrow_mut().clear();
+
+        let removed = revert_with(&dir, &scutil, &snaps).unwrap();
+        assert_eq!(removed, 1, "the one managed resolver file is removed");
+        assert!(!dir.join("corp.example.com").exists());
+        // The default was restored to the snapshotted prior servers, and the
+        // snapshot cleared.
+        let scripts = scutil.scripts.borrow();
+        assert_eq!(scripts.len(), 1);
+        assert!(scripts[0].contains("d.add ServerAddresses * 198.51.100.1\n"));
+        drop(scripts);
+        assert!(snaps.slot.borrow().is_none());
+    }
+
+    #[test]
+    fn revert_with_nothing_applied_is_a_clean_noop() {
+        let dir = temp_dir("revert-noop");
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        let removed = revert_with(&dir, &scutil, &snaps).unwrap();
+        assert_eq!(removed, 0);
+        assert!(scutil.scripts.borrow().is_empty());
     }
 
     #[test]

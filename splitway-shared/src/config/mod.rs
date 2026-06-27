@@ -50,6 +50,7 @@ pub fn create_empty_config_at(path: &Path) -> Result<(), ConfigParseError> {
         enabled: default_enabled(),
         vpn_backend: VpnBackend::default(),
         openvpn: OpenVpnConfig::default(),
+        fallback_dns: None,
     };
     save_config_to(path, &empty_config)
 }
@@ -228,6 +229,16 @@ pub struct LocalConfig {
     /// pre-3c configs parsing; ignored unless `vpn_backend = openvpn`.
     #[serde(default)]
     pub openvpn: OpenVpnConfig,
+    /// Optional override for the off-tunnel fallback resolver used on platforms
+    /// that demote a hijacked system default (macOS — see
+    /// [`crate::platform::VpnInfo::demote_target`]). `None` (the default, and
+    /// always on Linux) means "use the physical primary interface's own DHCP
+    /// resolver", which the detector discovers; `Some(servers)` pins a specific
+    /// public resolver (e.g. `["1.1.1.1"]`) for non-corp DNS instead. Ignored on
+    /// platforms that do not demote. `#[serde(default)]` keeps older configs
+    /// (without this field) parsing unchanged.
+    #[serde(default)]
+    pub fallback_dns: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -302,6 +313,8 @@ mod tests {
                 management: "127.0.0.1:7505".to_string(),
                 management_password_file: Some("/etc/splitway/mgmt.pass".to_string()),
             },
+            // A non-default value so the round-trip exercises the new field.
+            fallback_dns: Some(vec!["192.0.2.1".to_string()]),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -382,6 +395,7 @@ mod tests {
             enabled: true,
             vpn_backend: VpnBackend::default(),
             openvpn: OpenVpnConfig::default(),
+            fallback_dns: None,
         };
         save_config_to(&path, &config).unwrap();
         let loaded = load_config_from(&path).unwrap();

@@ -244,6 +244,27 @@ reimplemented per frontend:
   [`docs/design/macos-self-install.md`](docs/design/macos-self-install.md). (Homebrew —
   installing the same `.app` + binaries, with no competing `service` block — is the
   next phase.)
+- **7d-4 — macOS DNS privacy (demote + scope)**: the macOS backend reaches DNS
+  parity with Linux. The previous backend only *scoped* the corp domains via
+  `/etc/resolver`; that is insufficient against a VPN client that hijacks the
+  system **default** resolver (the corp resolver is the global default, scoped to
+  no `utun`, so non-corp DNS would also traverse the tunnel). This phase adds the
+  **demote**: snapshot the primary network service's DNS, overwrite it with an
+  off-tunnel fallback (the physical interface's own DHCP resolver, or a
+  configured `fallback_dns` override), and restore it on every revert path —
+  transactional and reversible (an on-disk snapshot survives an unclean exit).
+  Detection is rewritten to be **structural and vendor-neutral**: it reads the
+  per-service DNS model (a service whose resolver differs from the physical
+  link's is the VPN) rather than filtering `scutil --dns` by a `utun` — and reads
+  the VPN signal from the VPN's *own* service, not the global default Splitway
+  mutates, so the demote does not cause detection to oscillate. The state machine
+  is decoupled from `vpn_name` on macOS (gated via `reverts_globally()`); Linux
+  stays interface-keyed and unchanged. DNS only — no IP-route manipulation (the
+  client already splits IP; same boundary as Linux). The GUI interface-picker
+  becomes a benign no-op on macOS (removal is a later GUI phase). Implementation +
+  synthetic-fixture tests land here; the live packet-level / reconnect / revert
+  acceptance is machine-bound and verified separately. See
+  [`docs/design/macos-dns-privacy.md`](docs/design/macos-dns-privacy.md).
 
 ### Phase 8 — feature freeze + hardening
 

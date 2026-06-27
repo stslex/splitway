@@ -48,7 +48,8 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use splitway_shared::platform::{PlatformError, VpnEvent, VpnInfo};
 
-use super::detector::current_dns;
+use super::detector::current_vpn_state;
+use super::parser::Detected;
 use super::state::{sample_with_retry, Deduper, Emit, INITIAL_SAMPLE_ATTEMPTS};
 
 /// Delay between retries of the post-arm initial sample (see [`emit_initial`]).
@@ -99,9 +100,12 @@ fn run_watch(interface: String, tx: Sender<VpnEvent>) {
         }
     };
 
-    // Watch global DNS plus per-service DNS and per-interface IPv4 changes; any
-    // of these fires when a VPN comes up or goes down. The callback re-reads the
-    // full state, so over-broad keys only cost a redundant (deduped) read.
+    // Watch the per-service DNS and per-interface IPv4 keys (what detection now
+    // reads — see `parser`), plus global DNS as an extra trigger; any of these
+    // fires when a VPN comes up or goes down. The callback re-reads the full
+    // model and dedups, so over-broad keys (and the callback our own demote of a
+    // service's DNS triggers) only cost a redundant, suppressed read — never a
+    // spurious state change.
     let keys: CFArray<CFString> =
         CFArray::from_CFTypes(&[CFString::from_static_string("State:/Network/Global/DNS")]);
     let patterns: CFArray<CFString> = CFArray::from_CFTypes(&[
@@ -164,18 +168,18 @@ fn on_change(_store: SCDynamicStore, _changed_keys: CFArray<CFString>, ctx: &mut
     }
 }
 
-/// Steady-state callback path: read the interface's current DNS, decide whether
-/// it represents a new state, and send the corresponding event. Returns `false`
+/// Steady-state callback path: read the current DNS model, decide whether it
+/// represents a new state, and send the corresponding event. Returns `false`
 /// if the receiver has been dropped.
 fn emit_current(interface: &str, tx: &Sender<VpnEvent>, dedup: &mut Deduper) -> bool {
-    match current_dns(interface) {
-        Ok(servers) => emit_servers(interface, tx, dedup, servers),
+    match current_vpn_state() {
+        Ok(detected) => emit_detected(interface, tx, dedup, detected),
         // A transient `scutil` failure is not "VPN down": keep the last known
         // state instead of emitting a spurious Down that would revert rules.
         // SCDynamicStore re-fires the callback on the next change, so a one-off
         // hiccup here recovers on its own.
         Err(e) => {
-            log::warn!("reading DNS for {interface} failed: {e}; keeping last state");
+            log::warn!("reading the DNS model failed: {e}; keeping last state");
             true
         }
     }
@@ -192,16 +196,14 @@ fn emit_current(interface: &str, tx: &Sender<VpnEvent>, dedup: &mut Deduper) -> 
 /// notifications that fire during the retries are queued and delivered once the
 /// run loop starts, and the shared dedup prevents a double-emit.
 fn emit_initial(interface: &str, tx: &Sender<VpnEvent>, dedup: &mut Deduper) -> bool {
-    let sample = sample_with_retry(
-        INITIAL_SAMPLE_ATTEMPTS,
-        || current_dns(interface),
-        || std::thread::sleep(INITIAL_SAMPLE_RETRY_DELAY),
-    );
+    let sample = sample_with_retry(INITIAL_SAMPLE_ATTEMPTS, current_vpn_state, || {
+        std::thread::sleep(INITIAL_SAMPLE_RETRY_DELAY)
+    });
     match sample {
-        Ok(servers) => emit_servers(interface, tx, dedup, servers),
+        Ok(detected) => emit_detected(interface, tx, dedup, detected),
         Err(e) => {
             log::error!(
-                "initial DNS read for {interface} failed after {INITIAL_SAMPLE_ATTEMPTS} \
+                "initial DNS-model read failed after {INITIAL_SAMPLE_ATTEMPTS} \
                  attempts: {e}; auto-apply will start on the next DNS/network change"
             );
             true // stay alive; a later notification can still recover
@@ -209,19 +211,29 @@ fn emit_initial(interface: &str, tx: &Sender<VpnEvent>, dedup: &mut Deduper) -> 
     }
 }
 
-/// Dedup a freshly-read server list and send the resulting event. Returns
-/// `false` if the receiver has been dropped.
-fn emit_servers(
+/// Dedup a freshly-read detection and send the resulting event. Returns `false`
+/// if the receiver has been dropped. The `interface_name` carried in `Up` is
+/// advisory on macOS (nothing keys on it); the demote-target rides along so the
+/// backend can demote the hijacked default to it.
+fn emit_detected(
     interface: &str,
     tx: &Sender<VpnEvent>,
     dedup: &mut Deduper,
-    servers: Vec<String>,
+    detected: Detected,
 ) -> bool {
-    let event = match dedup.decide(&servers) {
-        Emit::Up => VpnEvent::Up(VpnInfo {
-            interface_name: interface.to_string(),
-            dns_servers: servers,
-        }),
+    let event = match dedup.decide(&detected) {
+        Emit::Up => match detected {
+            Detected::Up {
+                corp_dns,
+                demote_target,
+            } => VpnEvent::Up(VpnInfo {
+                interface_name: interface.to_string(),
+                dns_servers: corp_dns,
+                demote_target: Some(demote_target),
+            }),
+            // `decide` only returns `Up` for a `Detected::Up`.
+            Detected::Down => unreachable!("decide returned Up for a Down detection"),
+        },
         Emit::Down => VpnEvent::Down {
             interface_name: interface.to_string(),
         },
