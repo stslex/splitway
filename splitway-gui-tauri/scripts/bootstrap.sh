@@ -77,6 +77,17 @@ install_binaries() {
     # non-root-writable ancestor can rename/replace $BIN_DIR itself, so pinning it
     # to root:wheel below is only sound once every parent is root-only.
     assert_root_only_path "$(dirname "$BIN_DIR")"
+    # ...then resolve symlinks before trusting that result: the check above is
+    # lexical, so a symlinked $BIN_DIR (e.g. /usr/local/bin -> /Users/alice/bin)
+    # would pass it while the REAL target lives in a user-writable tree — letting
+    # that user rename/replace the target and have launchd run it as root. The
+    # lexical parent being root-only (verified above) means a non-root user cannot
+    # swap the symlink itself; this closes the other half by verifying the physical
+    # target's ancestor chain too. On a normal (non-symlink) layout it resolves to
+    # the same path, so the extra check is a no-op.
+    local real_bin
+    real_bin="$(cd "$BIN_DIR" && pwd -P)" || die "cannot resolve the real path of ${BIN_DIR}"
+    [ "$real_bin" = "$BIN_DIR" ] || assert_root_only_path "$(dirname "$real_bin")"
     chown root:wheel "$BIN_DIR" || die "cannot make ${BIN_DIR} root-owned; refusing to install a root-run binary into a non-root-writable directory"
     chmod 755 "$BIN_DIR"
     local owner

@@ -71,7 +71,12 @@ no view-model field is added, so the bindings contract is untouched.
   or, since renaming a directory entry needs write access to its *parent*, rename
   the pinned `bin` out from under us and drop in its own — and have the root
   LaunchDaemon exec it at the next boot (a persistent local privilege escalation —
-  the launchd "unsafe binary location" anti-pattern).
+  the launchd "unsafe binary location" anti-pattern). The parent-chain check is
+  **lexical**, so it also resolves symlinks before trusting the result: a symlinked
+  `/usr/local/bin` (e.g. → `/Users/alice/bin`) would pass the lexical check while
+  the real target sits in a user-writable tree, so the installer additionally
+  verifies the physical target's ancestor chain (a non-symlink layout resolves to
+  the same path, so it is a no-op there).
 - **An independent LaunchDaemon, group-reachable socket.** The GUI runs as the
   desktop user, so it reaches the root daemon only through the opt-in socket group
   (`--socket-group splitway` → `/var/run/splitway` `0750 root:splitway`, socket
