@@ -101,13 +101,19 @@ fn run_watch(interface: String, tx: Sender<VpnEvent>) {
     };
 
     // Watch the per-service DNS and per-interface IPv4 keys (what detection now
-    // reads — see `parser`), plus global DNS as an extra trigger; any of these
-    // fires when a VPN comes up or goes down. The callback re-reads the full
-    // model and dedups, so over-broad keys (and the callback our own demote of a
-    // service's DNS triggers) only cost a redundant, suppressed read — never a
-    // spurious state change.
-    let keys: CFArray<CFString> =
-        CFArray::from_CFTypes(&[CFString::from_static_string("State:/Network/Global/DNS")]);
+    // reads — see `parser`), plus the two global keys. `State:/Network/Global/IPv4`
+    // is essential, not just an extra trigger: detection reads `PrimaryService`/
+    // `PrimaryInterface` from it to anchor the physical service and demote target,
+    // and macOS can switch the primary route between already-configured services by
+    // updating only this key, without touching any watched DNS key — so without it
+    // the daemon would sleep with a stale primary-service decision. `Global/DNS` is
+    // the extra trigger. The callback re-reads the full model and dedups, so
+    // over-broad keys (and the callback our own demote of a service's DNS triggers)
+    // only cost a redundant, suppressed read — never a spurious state change.
+    let keys: CFArray<CFString> = CFArray::from_CFTypes(&[
+        CFString::from_static_string("State:/Network/Global/IPv4"),
+        CFString::from_static_string("State:/Network/Global/DNS"),
+    ]);
     let patterns: CFArray<CFString> = CFArray::from_CFTypes(&[
         CFString::from_static_string("(State|Setup):/Network/Service/.*/DNS"),
         CFString::from_static_string("State:/Network/Interface/.*/IPv4"),

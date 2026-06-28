@@ -122,10 +122,12 @@ impl DnsBackend for MacosBackend {
 ///    `/etc/resolver` (itself transactional; rolls back on any failure).
 /// 2. **Demote** — when `fallback` is `Some` (the VPN hijacked the system
 ///    default), [`demote::demote`] sends non-corp DNS off-tunnel. If it fails,
-///    the resolver scope from step 1 is rolled back so the system is never left
-///    half-changed (scoped but with the default still hijacked), and the demote
-///    error is surfaced. The demote's own snapshot still lets a later revert
-///    restore the default even if this rollback is incomplete.
+///    step 1's writes are rolled back **to the exact pre-apply scope** so the
+///    system is never left half-changed (scoped but with the default still
+///    hijacked), and the demote error is surfaced. Rolling back this apply's
+///    journal — not a blanket managed-file removal — means a re-apply whose
+///    demote fails restores the previously-working split DNS instead of wiping
+///    it. The demote's own snapshot still lets a later revert restore the default.
 fn apply_with(
     dir: &Path,
     servers: &[String],
@@ -134,16 +136,15 @@ fn apply_with(
     scutil: &dyn demote::ScutilRunner,
     snapshots: &dyn demote::SnapshotStore,
 ) -> Result<(), PlatformError> {
-    apply_to_dir(dir, servers, domains)?;
+    let journal = apply_to_dir(dir, servers, domains)?;
 
     if let Some(fallback) = fallback {
         if let Err(e) = demote::demote(scutil, snapshots, fallback) {
-            // Undo the scope just written so no partial state remains.
-            if let Err(rollback_err) = remove_managed(dir, None) {
-                log::error!(
-                    "demote failed and rolling back the resolver scope also failed: {rollback_err}"
-                );
-            }
+            // Undo exactly this apply's scope changes — overwritten files back to
+            // their prior bytes, newly-created and pruned files undone — so a
+            // transient demote failure restores the prior scope rather than
+            // dropping every managed resolver file.
+            rollback(&journal);
             return Err(e);
         }
     }
@@ -173,7 +174,7 @@ fn revert_with(
     scutil: &dyn demote::ScutilRunner,
     snapshots: &dyn demote::SnapshotStore,
 ) -> Result<RevertOutcome, PlatformError> {
-    let removed = remove_managed(dir, None).map_err(|e| {
+    let removed = remove_managed(dir, None, None).map_err(|e| {
         PlatformError::CommandFailed(format!("failed to remove resolver files: {e}"))
     })?;
     let restored_default = demote::restore(scutil, snapshots)?;
@@ -185,6 +186,7 @@ fn revert_with(
 
 /// Prior on-disk state of a resolver file before this apply touched it, used to
 /// undo a failed apply.
+#[derive(Debug)]
 enum Prior {
     /// The file existed; these are its bytes, restored on rollback.
     Existed(Vec<u8>),
@@ -203,7 +205,15 @@ enum Prior {
 /// never a partial or empty set. Then prunes our now-unwanted files; a prune
 /// failure is returned (not swallowed) so the caller retries rather than
 /// recording success while a dropped domain's file keeps routing.
-fn apply_to_dir(dir: &Path, servers: &[String], domains: &[String]) -> Result<(), PlatformError> {
+///
+/// On success returns the **journal** of every change made (files overwritten,
+/// created, and pruned), so a caller (the apply pipeline) can undo exactly this
+/// reconcile — restoring the prior scope — if a *later* step (the demote) fails.
+fn apply_to_dir(
+    dir: &Path,
+    servers: &[String],
+    domains: &[String],
+) -> Result<Vec<(PathBuf, Prior)>, PlatformError> {
     // Reject names that are not safe single path components before touching the
     // filesystem: `dir.join("../x")` would escape /etc/resolver, and a
     // slash-containing name would never match the single-component filenames
@@ -286,20 +296,17 @@ fn apply_to_dir(dir: &Path, servers: &[String], domains: &[String]) -> Result<()
 
     let keep: BTreeSet<&str> = domains.iter().map(String::as_str).collect();
     // Surface prune failures: a leftover file for a dropped domain keeps routing
-    // it through the VPN. Roll back this call's writes first — on a failed
-    // reconcile the state machine does not record `applied`, so newly-created
-    // files left behind would be skipped by a later revert. This undoes only
-    // this call's writes; a partially-completed prune is not un-deleted, but
-    // prune only ever removes files that are being dropped or are already stale,
-    // so those deletions are safe to leave. The result stays consistent with the
-    // retained `applied` state.
-    if let Err(e) = remove_managed(dir, Some(&keep)) {
+    // it through the VPN. The prune records each removed file into `written` (as
+    // `Prior::Existed`), so on a prune failure — or a later demote failure — the
+    // rollback restores the pruned files too, leaving the prior scope exactly as
+    // it was rather than a partial set.
+    if let Err(e) = remove_managed(dir, Some(&keep), Some(&mut written)) {
         rollback(&written);
         return Err(PlatformError::CommandFailed(format!(
             "failed to prune stale resolver files: {e}"
         )));
     }
-    Ok(())
+    Ok(written)
 }
 
 /// Undo the writes recorded in `written`, most recent first: restore each
@@ -323,7 +330,15 @@ fn rollback(written: &[(PathBuf, Prior)]) {
 /// filename is in `keep` (when `Some`). A missing `dir` is treated as "nothing
 /// to remove". Returns how many files were removed. Files we do not own (no
 /// marker) and unreadable files are left untouched.
-fn remove_managed(dir: &Path, keep: Option<&BTreeSet<&str>>) -> io::Result<usize> {
+///
+/// When `journal` is `Some`, each removed file is recorded as
+/// `(path, Prior::Existed(bytes))` so a later [`rollback`] can re-create it — the
+/// apply pipeline uses this so a prune is undoable along with the writes.
+fn remove_managed(
+    dir: &Path,
+    keep: Option<&BTreeSet<&str>>,
+    mut journal: Option<&mut Vec<(PathBuf, Prior)>>,
+) -> io::Result<usize> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
@@ -347,11 +362,16 @@ fn remove_managed(dir: &Path, keep: Option<&BTreeSet<&str>>) -> io::Result<usize
         if keep.is_some_and(|keep| keep.contains(name)) {
             continue;
         }
-        // Only touch files we wrote; never a user-authored resolver file.
-        match fs::read_to_string(&path) {
-            Ok(contents) if is_managed(&contents) => {
+        // Only touch files we wrote; never a user-authored resolver file. Read
+        // the bytes (not a lossy string) so a journaled entry restores them
+        // exactly on rollback.
+        match fs::read(&path) {
+            Ok(bytes) if is_managed(&String::from_utf8_lossy(&bytes)) => {
                 fs::remove_file(&path)?;
                 removed += 1;
+                if let Some(journal) = journal.as_deref_mut() {
+                    journal.push((path, Prior::Existed(bytes)));
+                }
             }
             _ => {}
         }
@@ -552,6 +572,55 @@ mod tests {
     }
 
     #[test]
+    fn demote_failure_on_a_reapply_restores_the_previous_scope() {
+        // A re-apply over a previously-working scope whose demote then fails must
+        // restore the PRIOR files (overwritten ones back to their old content,
+        // pruned ones re-created), not wipe every managed resolver file.
+        let dir = temp_dir("apply-reapply-rollback");
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        // First apply (no demote): two managed files become the working scope.
+        apply_with(
+            &dir,
+            &["192.0.2.53".to_string()],
+            &[
+                "corp.example.com".to_string(),
+                "old.example.com".to_string(),
+            ],
+            None,
+            &scutil,
+            &snaps,
+        )
+        .unwrap();
+        let corp_before = fs::read_to_string(dir.join("corp.example.com")).unwrap();
+        assert!(dir.join("old.example.com").exists());
+
+        // Re-apply with new servers, dropping old.example.com — but the demote fails.
+        scutil.fail_on_set();
+        let result = apply_with(
+            &dir,
+            &["192.0.2.99".to_string()],
+            &["corp.example.com".to_string()],
+            Some(&["198.51.100.1".to_string()]),
+            &scutil,
+            &snaps,
+        );
+        assert!(result.is_err(), "the demote failure fails the apply");
+        // The previous scope is restored exactly: corp.example.com back to its
+        // prior content, and the pruned old.example.com re-created.
+        assert_eq!(
+            fs::read_to_string(dir.join("corp.example.com")).unwrap(),
+            corp_before,
+            "the overwritten file is restored to its pre-reapply content"
+        );
+        assert!(
+            dir.join("old.example.com").exists(),
+            "the pruned file is restored on rollback — not left dropped"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn revert_with_removes_files_and_restores_the_default() {
         let dir = temp_dir("revert-with");
         let scutil = FakeScutil::up();
@@ -681,7 +750,7 @@ mod tests {
         let user_file = dir.join("user.example");
         fs::write(&user_file, "nameserver 9.9.9.9\n").unwrap();
 
-        let removed = remove_managed(&dir, None).unwrap();
+        let removed = remove_managed(&dir, None, None).unwrap();
         assert_eq!(removed, 1);
         assert!(!dir.join("a.com").exists(), "our file is removed");
         assert!(user_file.exists(), "the user's file is untouched");
@@ -693,7 +762,7 @@ mod tests {
         let mut missing = std::env::temp_dir();
         missing.push(format!("splitway-absent-resolver-{}", std::process::id()));
         let _ = fs::remove_dir_all(&missing);
-        assert_eq!(remove_managed(&missing, None).unwrap(), 0);
+        assert_eq!(remove_managed(&missing, None, None).unwrap(), 0);
     }
 
     #[test]
