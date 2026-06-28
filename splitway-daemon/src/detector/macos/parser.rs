@@ -196,15 +196,31 @@ pub(super) fn decide(model: &DnsModel) -> Detected {
     // when known (a VPN service can also report the primary interface name, so
     // the id is preferred), falling back to the primary interface name. Its
     // resolver is the demote-target (where non-corp DNS goes off-tunnel).
-    let physical = model.services.iter().find(|s| {
-        !s.servers.is_empty()
-            && match model.primary_service.as_deref() {
-                Some(id) => s.service_id == id,
-                None => s.interface_name.as_deref() == model.primary_interface.as_deref(),
+    let physical = match model.primary_service.as_deref() {
+        Some(id) => model
+            .services
+            .iter()
+            .find(|s| !s.servers.is_empty() && s.service_id == id),
+        // No authoritative PrimaryService id: anchor on the primary interface
+        // name — but only when EXACTLY ONE DNS-bearing service reports it. A VPN
+        // service can also report the primary interface, so if more than one
+        // matches we cannot tell which is physical; picking the first would risk
+        // selecting the VPN's corp resolver as "physical", inverting corp/fallback
+        // (apply corp domains to the off-tunnel DNS and demote the default to the
+        // corp DNS — a leak). Treat that as ambiguous and stay conservative.
+        None => {
+            let mut matches = model.services.iter().filter(|s| {
+                !s.servers.is_empty()
+                    && s.interface_name.as_deref() == model.primary_interface.as_deref()
+            });
+            match (matches.next(), matches.next()) {
+                (Some(only), None) => Some(only),
+                _ => None, // zero matches, or ambiguous (more than one) → Down below
             }
-    });
+        }
+    };
     let Some(physical) = physical else {
-        // Without the physical resolver we cannot pick a safe demote-target.
+        // No unambiguous physical resolver → cannot pick a safe demote-target.
         return Detected::Down;
     };
 
@@ -491,13 +507,15 @@ mod tests {
 
     #[test]
     fn falls_back_to_interface_name_when_primary_service_is_unknown() {
-        // If PrimaryService is absent, anchor on the primary interface name.
+        // If PrimaryService is absent, anchor on the primary interface name — but
+        // only when EXACTLY ONE DNS service reports it. Here the VPN is on a tunnel,
+        // so the physical en0 service is the unambiguous match.
         let m = model(
             Some("en0"),
             None,
             vec![
                 svc("phys", Some("en0"), &["198.51.100.1"]),
-                svc("vpn", Some("en0"), &["192.0.2.53"]),
+                svc("vpn", Some("utun4"), &["192.0.2.53"]),
             ],
         );
         assert_eq!(
@@ -507,6 +525,24 @@ mod tests {
                 demote_target: vec!["198.51.100.1".to_string()],
             }
         );
+    }
+
+    #[test]
+    fn ambiguous_primary_interface_fallback_is_conservative_down() {
+        // P2: PrimaryService is absent AND more than one DNS service reports the
+        // primary interface (a VPN service can also report it). We cannot tell which
+        // is physical, so picking the first risks selecting the VPN's corp resolver
+        // as "physical" — inverting corp/fallback (corp domains to the off-tunnel
+        // DNS, default demoted to corp DNS). Stay conservative: Down.
+        let m = model(
+            Some("en0"),
+            None,
+            vec![
+                svc("vpn", Some("en0"), &["192.0.2.53"]), // VPN also on en0, listed first
+                svc("phys", Some("en0"), &["198.51.100.1"]),
+            ],
+        );
+        assert_eq!(decide(&m), Detected::Down);
     }
 
     #[test]

@@ -846,12 +846,15 @@ impl StateMachine {
     /// occur) is reported as `NoDnsFromVpn` rather than a near-unreachable state.
     ///
     /// A known out-of-sync condition takes precedence over every "inactive"
-    /// reason: a failed apply/revert (`needs_resync`) or an interface orphaned by
-    /// a failed switch (`orphaned` non-empty) means stale split-DNS rules may
-    /// still be installed somewhere, so reporting `Disabled`/`Applied`/etc. would
-    /// claim a clean state the daemon does not believe in. Both surface as
-    /// `ApplyFailed` ("out of sync") until cleanup succeeds — e.g. a `Disable`
-    /// whose revert failed reads `ApplyFailed`, not `Disabled`.
+    /// reason: a failed apply/revert (`needs_resync`), an interface orphaned by a
+    /// failed switch (`orphaned` non-empty), or a pending global cleanup (a macOS
+    /// startup demote-reconcile that failed transiently — `pending_global_cleanup`)
+    /// each means stale split-DNS rules or a stale demoted default may still be
+    /// installed, so reporting `Disabled`/`VpnDown`/`Applied`/etc. would claim a
+    /// clean state the daemon does not believe in. All surface as `ApplyFailed`
+    /// ("out of sync") until cleanup succeeds — e.g. a `Disable` whose revert
+    /// failed reads `ApplyFailed`, not `Disabled`; and a restart that could not
+    /// clear an orphaned demote reads `ApplyFailed`, not `VpnDown`.
     fn routing_state(&self) -> RoutingState {
         // A config file that does not parse takes precedence over everything:
         // the daemon froze on the last-good config, and the user must learn
@@ -860,9 +863,12 @@ impl StateMachine {
         if self.config_invalid {
             return RoutingState::ConfigInvalid;
         }
-        // Out-of-sync (a failed apply/revert, or a lingering orphaned interface)
-        // overrides the inactive-reason branches below — see the doc above.
-        if self.needs_resync || !self.orphaned.is_empty() {
+        // Out-of-sync (a failed apply/revert, a lingering orphaned interface, or a
+        // pending macOS demote-cleanup) overrides the inactive-reason branches
+        // below — see the doc above. Without the pending-cleanup term, a restart
+        // that left an orphaned demote pending would report `VpnDown` while the
+        // default DNS is still demoted.
+        if self.needs_resync || !self.orphaned.is_empty() || self.pending_global_cleanup {
             return RoutingState::ApplyFailed;
         }
         if !self.config.enabled {
@@ -2031,6 +2037,32 @@ mod tests {
             backend.reverts.lock().unwrap().len(),
             2,
             "the cleanup is retried until it succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reports_apply_failed_while_a_global_cleanup_is_pending() {
+        // P2: a pending macOS demote-cleanup (a startup reconcile that failed) means
+        // a stale default DNS may still be installed, so status must read
+        // ApplyFailed — not VpnDown — even though nothing is applied and the VPN is
+        // down at restart.
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        backend.set_fail_revert(true);
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "status-pending-cleanup",
+        );
+        sm.cleanup_orphaned_state_on_startup().await; // fails → pending set
+        assert!(sm.pending_global_cleanup);
+        assert!(!sm.vpn_up, "VPN is down at restart");
+        assert!(sm.applied.is_none());
+
+        assert_eq!(
+            sm.routing_state(),
+            RoutingState::ApplyFailed,
+            "a pending demote-cleanup is out-of-sync, not a clean VpnDown"
         );
     }
 
