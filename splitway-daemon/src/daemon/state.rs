@@ -597,6 +597,39 @@ impl StateMachine {
         }
     }
 
+    /// Reconcile orphaned persisted state left by a previous unclean exit, once at
+    /// startup (before the watch is armed).
+    ///
+    /// A **global-revert backend** (macOS) persists its default-DNS demote on disk
+    /// so it survives a SIGKILL. If the daemon was killed while demoted and the VPN
+    /// then went down before this restart, the watch's initial sample is `Down`
+    /// and is suppressed (nothing changed from the watcher's view), so without this
+    /// nothing would restore the default resolver or clear the snapshot — the
+    /// machine would stay pinned to the off-tunnel fallback until the next VPN
+    /// up→down cycle. A global revert is idempotent (a no-op when nothing was
+    /// persisted); and if a VPN is in fact up, the watch's initial `Up` re-applies
+    /// immediately after. Per-interface backends (Linux) keep no cross-restart
+    /// persisted state of this kind, so they skip it (their revert needs a live
+    /// `applied` interface anyway). `applied` stays `None` either way — this only
+    /// cleans state a *previous* process left behind.
+    async fn cleanup_orphaned_state_on_startup(&self) {
+        if !self.backend.reverts_globally() {
+            return;
+        }
+        let backend = self.backend.clone();
+        let interface = self.config.vpn_name.clone();
+        match tokio::task::spawn_blocking(move || backend.revert_rules(&interface)).await {
+            Ok(Ok(())) => {
+                log::debug!("startup: reconciled any orphaned default-DNS demote state")
+            }
+            Ok(Err(e)) => log::warn!(
+                "startup orphaned-state cleanup failed: {e}; \
+                 it will be retried on the next VPN event"
+            ),
+            Err(e) => log::error!("startup orphaned-state cleanup task panicked: {e}"),
+        }
+    }
+
     /// Entry point for a forwarded detector event. Drops events from a watch
     /// generation we have since superseded (an interface switch may leave an
     /// in-flight event from the old forwarding task), so the old interface's
@@ -1309,6 +1342,11 @@ pub async fn run_state(
     mut rx: mpsc::Receiver<StateCommand>,
     mut shutdown: oneshot::Receiver<oneshot::Sender<bool>>,
 ) {
+    // Reconcile any orphaned persisted state left by a previous unclean exit
+    // (e.g. a global-revert backend's default-DNS demote snapshot) before arming
+    // the watch — the initial Down sample is suppressed, so this is the only path
+    // that clears it when the VPN is already down at startup.
+    machine.cleanup_orphaned_state_on_startup().await;
     // Arm the VPN watch once here, before the command loop, so all watch
     // lifecycle (start at boot, re-arm on config change) lives in one owner —
     // the actor — rather than being split with `run_async`.
@@ -1845,6 +1883,51 @@ mod tests {
 
         assert!(backend.applies.lock().unwrap().is_empty());
         assert!(sm.applied.is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_reconciles_orphaned_demote_for_a_global_revert_backend() {
+        // A macOS-style backend persists its default-DNS demote across an unclean
+        // exit, so the daemon reverts any orphaned state once at startup — a
+        // suppressed initial Down would otherwise never clear it.
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        let sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "startup-cleanup-global",
+        );
+
+        sm.cleanup_orphaned_state_on_startup().await;
+
+        assert_eq!(
+            backend.reverts.lock().unwrap().as_slice(),
+            &["wg0"],
+            "the global-revert backend is reconciled once at boot"
+        );
+        assert!(
+            sm.applied.is_none(),
+            "cleanup records nothing as applied — it only clears a prior process's state"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_skips_cleanup_for_a_per_interface_backend() {
+        // A per-interface backend (Linux) keeps no cross-restart persisted state of
+        // this kind, so startup must not issue a spurious revert.
+        let backend = Arc::new(MockBackend::default()); // reverts_globally == false
+        let sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "startup-cleanup-skip",
+        );
+
+        sm.cleanup_orphaned_state_on_startup().await;
+
+        assert!(
+            backend.reverts.lock().unwrap().is_empty(),
+            "a per-interface backend is not reverted at boot"
+        );
     }
 
     #[tokio::test]

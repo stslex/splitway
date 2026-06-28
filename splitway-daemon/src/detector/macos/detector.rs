@@ -90,9 +90,19 @@ fn read_dns_model() -> Result<DnsModel, PlatformError> {
         if servers.is_empty() {
             continue; // a service with no DNS contributes nothing
         }
+        let service_id = service_id_from_key(key);
+        // The interface binding is read from the service's IPv4/IPv6 entity, NOT
+        // the DNS dict — the DNS schema is the DNS fields (ServerAddresses, …) and
+        // does not reliably carry InterfaceName. Reading it only from the DNS dict
+        // would leave a secondary Wi-Fi/Ethernet service's interface unknown, and
+        // `decide` would then misread that `None` as an unscoped/default hijacker
+        // (a false "VPN up"). Fall back to the DNS dict only if neither entity
+        // names an interface.
+        let interface_name = read_service_interface(&service_id)
+            .or_else(|| parse_scalar_field(&dump, "InterfaceName"));
         services.push(ServiceDns {
-            service_id: service_id_from_key(key),
-            interface_name: parse_scalar_field(&dump, "InterfaceName"),
+            service_id,
+            interface_name,
             servers,
         });
     }
@@ -102,6 +112,24 @@ fn read_dns_model() -> Result<DnsModel, PlatformError> {
         primary_service,
         services,
     })
+}
+
+/// Read the BSD interface a service is bound to, from its IPv4 (then IPv6)
+/// dynamic-store entity — the reliable source for the binding. The per-service
+/// DNS entity does not reliably carry `InterfaceName` (its schema is the DNS
+/// fields), so reading the interface only from the DNS dict can leave a secondary
+/// network's interface unknown, which `decide` would misclassify as an unscoped
+/// (default-hijacker) resolver. Returns `None` only when neither entity names one.
+fn read_service_interface(service_id: &str) -> Option<String> {
+    for entity in ["IPv4", "IPv6"] {
+        let key = format!("State:/Network/Service/{service_id}/{entity}");
+        if let Ok(dump) = scutil_show(&key) {
+            if let Some(iface) = parse_scalar_field(&dump, "InterfaceName") {
+                return Some(iface);
+            }
+        }
+    }
+    None
 }
 
 /// Extract the dynamic-store key from one `scutil list` output row. `scutil`
