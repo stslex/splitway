@@ -299,6 +299,19 @@ impl SnapshotStore for FileSnapshotStore {
     }
 }
 
+/// Order-insensitive equality of two resolver lists (treated as sets) — used to
+/// tell whether a service's live DNS is still our fallback or a new real resolver.
+fn same_server_set(a: &[String], b: &[String]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a: Vec<&String> = a.iter().collect();
+    let mut b: Vec<&String> = b.iter().collect();
+    a.sort();
+    b.sort();
+    a == b
+}
+
 /// Demote the system default resolver to `fallback`, snapshotting the prior
 /// primary-service DNS first so [`restore`] can undo it. Idempotent: re-running
 /// with the same fallback is a no-op-equivalent (it re-sets the same servers);
@@ -326,15 +339,29 @@ pub(super) fn demote(
     // Snapshot handling, keyed by the service we are about to demote:
     //
     // - No snapshot yet → capture this service's prior DNS (the first demote).
-    // - A snapshot for THIS SAME service → keep it (a reconcile re-apply must not
-    //   snapshot our own fallback as the "prior").
+    // - A snapshot for THIS SAME service → keep it, UNLESS the service's live DNS
+    //   has changed to something other than our fallback (a DHCP renewal handed the
+    //   same service a new resolver and the watcher re-emitted Up): then refresh
+    //   the snapshot to the current resolver, so a later restore writes back the
+    //   latest service DNS rather than the stale pre-change one. A reconcile
+    //   re-apply where the service still shows our fallback keeps the snapshot (we
+    //   must never capture our own fallback as the "prior").
     // - A snapshot for a DIFFERENT service (the primary changed while up — e.g. a
     //   Wi-Fi↔Ethernet switch) → restore that previous service from its snapshot
     //   first, so it is not left stranded on our fallback, then capture and demote
     //   the new primary. Exactly one service is ever demoted at a time.
     match snapshots.load() {
         Some(existing) if existing.service_dns_key == key => {
-            // Same service — keep the original prior snapshot.
+            let current = scutil.service_dns_state(&key)?;
+            if !current.servers.is_empty() && !same_server_set(&current.servers, fallback) {
+                // The service's real DNS changed under us → refresh the snapshot.
+                snapshots.save(&DemoteSnapshot {
+                    service_dns_key: key.clone(),
+                    interface_name: current.interface_name,
+                    prior_servers: current.servers,
+                })?;
+            }
+            // else: still our fallback (or no DNS) → keep the original snapshot.
         }
         Some(existing) => {
             // Primary changed: un-demote the old service, then snapshot the new.
@@ -374,20 +401,21 @@ fn capture_snapshot(
     })
 }
 
-/// Restore the demoted default from the snapshot, then clear it. A missing
-/// snapshot is a clean no-op (nothing was demoted, or already restored). Always
-/// clears the snapshot on success so a later demote re-snaps.
+/// Restore the demoted default from the snapshot, then clear it. Returns whether
+/// a snapshot was present and restored (so the caller can flush the DNS cache
+/// even when no resolver files were removed). A missing snapshot is a clean no-op
+/// → `Ok(false)`. Always clears the snapshot on success so a later demote re-snaps.
 pub(super) fn restore(
     scutil: &dyn ScutilRunner,
     snapshots: &dyn SnapshotStore,
-) -> Result<(), PlatformError> {
+) -> Result<bool, PlatformError> {
     let Some(snapshot) = snapshots.load() else {
-        return Ok(()); // nothing demoted
+        return Ok(false); // nothing demoted
     };
     restore_snapshot(scutil, &snapshot)?;
     snapshots.clear();
     log::info!("restored the system default resolver from the demote snapshot");
-    Ok(())
+    Ok(true)
 }
 
 /// Run the `scutil` write that restores one snapshot's service to its prior DNS.
@@ -656,19 +684,56 @@ mod tests {
     }
 
     #[test]
-    fn redemote_does_not_overwrite_the_original_snapshot() {
+    fn redemote_same_service_still_on_our_fallback_keeps_the_snapshot() {
         let scutil = FakeScutil::up();
         let snaps = MemSnapshots::default();
         demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
         let after_first = snaps.load().unwrap();
-        // A second demote (same primary) must keep the ORIGINAL prior, not
-        // snapshot our own fallback.
+        // The demote took effect: the service now reports OUR fallback as its DNS.
+        scutil.set_service_state(
+            "State:/Network/Service/ABC/DNS",
+            ServiceDnsState {
+                interface_name: Some("en0".to_string()),
+                servers: vec!["203.0.113.9".to_string()],
+            },
+        );
+        // A second demote (same primary, still our fallback) must keep the ORIGINAL
+        // prior, not snapshot our own fallback.
         demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
         assert_eq!(snaps.load().unwrap(), after_first);
         assert_eq!(
             after_first.prior_servers,
             vec!["198.51.100.1".to_string()],
             "the snapshot must remain the real prior resolver, never our fallback"
+        );
+    }
+
+    #[test]
+    fn redemote_same_service_refreshes_the_snapshot_when_the_dhcp_dns_changed() {
+        // P2: the SAME primary service stays active but its DHCP resolver changes
+        // (a new lease overwrites our fallback) and the watcher re-emits Up. The
+        // snapshot must refresh to the NEW resolver, so a later restore writes back
+        // the latest service DNS instead of pinning the pre-change one.
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
+        // DHCP hands the same service a new resolver.
+        scutil.set_service_state(
+            "State:/Network/Service/ABC/DNS",
+            ServiceDnsState {
+                interface_name: Some("en0".to_string()),
+                servers: vec!["198.51.100.77".to_string()],
+            },
+        );
+        demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
+        assert_eq!(
+            snaps.load().unwrap(),
+            snap(
+                "State:/Network/Service/ABC/DNS",
+                Some("en0"),
+                &["198.51.100.77"]
+            ),
+            "the snapshot must track the new DHCP resolver so restore is not stale"
         );
     }
 

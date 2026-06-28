@@ -41,15 +41,22 @@ impl DnsBackend for MacosBackend {
     }
 
     fn revert_rules(&self, _interface: &str) -> Result<(), PlatformError> {
-        let removed = revert_with(
+        let outcome = revert_with(
             Path::new(RESOLVER_DIR),
             &demote::RealScutil,
             &demote::FileSnapshotStore::new(),
         )?;
-        if removed > 0 {
+        // Flush when EITHER resolver files were removed OR a demoted default was
+        // restored — restoring the default changes resolution even when no files
+        // were removed (e.g. a retried revert after the files were already gone),
+        // so the cache must not keep serving the demoted/default answers.
+        if outcome.removed > 0 || outcome.restored_default {
             flush_dns_cache();
         }
-        log::info!("reverted {removed} splitway resolver file(s) and restored any demoted default");
+        log::info!(
+            "reverted {} splitway resolver file(s) and restored any demoted default",
+            outcome.removed
+        );
         Ok(())
     }
 
@@ -143,10 +150,18 @@ fn apply_with(
     Ok(())
 }
 
+/// What a revert changed: how many managed resolver files were removed, and
+/// whether a demoted system default was restored. Either being non-trivial means
+/// resolution changed and the DNS cache must be flushed.
+struct RevertOutcome {
+    removed: usize,
+    restored_default: bool,
+}
+
 /// The revert pipeline, parameterized over the resolver dir and the demote seam.
 /// Removes every managed `/etc/resolver` file AND restores any demoted system
-/// default from the on-disk snapshot. Returns the number of resolver files
-/// removed (so the caller can decide whether a cache flush is warranted).
+/// default from the on-disk snapshot. Reports both (see [`RevertOutcome`]) so the
+/// caller can flush the DNS cache when either changed.
 ///
 /// The restore runs even when no resolver files were removed: a prior run may
 /// have demoted without (or after pruning) resolver files, and the snapshot is
@@ -157,12 +172,15 @@ fn revert_with(
     dir: &Path,
     scutil: &dyn demote::ScutilRunner,
     snapshots: &dyn demote::SnapshotStore,
-) -> Result<usize, PlatformError> {
+) -> Result<RevertOutcome, PlatformError> {
     let removed = remove_managed(dir, None).map_err(|e| {
         PlatformError::CommandFailed(format!("failed to remove resolver files: {e}"))
     })?;
-    demote::restore(scutil, snapshots)?;
-    Ok(removed)
+    let restored_default = demote::restore(scutil, snapshots)?;
+    Ok(RevertOutcome {
+        removed,
+        restored_default,
+    })
 }
 
 /// Prior on-disk state of a resolver file before this apply touched it, used to
@@ -550,8 +568,12 @@ mod tests {
         .unwrap();
         scutil.scripts.borrow_mut().clear();
 
-        let removed = revert_with(&dir, &scutil, &snaps).unwrap();
-        assert_eq!(removed, 1, "the one managed resolver file is removed");
+        let outcome = revert_with(&dir, &scutil, &snaps).unwrap();
+        assert_eq!(
+            outcome.removed, 1,
+            "the one managed resolver file is removed"
+        );
+        assert!(outcome.restored_default, "the demoted default was restored");
         assert!(!dir.join("corp.example.com").exists());
         // The default was restored to the snapshotted prior servers, and the
         // snapshot cleared.
@@ -567,9 +589,44 @@ mod tests {
         let dir = temp_dir("revert-noop");
         let scutil = FakeScutil::up();
         let snaps = MemSnapshots::default();
-        let removed = revert_with(&dir, &scutil, &snaps).unwrap();
-        assert_eq!(removed, 0);
+        let outcome = revert_with(&dir, &scutil, &snaps).unwrap();
+        assert_eq!(outcome.removed, 0);
+        assert!(!outcome.restored_default);
         assert!(scutil.scripts.borrow().is_empty());
+    }
+
+    #[test]
+    fn revert_with_reports_a_restore_even_when_no_files_were_removed() {
+        // P2: the resolver files were already gone (removed == 0) but a demote
+        // snapshot still exists (e.g. a prior revert removed the files, then the
+        // scutil restore failed; this retry restores the default). revert_with must
+        // report the restore so the caller still flushes the DNS cache.
+        let dir = temp_dir("revert-restore-only");
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        apply_with(
+            &dir,
+            &["192.0.2.53".to_string()],
+            &["corp.example.com".to_string()],
+            Some(&["198.51.100.1".to_string()]),
+            &scutil,
+            &snaps,
+        )
+        .unwrap();
+        // Simulate the resolver file already being gone from a prior partial revert.
+        fs::remove_file(dir.join("corp.example.com")).unwrap();
+        scutil.scripts.borrow_mut().clear();
+
+        let outcome = revert_with(&dir, &scutil, &snaps).unwrap();
+        assert_eq!(outcome.removed, 0, "no resolver files left to remove");
+        assert!(
+            outcome.restored_default,
+            "the demoted default was still restored → caller must flush"
+        );
+        assert!(
+            snaps.slot.borrow().is_none(),
+            "snapshot cleared after restore"
+        );
     }
 
     #[test]
