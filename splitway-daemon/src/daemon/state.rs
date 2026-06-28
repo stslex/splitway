@@ -1348,10 +1348,25 @@ impl StateMachine {
 }
 
 /// Whether a config delta requires re-arming the detector watch — i.e. it
-/// touches a field the watch is keyed on. Domain/`enabled` edits do not (those
-/// only change `desired()`), so they reconcile without tearing the watch down.
+/// touches a field the watch is keyed on, OR a field whose change needs the
+/// revert + re-sample that a re-arm performs. Domain/`enabled` edits do not
+/// (those only change `desired()`), so they reconcile without tearing the watch
+/// down.
+///
+/// `fallback_dns` is included for the revert + re-sample, not because the watch
+/// is keyed on it: after a macOS demote the detector reads the demoted value back
+/// as the demote-target, so `last_info.demote_target` becomes the override we
+/// installed. Without a fresh sample, removing or changing the override would
+/// leave the physical service pinned to the old fallback (`desired()` still
+/// equals the applied target, so nothing re-applies until the next network/VPN
+/// cycle). The re-arm reverts first — restoring the real prior DHCP resolver from
+/// the demote snapshot — then re-samples, so the next demote targets the correct
+/// resolver. (Harmless on Linux, which ignores `fallback_dns`.)
 fn watch_settings_changed(old: &LocalConfig, new: &LocalConfig) -> bool {
-    old.vpn_name != new.vpn_name || old.vpn_backend != new.vpn_backend || old.openvpn != new.openvpn
+    old.vpn_name != new.vpn_name
+        || old.vpn_backend != new.vpn_backend
+        || old.openvpn != new.openvpn
+        || old.fallback_dns != new.fallback_dns
 }
 
 /// The reply when a mutation cannot read the config file (missing or malformed).
@@ -2726,6 +2741,16 @@ mod tests {
         let mut ovpn = base.clone();
         ovpn.openvpn.management = "127.0.0.1:7505".to_string();
         assert!(watch_settings_changed(&base, &ovpn));
+
+        // A `fallback_dns` change also re-arms: the re-arm's revert + re-sample is
+        // what restores the real prior DHCP resolver and re-demotes to it after the
+        // override is changed/removed (the detector reads the demoted value back, so
+        // a plain reconcile would otherwise stay pinned to the old fallback).
+        let mut fallback = base.clone();
+        fallback.fallback_dns = Some(vec!["203.0.113.9".to_string()]);
+        assert!(watch_settings_changed(&base, &fallback));
+        // ...and removing it again is a change too.
+        assert!(watch_settings_changed(&fallback, &base));
     }
 
     #[tokio::test]

@@ -369,15 +369,20 @@ pub(super) fn demote(
         Some(existing) if existing.service_dns_key == key => {
             let current = scutil.service_dns_state(&key)?;
             // Keep the original prior while the service still shows a fallback WE
-            // installed (`installed_fallback`) — never capture our own fallback. A
-            // value that is neither empty nor our installed fallback is a genuine
-            // DHCP update on the same service → adopt it as the new prior so a
-            // later restore writes the latest resolver. Comparing against the
-            // recorded installed fallback (NOT the new `fallback`) is what keeps a
-            // `fallback_dns` config change — where the service still shows a
-            // *previous* fallback we wrote — from being mistaken for a DHCP update.
+            // installed — never capture our own fallback. We recognise "ours" two
+            // ways: the recorded `installed_fallback` (handles a `fallback_dns`
+            // change, where the service still shows a *previous* fallback we wrote)
+            // AND the `fallback` we are about to (re)install (handles a retry after
+            // the post-write `installed_fallback` record below failed, leaving it
+            // stale/empty while the service already shows this fallback — without
+            // this clause the retry would mistake our own fallback for a DHCP
+            // update and snapshot it as the prior, losing the real resolver). A
+            // value that is neither empty nor one of those is a genuine DHCP update
+            // on the same service → adopt it as the new prior so a later restore
+            // writes it.
             if !current.servers.is_empty()
                 && !same_server_set(&current.servers, &existing.installed_fallback)
+                && !same_server_set(&current.servers, fallback)
             {
                 snapshots.save(&DemoteSnapshot {
                     service_dns_key: key.clone(),
@@ -822,6 +827,50 @@ mod tests {
             after.installed_fallback,
             vec!["203.0.113.50".to_string()],
             "the recorded installed fallback tracks the newly applied one"
+        );
+    }
+
+    #[test]
+    fn redemote_keeps_prior_when_the_installed_fallback_record_was_lost() {
+        // P2: the post-write `installed_fallback` record can fail (e.g. a transient
+        // `/var/run` write error) after the demote's `set` already succeeded, leaving
+        // the snapshot's installed_fallback empty while the service already shows our
+        // fallback. A retry with the SAME fallback must still recognise that value as
+        // ours and keep the real DHCP prior — not snapshot our own fallback (which a
+        // later restore would then write back as if it were the prior resolver).
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        // Seed the post-failure state: the real DHCP prior is captured, but the
+        // installed_fallback record was lost (empty), and the service already shows
+        // the fallback the previous `set` wrote.
+        snaps
+            .save(&snap(
+                "State:/Network/Service/ABC/DNS",
+                Some("en0"),
+                &["198.51.100.1"],
+                &[],
+            ))
+            .unwrap();
+        scutil.set_service_state(
+            "State:/Network/Service/ABC/DNS",
+            ServiceDnsState {
+                interface_name: Some("en0".to_string()),
+                servers: vec!["203.0.113.9".to_string()],
+            },
+        );
+        // Retry the demote with the SAME fallback.
+        demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
+        let after = snaps.load().unwrap();
+        assert_eq!(
+            after.prior_servers,
+            vec!["198.51.100.1".to_string()],
+            "a retry must not capture our own fallback as the prior when the \
+             installed_fallback record was lost"
+        );
+        assert_eq!(
+            after.installed_fallback,
+            vec!["203.0.113.9".to_string()],
+            "the post-write step repairs the lost installed_fallback record"
         );
     }
 
