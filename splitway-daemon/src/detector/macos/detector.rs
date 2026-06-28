@@ -78,17 +78,18 @@ fn read_dns_model() -> Result<DnsModel, PlatformError> {
         if !key.starts_with("State:/Network/Service/") {
             continue;
         }
-        let dump = match scutil_show(key) {
-            Ok(dump) => dump,
-            // A key that vanished between list and show is skipped, not fatal.
-            Err(e) => {
-                log::debug!("reading {key} failed: {e}; skipping");
-                continue;
-            }
-        };
+        // Propagate a real `scutil` failure rather than skipping the service: a
+        // missing/vanished key is reported as `No such key` on stdout with exit 0
+        // (→ `Ok`, then empty servers below), so an `Err` here is a genuine command
+        // failure (spawn error or non-zero exit). Skipping it would silently drop a
+        // live service from the model — e.g. the VPN service, read after a
+        // successful `list` — and `decide` could then conclude "down" and revert the
+        // rules. Failing the read instead makes the watcher keep the last known
+        // state until the next change.
+        let dump = scutil_show(key)?;
         let servers = parse_array_field(&dump, "ServerAddresses");
         if servers.is_empty() {
-            continue; // a service with no DNS contributes nothing
+            continue; // a service with no DNS (incl. the `No such key` case) contributes nothing
         }
         let service_id = service_id_from_key(key);
         // The interface binding is read from the service's IPv4/IPv6 entity, NOT

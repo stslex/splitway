@@ -117,6 +117,14 @@ fn run_watch(interface: String, tx: Sender<VpnEvent>) {
     let patterns: CFArray<CFString> = CFArray::from_CFTypes(&[
         CFString::from_static_string("(State|Setup):/Network/Service/.*/DNS"),
         CFString::from_static_string("State:/Network/Interface/.*/IPv4"),
+        // The per-service IPv4/IPv6 entities carry each service's `InterfaceName`
+        // binding, which `read_service_interface` reads to classify a service
+        // (physical vs. an unscoped default hijacker). A service gaining/losing an
+        // interface binding without a DNS or global change must re-trigger
+        // detection — otherwise the service stays classified from stale data (an
+        // unknown interface can be misread as a hijacker → false "VPN up").
+        CFString::from_static_string("State:/Network/Service/.*/IPv4"),
+        CFString::from_static_string("State:/Network/Service/.*/IPv6"),
     ]);
     if !store.set_notification_keys(&keys, &patterns) {
         log::error!("SCDynamicStore::set_notification_keys failed; macOS VPN watch disabled");
