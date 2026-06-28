@@ -139,21 +139,31 @@ pub(super) trait ScutilRunner {
     fn run_script(&self, script: &str) -> Result<(), PlatformError>;
 }
 
-/// Build the `scutil` script that sets `key`'s `ServerAddresses` to `servers`,
-/// preserving the service's `InterfaceName` when known.
+/// Build the `scutil` script that overrides `key`'s `ServerAddresses`, leaving
+/// every other field of the service's DNS dictionary intact.
 ///
-/// We replace only the values we manage; SearchDomains and the rest of the dict
-/// are not ours to keep — macOS repopulates a service's DNS dict from its source
-/// (DHCP / the VPN) on the next network change, and the corp split-DNS is held
-/// independently by the `/etc/resolver` files, so a minimal dict is sufficient.
+/// `ServerAddresses` is the only field Splitway manages; the rest of the dict
+/// (`SearchDomains`, `DomainName`, `SupplementalMatchDomains`, `SearchOrder`,
+/// `InterfaceName`, …) belongs to DHCP / the VPN. So the script `get`s the
+/// service's CURRENT dictionary into the working buffer first, then overrides
+/// only `ServerAddresses`, then writes the merged dict back. A bare `d.init`
+/// would instead start from an empty dictionary and the `set` would *replace* the
+/// whole dict, dropping those unmanaged fields until the next network
+/// reconfiguration repopulated them (breaking local search-domain / supplemental
+/// DNS behaviour while Splitway is active). On a missing key `get` leaves the
+/// (empty) initialised dict, so a fresh service is still created.
 ///
-/// **`InterfaceName` is re-added when known** because a bare `d.init` write would
-/// drop it, and the detector identifies the *physical* service by its
-/// `InterfaceName == PrimaryInterface` (see the detector's `decide`). Dropping it
-/// on our own demote would make the next detection round fail to find the
-/// physical service — inverting corp/fallback or undoing the demote (the exact
-/// oscillation the per-service model exists to prevent). So the demote carries
-/// the interface name through.
+/// - `servers` non-empty → override `ServerAddresses` (demote to the fallback, or
+///   restore the prior resolvers).
+/// - `servers` empty → `d.remove ServerAddresses`, dropping only *our* override
+///   while keeping the rest of the dict (restore of a service that had no explicit
+///   prior `ServerAddresses`).
+///
+/// `InterfaceName` is preserved automatically by `get`; it is additionally
+/// re-added when known as a belt-and-suspenders guarantee that the demoted
+/// *physical* service stays identifiable to the detector (which anchors it by
+/// `InterfaceName == PrimaryInterface`; see the detector's `decide`), even on the
+/// missing-key path where `get` loaded nothing.
 pub(super) fn build_set_dns_script(
     key: &str,
     servers: &[String],
@@ -162,6 +172,8 @@ pub(super) fn build_set_dns_script(
     let mut script = String::new();
     script.push_str("open\n");
     script.push_str("d.init\n");
+    // Load the live dict so unmanaged fields ride through unchanged.
+    script.push_str(&format!("get {key}\n"));
     if !servers.is_empty() {
         script.push_str("d.add ServerAddresses *");
         for s in servers {
@@ -169,6 +181,9 @@ pub(super) fn build_set_dns_script(
             script.push_str(s);
         }
         script.push('\n');
+    } else {
+        // Drop only our ServerAddresses override; keep every other field.
+        script.push_str("d.remove ServerAddresses\n");
     }
     if let Some(iface) = interface_name {
         // A single-value key (no `*`): the interface the service is bound to.
@@ -177,13 +192,6 @@ pub(super) fn build_set_dns_script(
     script.push_str(&format!("set {key}\n"));
     script.push_str("quit\n");
     script
-}
-
-/// Build the `scutil` script that removes `key` entirely (used on restore when
-/// the service had no prior explicit DNS — clearing ours lets SC repopulate the
-/// service's DNS from its real source).
-pub(super) fn build_remove_key_script(key: &str) -> String {
-    format!("open\nremove {key}\nquit\n")
 }
 
 /// The `State:/Network/Service/<id>/DNS` key for a service id.
@@ -383,23 +391,19 @@ pub(super) fn restore(
 }
 
 /// Run the `scutil` write that restores one snapshot's service to its prior DNS.
-/// If the service had explicit prior servers, set them back (preserving the
-/// captured interface name); if it had none, remove the key so
-/// SystemConfiguration repopulates the service's DNS from its real source. Does
-/// not touch the snapshot store — the caller owns clearing it.
+/// Restores the prior `ServerAddresses` when there were any, otherwise removes
+/// only our `ServerAddresses` override — either way `get`-preserving the rest of
+/// the service's live DNS dict (so DHCP-provided SearchDomains/etc. survive the
+/// round-trip). Does not touch the snapshot store — the caller owns clearing it.
 fn restore_snapshot(
     scutil: &dyn ScutilRunner,
     snapshot: &DemoteSnapshot,
 ) -> Result<(), PlatformError> {
-    let script = if snapshot.prior_servers.is_empty() {
-        build_remove_key_script(&snapshot.service_dns_key)
-    } else {
-        build_set_dns_script(
-            &snapshot.service_dns_key,
-            &snapshot.prior_servers,
-            snapshot.interface_name.as_deref(),
-        )
-    };
+    let script = build_set_dns_script(
+        &snapshot.service_dns_key,
+        &snapshot.prior_servers,
+        snapshot.interface_name.as_deref(),
+    );
     scutil.run_script(&script)
 }
 
@@ -524,11 +528,33 @@ mod tests {
             script,
             "open\n\
              d.init\n\
+             get State:/Network/Service/ABC/DNS\n\
              d.add ServerAddresses * 198.51.100.1\n\
              d.add InterfaceName en0\n\
              set State:/Network/Service/ABC/DNS\n\
              quit\n"
         );
+    }
+
+    #[test]
+    fn set_dns_script_gets_the_live_dict_before_overriding_to_preserve_fields() {
+        // The P2 invariant: `get` the existing dict BEFORE overriding
+        // ServerAddresses so unmanaged DHCP/VPN fields (SearchDomains, DomainName,
+        // SupplementalMatchDomains, …) ride through instead of being replaced by a
+        // minimal dict.
+        let script = build_set_dns_script(
+            "State:/Network/Service/ABC/DNS",
+            &["203.0.113.9".to_string()],
+            Some("en0"),
+        );
+        let get_at = script.find("get State:/Network/Service/ABC/DNS\n").unwrap();
+        let override_at = script.find("d.add ServerAddresses").unwrap();
+        assert!(
+            get_at < override_at,
+            "must load the live dict with `get` before overriding ServerAddresses"
+        );
+        // No bare-init minimal write that would replace the whole dict.
+        assert!(!script.contains("d.init\nd.add ServerAddresses"));
     }
 
     #[test]
@@ -553,19 +579,15 @@ mod tests {
     }
 
     #[test]
-    fn set_dns_script_with_no_servers_omits_the_add_but_keeps_the_interface() {
+    fn set_dns_script_with_no_servers_removes_only_our_server_addresses() {
+        // No prior servers → drop our ServerAddresses override (after `get`-ing the
+        // live dict) rather than adding any, keeping every other field intact.
         let script = build_set_dns_script("State:/Network/Service/ABC/DNS", &[], Some("en0"));
+        assert!(script.contains("get State:/Network/Service/ABC/DNS\n"));
+        assert!(script.contains("d.remove ServerAddresses\n"));
         assert!(!script.contains("d.add ServerAddresses"));
         assert!(script.contains("d.add InterfaceName en0\n"));
         assert!(script.contains("set State:/Network/Service/ABC/DNS\n"));
-    }
-
-    #[test]
-    fn remove_key_script_removes_the_key() {
-        assert_eq!(
-            build_remove_key_script("State:/Network/Service/ABC/DNS"),
-            "open\nremove State:/Network/Service/ABC/DNS\nquit\n"
-        );
     }
 
     #[test]
@@ -739,9 +761,10 @@ mod tests {
     }
 
     #[test]
-    fn restore_removes_the_key_when_no_prior_servers() {
-        // A service with no explicit prior DNS: restore removes our override so
-        // SC repopulates from the real source, rather than pinning empty.
+    fn restore_clears_only_our_servers_when_there_were_no_prior_ones() {
+        // A service with no explicit prior ServerAddresses: restore drops just our
+        // override (d.remove ServerAddresses) after `get`-ing the live dict, so any
+        // DHCP-provided SearchDomains/etc. are preserved rather than wiped.
         let scutil = FakeScutil::up();
         scutil.set_service_state(
             "State:/Network/Service/ABC/DNS",
@@ -757,7 +780,10 @@ mod tests {
         restore(&scutil, &snaps).unwrap();
         let scripts = scutil.scripts.borrow();
         assert_eq!(scripts.len(), 1);
-        assert!(scripts[0].starts_with("open\nremove State:/Network/Service/ABC/DNS\n"));
+        assert!(scripts[0].contains("get State:/Network/Service/ABC/DNS\n"));
+        assert!(scripts[0].contains("d.remove ServerAddresses\n"));
+        assert!(!scripts[0].contains("d.add ServerAddresses"));
+        assert!(scripts[0].contains("set State:/Network/Service/ABC/DNS\n"));
     }
 
     #[test]

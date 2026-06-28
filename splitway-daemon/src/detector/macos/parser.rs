@@ -17,10 +17,17 @@
 //!
 //! The **physical service** is the one whose id is the primary service (falling
 //! back to the primary interface name); its resolver is the demote-target. A
-//! **VPN service** is any *other* service whose DNS differs from the physical
-//! resolver — a non-physical resolver is in play → **VPN is up**, and its
-//! resolver is the corp DNS. The decision keys on this structural *difference*,
-//! never on any vendor/product string, so it generalises across VPN clients.
+//! **VPN service** is any *other* service that (a) carries DNS differing from the
+//! physical resolver AND (b) is plausibly the **default-resolver hijacker** —
+//! i.e. it rides the primary interface's own default route, runs on a tunnel
+//! pseudo-interface (`utun`/`ppp`/`ipsec`/…), or reports no interface (an
+//! unscoped/default resolver). A service bound to a *distinct hardware* interface
+//! (a second Ethernet/Wi-Fi/cellular link while another is primary) is a parallel
+//! physical network, not a hijacker: its differing DHCP resolver must **not** read
+//! as "VPN up". When such a hijacker service exists → **VPN is up** and its
+//! resolver is the corp DNS. The decision keys on this structural *difference* and
+//! on interface *kind* (the stable BSD driver prefix), never on any vendor/product
+//! string, so it generalises across VPN clients.
 //!
 //! Detection deliberately does **not** read `State:/Network/Global/DNS`: Splitway's
 //! own demote overwrites the physical service's DNS, which can change the global
@@ -166,15 +173,18 @@ pub(crate) fn parse_scalar_field(dump: &str, field: &str) -> Option<String> {
 /// mutable global default — see [`DnsModel`]).
 ///
 /// The physical service is the one bound to the primary interface; its DNS is
-/// the demote-target. A **VPN service** is any *other* service that carries DNS
-/// differing from the physical service's. VPN is **up** iff such a service
+/// the demote-target. A **VPN service** is any *other* service that both carries
+/// DNS differing from the physical service's AND looks like the default-resolver
+/// hijacker (see [`is_default_resolver_hijacker`]) — so a benign secondary
+/// physical network is not mistaken for a VPN. VPN is **up** iff such a service
 /// exists, and `corp_dns` is its resolver.
 ///
 /// Edge cases, all → [`Detected::Down`] (no false-positive apply):
 /// - no primary interface (offline) — nothing to anchor on;
 /// - no physical service DNS found — cannot determine the demote-target, and a
 ///   demote to nothing is worse than not applying, so stay conservative;
-/// - no non-physical service whose DNS differs from the physical — no VPN.
+/// - the only services differing from the physical are distinct secondary
+///   physical networks (not the hijacker) — no VPN.
 pub(super) fn decide(model: &DnsModel) -> Detected {
     // No primary network at all → nothing is in play.
     // A primary network must exist to anchor on (offline → nothing in play).
@@ -204,10 +214,18 @@ pub(super) fn decide(model: &DnsModel) -> Detected {
     // demote (which sets the physical service's DNS to the fallback) — the VPN's
     // own service still differs — and never mistakes the physical service for a
     // VPN. This signal is independent of the mutable global default.
+    //
+    // The differing service must ALSO be the default-resolver hijacker, not a
+    // distinct secondary physical network (e.g. Wi-Fi associated while Ethernet is
+    // primary, with its own DHCP DNS) — otherwise that benign secondary resolver
+    // would be a false "VPN up". The hijacker filter precedes the difference check
+    // so, with both a real VPN and a secondary network present, the VPN is still
+    // found regardless of service order.
     let vpn_dns = model
         .services
         .iter()
         .filter(|s| s.service_id != physical.service_id && !s.servers.is_empty())
+        .filter(|s| is_default_resolver_hijacker(s, model.primary_interface.as_deref()))
         .find(|s| !same_set(&s.servers, &physical.servers))
         .map(|s| &s.servers);
 
@@ -230,6 +248,44 @@ fn same_set(a: &[String], b: &[String]) -> bool {
     a_sorted.sort();
     b_sorted.sort();
     a_sorted == b_sorted
+}
+
+/// macOS tunnel / virtual interface name prefixes. A global-default-hijack VPN
+/// rides one of these pseudo-interfaces (or the primary interface itself); a
+/// *secondary physical* network (Wi-Fi while Ethernet is primary, a second
+/// Ethernet, cellular, a VM/Thunderbolt bridge, …) is bound to a distinct
+/// hardware interface that is none of these. Matching by interface *kind* (the
+/// stable BSD driver prefix) — never a vendor/product string — keeps the detector
+/// vendor-neutral while still excluding parallel physical networks.
+const TUNNEL_INTERFACE_PREFIXES: [&str; 5] = ["utun", "ppp", "ipsec", "tun", "tap"];
+
+/// Whether an interface name is a tunnel / virtual pseudo-interface (a VPN
+/// carrier) rather than a hardware link.
+fn is_tunnel_interface(iface: &str) -> bool {
+    TUNNEL_INTERFACE_PREFIXES
+        .iter()
+        .any(|prefix| iface.starts_with(prefix))
+}
+
+/// Whether a (non-physical) service is plausibly the **default-resolver
+/// hijacker** rather than a benign secondary physical network.
+///
+/// A VPN that hijacks the system default resolver either rides the primary
+/// interface's own default route (its service reports the *primary* interface),
+/// runs on a tunnel pseudo-interface (`utun`/`ppp`/`ipsec`/…), or registers an
+/// unscoped/default resolver (its service reports *no* interface). A service
+/// bound to a *distinct hardware* interface is a parallel physical network — a
+/// second Ethernet/Wi-Fi/cellular link — and its differing DHCP resolver must NOT
+/// read as "VPN up". This signal is stable under Splitway's own demote (it does
+/// not depend on the mutable global default).
+fn is_default_resolver_hijacker(service: &ServiceDns, primary_interface: Option<&str>) -> bool {
+    match service.interface_name.as_deref() {
+        // No interface → an unscoped / default (global-path) resolver.
+        None => true,
+        // Rides the primary default route, or is a VPN tunnel pseudo-interface.
+        // Anything else is a distinct secondary physical link → not a hijacker.
+        Some(iface) => Some(iface) == primary_interface || is_tunnel_interface(iface),
+    }
 }
 
 #[cfg(test)]
@@ -508,18 +564,17 @@ mod tests {
     }
 
     #[test]
-    fn decision_ignores_utun_interfaces_entirely() {
-        // Proof no `utun` is keyed on: the decision compares per-service DNS
-        // against the physical resolver, never a utun name. A utun service with
-        // its own DNS that differs from physical reads as "a VPN service"
-        // structurally — by its DNS, not its name.
+    fn a_tunnel_vpn_is_detected_by_its_differing_dns_not_its_index() {
+        // No SPECIFIC utun index/name is keyed on: a tunnel VPN is recognised by
+        // its differing DNS, and its interface only has to be a tunnel *kind*
+        // (utun/ppp/ipsec/…) — never a particular name — to qualify as a hijacker.
         let m = model(
             Some("en0"),
             Some("phys"),
             vec![
                 svc("phys", Some("en0"), &["198.51.100.1"]),
                 // Whatever the tunnel interface is named (utun index varies), it
-                // is recognised by its differing DNS, not its name.
+                // is recognised as a tunnel kind carrying differing DNS.
                 svc("vpn", Some("utun7"), &["192.0.2.53"]),
             ],
         );
@@ -530,6 +585,97 @@ mod tests {
                 demote_target: vec!["198.51.100.1".to_string()],
             }
         );
+    }
+
+    #[test]
+    fn a_secondary_physical_network_is_not_mistaken_for_a_vpn() {
+        // The P1 false positive: Ethernet en0 is primary while Wi-Fi en1 stays
+        // associated with its own DHCP resolver that differs from en0's. With NO
+        // VPN running, en1 is a distinct *hardware* interface (not the primary,
+        // not a tunnel) → a parallel network, not the default-resolver hijacker →
+        // Down (no false apply of the corp domains to the Wi-Fi resolver).
+        let m = model(
+            Some("en0"),
+            Some("phys"),
+            vec![
+                svc("phys", Some("en0"), &["198.51.100.1"]),
+                svc("wifi", Some("en1"), &["198.51.100.99"]), // secondary DHCP DNS
+            ],
+        );
+        assert_eq!(decide(&m), Detected::Down);
+    }
+
+    #[test]
+    fn a_tunnel_vpn_is_found_even_alongside_a_secondary_physical_network() {
+        // A real VPN (utun) AND a secondary physical Wi-Fi are both present, with
+        // the secondary listed FIRST. The secondary en1 is excluded; the tunnel
+        // hijacker is still found → Up with the VPN's corp DNS (order-insensitive).
+        let m = model(
+            Some("en0"),
+            Some("phys"),
+            vec![
+                svc("wifi", Some("en1"), &["198.51.100.99"]), // secondary, listed first
+                svc("phys", Some("en0"), &["198.51.100.1"]),
+                svc("vpn", Some("utun4"), &["192.0.2.53"]),
+            ],
+        );
+        assert_eq!(
+            decide(&m),
+            Detected::Up {
+                corp_dns: vec!["192.0.2.53".to_string()],
+                demote_target: vec!["198.51.100.1".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn an_unscoped_hijacker_with_no_interface_is_detected() {
+        // A global-default-hijack VPN whose own service entry carries no
+        // InterfaceName is an unscoped/default resolver → still a hijacker → Up.
+        let m = model(
+            Some("en0"),
+            Some("phys"),
+            vec![
+                svc("phys", Some("en0"), &["198.51.100.1"]),
+                ServiceDns {
+                    service_id: "vpn".to_string(),
+                    interface_name: None,
+                    servers: vec!["192.0.2.53".to_string()],
+                },
+            ],
+        );
+        assert_eq!(
+            decide(&m),
+            Detected::Up {
+                corp_dns: vec!["192.0.2.53".to_string()],
+                demote_target: vec!["198.51.100.1".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn hijacker_predicate_classifies_by_interface_kind() {
+        // Primary interface en0. Hijackers: the primary itself, any tunnel kind,
+        // or no interface. Non-hijackers: a distinct secondary hardware link.
+        let primary = Some("en0");
+        let h = |iface: Option<&str>| {
+            is_default_resolver_hijacker(&svc("s", iface, &["192.0.2.53"]), primary)
+        };
+        assert!(h(Some("en0")), "rides the primary default route");
+        assert!(
+            h(Some("utun4")) && h(Some("ppp0")) && h(Some("ipsec0")),
+            "tunnel kinds"
+        );
+        assert!(h(None), "unscoped/default resolver");
+        assert!(
+            !h(Some("en1")),
+            "a second Ethernet/Wi-Fi is a secondary network"
+        );
+        assert!(
+            !h(Some("bridge100")),
+            "a VM/Thunderbolt bridge is a secondary network"
+        );
+        assert!(!h(Some("pdp_ip0")), "cellular is a secondary network");
     }
 
     #[test]

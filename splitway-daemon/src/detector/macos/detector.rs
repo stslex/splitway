@@ -66,9 +66,18 @@ fn read_dns_model() -> Result<DnsModel, PlatformError> {
     let primary_service = parse_scalar_field(&global_ipv4_dump, "PrimaryService");
 
     // Enumerate every per-service DNS key and read its id + InterfaceName + servers.
+    // `scutil`'s `list` does NOT print bare keys: each match is a prefixed row
+    // (`subKey [<n>] = State:/.../DNS`), so the key must be parsed out of the row
+    // before it is shown — otherwise every `show` is fed the whole row, returns
+    // `No such key`, and the model stays empty (detection always "down").
     let listing = scutil_list("State:/Network/Service/.*/DNS")?;
     let mut services = Vec::new();
-    for key in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
+    for row in listing.lines() {
+        let key = parse_list_key(row);
+        // Skip blank/header rows and anything outside the listed pattern.
+        if !key.starts_with("State:/Network/Service/") {
+            continue;
+        }
         let dump = match scutil_show(key) {
             Ok(dump) => dump,
             // A key that vanished between list and show is skipped, not fatal.
@@ -93,6 +102,20 @@ fn read_dns_model() -> Result<DnsModel, PlatformError> {
         primary_service,
         services,
     })
+}
+
+/// Extract the dynamic-store key from one `scutil list` output row. `scutil`
+/// prints each match as `  subKey [<n>] = State:/Network/Service/<id>/DNS`, not
+/// as a bare key, so the `subKey [n] = ` prefix must be stripped before the key
+/// can be passed to `show` / [`service_id_from_key`]. A row without the ` = `
+/// marker is returned trimmed (defensive); the caller filters anything that is
+/// not a service DNS key.
+fn parse_list_key(row: &str) -> &str {
+    let row = row.trim();
+    match row.rsplit_once(" = ") {
+        Some((_, key)) => key.trim(),
+        None => row,
+    }
 }
 
 /// Extract the `<id>` from a `State:/Network/Service/<id>/DNS` key, so it can be
@@ -159,7 +182,30 @@ fn scutil_script(script: &str) -> Result<String, PlatformError> {
 
 #[cfg(test)]
 mod tests {
-    use super::service_id_from_key;
+    use super::{parse_list_key, service_id_from_key};
+
+    #[test]
+    fn parse_list_key_strips_the_scutil_subkey_prefix() {
+        // The real `scutil list` row shape — the key must be parsed out, not shown
+        // verbatim (the bug: the whole row went to `show` → `No such key`).
+        assert_eq!(
+            parse_list_key("  subKey [0] = State:/Network/Service/ABC-123/DNS"),
+            "State:/Network/Service/ABC-123/DNS"
+        );
+        assert_eq!(
+            parse_list_key("subKey [12] = State:/Network/Service/XYZ/DNS"),
+            "State:/Network/Service/XYZ/DNS"
+        );
+    }
+
+    #[test]
+    fn parse_list_key_passes_a_bare_key_through() {
+        // Defensive: a row already in bare-key form is returned trimmed.
+        assert_eq!(
+            parse_list_key("  State:/Network/Service/ABC/DNS  "),
+            "State:/Network/Service/ABC/DNS"
+        );
+    }
 
     #[test]
     fn service_id_from_key_extracts_the_id() {
