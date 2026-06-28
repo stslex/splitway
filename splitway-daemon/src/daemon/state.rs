@@ -385,13 +385,31 @@ impl StateMachine {
     }
 
     /// The off-tunnel fallback resolver to fold into the `VpnInfo` handed to the
-    /// backend: the configured `fallback_dns` override if set, else the
-    /// detector-supplied `demote_target` (the physical interface's own DHCP
-    /// resolver). `None` on a backend/VPN that does not demote. The backend
-    /// applies the demote only when this is `Some(non-empty)`.
+    /// backend: the configured `fallback_dns` override if set **and every entry is
+    /// a valid IP literal**, else the detector-supplied `demote_target` (the
+    /// physical interface's own DHCP resolver). A malformed override is ignored —
+    /// it would otherwise reach the root `scutil` demote script verbatim. `None` on
+    /// a backend/VPN that does not demote. The backend applies the demote only when
+    /// this is `Some(non-empty)`.
     fn effective_demote_target(&self, info: &VpnInfo) -> Option<Vec<String>> {
         match &self.config.fallback_dns {
-            Some(servers) if !servers.is_empty() => Some(servers.clone()),
+            // A configured override wins — but only when every entry is a real IP
+            // literal. The values are appended verbatim into the root `scutil`
+            // demote script, so a non-IP entry (a typo, a hostname, whitespace, an
+            // empty element) would malform the script rather than fail cleanly.
+            // Reject the whole override in that case and fall back to the detector's
+            // demote-target, logging so the bad config is visible.
+            Some(servers) if !servers.is_empty() => {
+                if servers.iter().all(|s| config::is_ip_literal(s)) {
+                    Some(servers.clone())
+                } else {
+                    log::warn!(
+                        "ignoring fallback_dns: every entry must be an IP literal; \
+                         using the detected physical resolver instead"
+                    );
+                    info.demote_target.clone()
+                }
+            }
             _ => info.demote_target.clone(),
         }
     }
@@ -3428,6 +3446,25 @@ mod tests {
             backend.applied_demote_targets.lock().unwrap().as_slice(),
             &[Some(vec!["203.0.113.9".to_string()])],
             "the fallback_dns override must replace the detector's demote-target"
+        );
+    }
+
+    #[tokio::test]
+    async fn macos_apply_ignores_a_non_ip_fallback_dns_override() {
+        // A `fallback_dns` override with a non-IP entry must NOT reach the backend:
+        // it would be interpolated verbatim into the root `scutil` demote script. It
+        // is rejected as a whole and the detector's demote-target is used instead.
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        let mut cfg = config(true, &["corp.example.com"]);
+        cfg.fallback_dns = Some(vec!["not-an-ip".to_string()]);
+        let mut sm = machine(backend.clone(), cfg, "macos-bad-override");
+
+        sm.on_event(vpn_up_macos("utun7", &["198.51.100.1"])).await;
+        assert_eq!(
+            backend.applied_demote_targets.lock().unwrap().as_slice(),
+            &[Some(vec!["198.51.100.1".to_string()])],
+            "a non-IP fallback_dns override is ignored; the detector's demote-target is used"
         );
     }
 
