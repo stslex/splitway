@@ -769,10 +769,14 @@ impl StateMachine {
         // intentionally ignored: shutdown reports cleanliness from the
         // `self.orphaned` check below, which covers the same lingering set.
         let _ = self.revert_orphaned().await;
-        let applied_clean = if self.applied.is_none() {
-            true
-        } else {
-            log::info!("shutdown: reverting active rules");
+        // Revert applied rules, and ALSO run a pending global cleanup (a macOS
+        // startup reconcile that failed transiently) so a stale demote snapshot /
+        // default DNS is not left behind when `applied` is `None`. `revert()`
+        // covers both: it reverts when `applied` is set, and runs the pending
+        // global cleanup otherwise — returning `Err` (→ unclean) if it still fails,
+        // so shutdown does not falsely report clean while a demote may remain.
+        let applied_clean = if self.applied.is_some() || self.pending_global_cleanup {
+            log::info!("shutdown: reverting active rules and any pending cleanup");
             match self.revert().await {
                 Ok(()) => true,
                 Err(e) => {
@@ -780,6 +784,8 @@ impl StateMachine {
                     false
                 }
             }
+        } else {
+            true
         };
         if applied_clean && self.orphaned.is_empty() {
             log::info!("shutdown: system left clean");
@@ -2412,6 +2418,59 @@ mod tests {
         // Revert failed: shutdown reports unclean and keeps `applied` set.
         assert!(!clean);
         assert!(sm.applied.is_some());
+    }
+
+    #[tokio::test]
+    async fn shutdown_runs_a_pending_global_cleanup_even_with_nothing_applied() {
+        // P2: a macOS startup cleanup failed (pending) and nothing is applied. If
+        // the daemon is stopped before any reconcile retries it, shutdown must
+        // still run the global cleanup rather than reporting clean while a stale
+        // demote snapshot / default DNS remains.
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        backend.set_fail_revert(true);
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "shutdown-pending-cleanup",
+        );
+        sm.cleanup_orphaned_state_on_startup().await; // fails → pending set
+        assert!(sm.pending_global_cleanup);
+        backend.reverts.lock().unwrap().clear();
+
+        backend.set_fail_revert(false); // the retry at shutdown succeeds
+        let clean = sm.shutdown().await;
+        assert!(clean, "shutdown is clean once the pending cleanup succeeds");
+        assert!(!sm.pending_global_cleanup, "the pending cleanup is cleared");
+        assert_eq!(
+            backend.reverts.lock().unwrap().as_slice(),
+            &["wg0"],
+            "shutdown ran the global cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_unclean_when_a_pending_cleanup_still_fails() {
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        backend.set_fail_revert(true);
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "shutdown-pending-fail",
+        );
+        sm.cleanup_orphaned_state_on_startup().await;
+        assert!(sm.pending_global_cleanup);
+
+        let clean = sm.shutdown().await; // fail_revert still true
+        assert!(
+            !clean,
+            "shutdown reports unclean while a demote snapshot may remain"
+        );
+        assert!(
+            sm.pending_global_cleanup,
+            "the pending flag stays set for a future retry"
+        );
     }
 
     #[tokio::test]
