@@ -210,6 +210,13 @@ pub struct StateMachine {
     /// desired target equals the — now possibly stale — `applied` snapshot, so a
     /// post-failure "already converged" check can never skip a needed re-apply.
     needs_resync: bool,
+    /// Set when the startup reconcile of orphaned persisted state (a global-revert
+    /// backend's demote left by a previous unclean exit) failed transiently. With
+    /// `applied == None`, an ordinary `revert()` is a no-op, so without this the
+    /// orphaned state would linger until a full VPN up→down cycle. While set, each
+    /// `revert()` retries the global cleanup until it succeeds. See
+    /// [`Self::cleanup_orphaned_state_on_startup`].
+    pending_global_cleanup: bool,
     /// Cancel handle for the current watch's forwarding task. Aborting it drops
     /// the detector's `Receiver<VpnEvent>`, which closes the channel and lets the
     /// detector release its resources (see [`Self::arm_watch`]).
@@ -244,6 +251,7 @@ impl StateMachine {
             applied: None,
             orphaned: Vec::new(),
             needs_resync: false,
+            pending_global_cleanup: false,
             watch_cancel: None,
             watch_generation: 0,
             // No watch is armed until `arm_watch` runs (in `run_state`, before
@@ -522,6 +530,10 @@ impl StateMachine {
                         );
                         self.applied = Some(target);
                         self.needs_resync = false;
+                        // Applying establishes our own state (on macOS the demote
+                        // subsumes any prior process's snapshot), so a previously
+                        // pending orphaned-cleanup is no longer outstanding.
+                        self.pending_global_cleanup = false;
                         Ok(())
                     }
                     Ok(Err(e)) => {
@@ -562,8 +574,16 @@ impl StateMachine {
     /// `applied` is left set, so a later reconcile or shutdown retries it.
     async fn revert(&mut self) -> Result<(), PlatformError> {
         let Some(applied) = self.applied.clone() else {
-            // Nothing recorded as applied: the system already matches the
-            // "reverted" goal, so any prior uncertainty is resolved.
+            // Nothing recorded as applied. A previous process's orphaned global
+            // demote may still need cleaning (a startup reconcile that failed
+            // transiently) — retry it here so a Down/disable/reload converges it
+            // instead of waiting for a full VPN up→down cycle.
+            if self.pending_global_cleanup {
+                self.run_global_cleanup().await?;
+                self.pending_global_cleanup = false;
+            }
+            // The system already matches the "reverted" goal, so any prior
+            // uncertainty is resolved.
             self.needs_resync = false;
             return Ok(());
         };
@@ -612,21 +632,39 @@ impl StateMachine {
     /// persisted state of this kind, so they skip it (their revert needs a live
     /// `applied` interface anyway). `applied` stays `None` either way — this only
     /// cleans state a *previous* process left behind.
-    async fn cleanup_orphaned_state_on_startup(&self) {
+    async fn cleanup_orphaned_state_on_startup(&mut self) {
         if !self.backend.reverts_globally() {
             return;
         }
+        if self.run_global_cleanup().await.is_err() {
+            // A transient failure must not strand the orphaned state: mark it so
+            // every later `revert()` retries until it succeeds.
+            self.pending_global_cleanup = true;
+        }
+    }
+
+    /// Run one global cleanup revert (used by the startup reconcile and the
+    /// retry-on-`revert` path). Logs the outcome and returns the backend result.
+    async fn run_global_cleanup(&self) -> Result<(), PlatformError> {
         let backend = self.backend.clone();
         let interface = self.config.vpn_name.clone();
         match tokio::task::spawn_blocking(move || backend.revert_rules(&interface)).await {
             Ok(Ok(())) => {
-                log::debug!("startup: reconciled any orphaned default-DNS demote state")
+                log::debug!("reconciled any orphaned default-DNS demote state");
+                Ok(())
             }
-            Ok(Err(e)) => log::warn!(
-                "startup orphaned-state cleanup failed: {e}; \
-                 it will be retried on the next VPN event"
-            ),
-            Err(e) => log::error!("startup orphaned-state cleanup task panicked: {e}"),
+            Ok(Err(e)) => {
+                log::warn!(
+                    "orphaned-state cleanup failed: {e}; it will be retried on the next reconcile"
+                );
+                Err(e)
+            }
+            Err(e) => {
+                log::error!("orphaned-state cleanup task panicked: {e}");
+                Err(PlatformError::CommandFailed(format!(
+                    "orphaned-state cleanup task panicked: {e}"
+                )))
+            }
         }
     }
 
@@ -1892,7 +1930,7 @@ mod tests {
         // suppressed initial Down would otherwise never clear it.
         let backend = Arc::new(MockBackend::default());
         backend.set_reverts_globally(true);
-        let sm = machine(
+        let mut sm = machine(
             backend.clone(),
             config(true, &["a.com"]),
             "startup-cleanup-global",
@@ -1909,6 +1947,10 @@ mod tests {
             sm.applied.is_none(),
             "cleanup records nothing as applied — it only clears a prior process's state"
         );
+        assert!(
+            !sm.pending_global_cleanup,
+            "a successful cleanup leaves nothing pending"
+        );
     }
 
     #[tokio::test]
@@ -1916,7 +1958,7 @@ mod tests {
         // A per-interface backend (Linux) keeps no cross-restart persisted state of
         // this kind, so startup must not issue a spurious revert.
         let backend = Arc::new(MockBackend::default()); // reverts_globally == false
-        let sm = machine(
+        let mut sm = machine(
             backend.clone(),
             config(true, &["a.com"]),
             "startup-cleanup-skip",
@@ -1927,6 +1969,47 @@ mod tests {
         assert!(
             backend.reverts.lock().unwrap().is_empty(),
             "a per-interface backend is not reverted at boot"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_startup_cleanup_is_retried_on_a_later_reconcile() {
+        // P2: the startup cleanup fails transiently. Because `applied` is None an
+        // ordinary reconcile's revert() would be a no-op — but the pending flag
+        // makes the next revert retry the global cleanup until it succeeds, so an
+        // orphaned demote is not stranded until a full VPN up→down cycle.
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        backend.set_fail_revert(true); // the startup cleanup fails
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "startup-cleanup-retry",
+        );
+
+        sm.cleanup_orphaned_state_on_startup().await;
+        assert!(
+            sm.pending_global_cleanup,
+            "a failed cleanup is recorded as pending"
+        );
+        assert_eq!(
+            backend.reverts.lock().unwrap().len(),
+            1,
+            "the failing attempt still issued a revert"
+        );
+
+        // A later reconcile (VPN still down, nothing applied) retries the cleanup,
+        // which now succeeds and clears the pending flag.
+        backend.set_fail_revert(false);
+        sm.reconcile_primary().await.unwrap();
+        assert!(
+            !sm.pending_global_cleanup,
+            "a successful retry clears the pending flag"
+        );
+        assert_eq!(
+            backend.reverts.lock().unwrap().len(),
+            2,
+            "the cleanup is retried until it succeeds"
         );
     }
 

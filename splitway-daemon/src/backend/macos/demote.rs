@@ -49,9 +49,10 @@ pub(super) const SNAPSHOT_PATH: &str = "/var/run/splitway/dns-demote.snapshot";
 /// Serialised to [`SNAPSHOT_PATH`] as a tiny self-describing line format (no
 /// serde dependency pulled in for one struct): each line is `<tag>\t<value>`,
 /// with tags `key` (the service DNS key, exactly once), `iface` (the
-/// `InterfaceName`, at most once — omitted when the service had none), and
-/// `server` (one per prior resolver, in order). The tags make the optional
-/// `iface` line unambiguous even when there are no servers.
+/// `InterfaceName`, at most once — omitted when the service had none), `server`
+/// (one per prior resolver, in order), and `fallback` (one per installed-fallback
+/// resolver, in order). The tags make the optional `iface` line unambiguous even
+/// when there are no servers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DemoteSnapshot {
     /// The full `State:/Network/Service/<id>/DNS` key that was overwritten.
@@ -64,6 +65,12 @@ pub(super) struct DemoteSnapshot {
     /// The `ServerAddresses` the service had before the demote (possibly empty
     /// if the service carried no explicit servers — restore then clears ours).
     pub prior_servers: Vec<String>,
+    /// The fallback resolver Splitway last installed on this service. Lets a
+    /// same-service re-demote tell our own fallback (which we must NOT capture as
+    /// the "prior") from a real DHCP update — even after a `fallback_dns` config
+    /// change, where the service may still show a *previous* fallback we wrote.
+    /// Updated only after a fallback write succeeds.
+    pub installed_fallback: Vec<String>,
 }
 
 impl DemoteSnapshot {
@@ -83,16 +90,22 @@ impl DemoteSnapshot {
             out.push_str(s);
             out.push('\n');
         }
+        for f in &self.installed_fallback {
+            out.push_str("fallback\t");
+            out.push_str(f);
+            out.push('\n');
+        }
         out
     }
 
     /// Parse the on-disk `<tag>\t<value>` line format. Requires a `key` line;
-    /// `iface` is optional; `server` lines are collected in order. Returns
-    /// `None` for an empty/garbled snapshot (no `key`).
+    /// `iface` is optional; `server` and `fallback` lines are collected in order.
+    /// Returns `None` for an empty/garbled snapshot (no `key`).
     fn deserialize(text: &str) -> Option<Self> {
         let mut service_dns_key: Option<String> = None;
         let mut interface_name: Option<String> = None;
         let mut prior_servers: Vec<String> = Vec::new();
+        let mut installed_fallback: Vec<String> = Vec::new();
         for line in text.lines() {
             let line = line.trim_end_matches(['\r', '\n']);
             let Some((tag, value)) = line.split_once('\t') else {
@@ -102,6 +115,7 @@ impl DemoteSnapshot {
                 "key" => service_dns_key = Some(value.to_string()),
                 "iface" if !value.is_empty() => interface_name = Some(value.to_string()),
                 "server" if !value.is_empty() => prior_servers.push(value.to_string()),
+                "fallback" if !value.is_empty() => installed_fallback.push(value.to_string()),
                 _ => {}
             }
         }
@@ -109,6 +123,7 @@ impl DemoteSnapshot {
             service_dns_key: service_dns_key?,
             interface_name,
             prior_servers,
+            installed_fallback,
         })
     }
 }
@@ -353,15 +368,27 @@ pub(super) fn demote(
     match snapshots.load() {
         Some(existing) if existing.service_dns_key == key => {
             let current = scutil.service_dns_state(&key)?;
-            if !current.servers.is_empty() && !same_server_set(&current.servers, fallback) {
-                // The service's real DNS changed under us → refresh the snapshot.
+            // Keep the original prior while the service still shows a fallback WE
+            // installed (`installed_fallback`) — never capture our own fallback. A
+            // value that is neither empty nor our installed fallback is a genuine
+            // DHCP update on the same service → adopt it as the new prior so a
+            // later restore writes the latest resolver. Comparing against the
+            // recorded installed fallback (NOT the new `fallback`) is what keeps a
+            // `fallback_dns` config change — where the service still shows a
+            // *previous* fallback we wrote — from being mistaken for a DHCP update.
+            if !current.servers.is_empty()
+                && !same_server_set(&current.servers, &existing.installed_fallback)
+            {
                 snapshots.save(&DemoteSnapshot {
                     service_dns_key: key.clone(),
                     interface_name: current.interface_name,
                     prior_servers: current.servers,
+                    // Preserved here; the post-write step below reconciles it to
+                    // the fallback actually installed.
+                    installed_fallback: existing.installed_fallback,
                 })?;
             }
-            // else: still our fallback (or no DNS) → keep the original snapshot.
+            // else: keep the existing snapshot unchanged.
         }
         Some(existing) => {
             // Primary changed: un-demote the old service, then snapshot the new.
@@ -382,12 +409,26 @@ pub(super) fn demote(
         fallback,
         interface_name.as_deref(),
     ))?;
+
+    // Record the fallback now on the service so the NEXT same-service demote
+    // recognises it as ours, even across a `fallback_dns` change. Done AFTER a
+    // successful write so a failed write leaves the previously-recorded fallback
+    // (still the value on the service) intact.
+    if let Some(mut snapshot) = snapshots.load() {
+        if !same_server_set(&snapshot.installed_fallback, fallback) {
+            snapshot.installed_fallback = fallback.to_vec();
+            snapshots.save(&snapshot)?;
+        }
+    }
+
     log::info!("demoted the system default resolver to the off-tunnel fallback");
     Ok(true)
 }
 
 /// Capture `key`'s current DNS dict (servers + interface name) into the
-/// snapshot store, before it is overwritten by a demote.
+/// snapshot store, before it is overwritten by a demote. `installed_fallback` is
+/// left empty here and set by the demote's post-write step once the fallback is
+/// actually on the service.
 fn capture_snapshot(
     scutil: &dyn ScutilRunner,
     snapshots: &dyn SnapshotStore,
@@ -398,6 +439,7 @@ fn capture_snapshot(
         service_dns_key: key.to_string(),
         interface_name: state.interface_name,
         prior_servers: state.servers,
+        installed_fallback: Vec::new(),
     })
 }
 
@@ -535,11 +577,17 @@ mod tests {
     use super::test_support::{FakeScutil, MemSnapshots};
     use super::*;
 
-    fn snap(key: &str, iface: Option<&str>, servers: &[&str]) -> DemoteSnapshot {
+    fn snap(
+        key: &str,
+        iface: Option<&str>,
+        servers: &[&str],
+        installed: &[&str],
+    ) -> DemoteSnapshot {
         DemoteSnapshot {
             service_dns_key: key.to_string(),
             interface_name: iface.map(str::to_string),
             prior_servers: servers.iter().map(|s| s.to_string()).collect(),
+            installed_fallback: installed.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -632,19 +680,25 @@ mod tests {
             "State:/Network/Service/ABC/DNS",
             Some("en0"),
             &["198.51.100.1", "198.51.100.2"],
+            &["203.0.113.9", "203.0.113.10"],
         );
         assert_eq!(DemoteSnapshot::deserialize(&s.serialize()).unwrap(), s);
     }
 
     #[test]
     fn snapshot_round_trips_with_no_prior_servers_and_no_interface() {
-        let s = snap("State:/Network/Service/ABC/DNS", None, &[]);
+        let s = snap("State:/Network/Service/ABC/DNS", None, &[], &[]);
         assert_eq!(DemoteSnapshot::deserialize(&s.serialize()).unwrap(), s);
     }
 
     #[test]
     fn snapshot_round_trips_with_an_interface_but_no_servers() {
-        let s = snap("State:/Network/Service/ABC/DNS", Some("en0"), &[]);
+        let s = snap(
+            "State:/Network/Service/ABC/DNS",
+            Some("en0"),
+            &[],
+            &["203.0.113.9"],
+        );
         assert_eq!(DemoteSnapshot::deserialize(&s.serialize()).unwrap(), s);
     }
 
@@ -669,6 +723,7 @@ mod tests {
                 "State:/Network/Service/ABC/DNS",
                 Some("en0"),
                 &["198.51.100.1"],
+                &["203.0.113.9"],
             )
         );
         // Exactly one script issued: set the fallback AND re-add InterfaceName so
@@ -731,9 +786,42 @@ mod tests {
             snap(
                 "State:/Network/Service/ABC/DNS",
                 Some("en0"),
-                &["198.51.100.77"]
+                &["198.51.100.77"],
+                &["203.0.113.9"],
             ),
             "the snapshot must track the new DHCP resolver so restore is not stale"
+        );
+    }
+
+    #[test]
+    fn redemote_after_a_fallback_change_keeps_the_original_prior() {
+        // P2: `fallback_dns` changes from one resolver to another while demoted, so
+        // the service still shows our PREVIOUS fallback. That previous fallback must
+        // not be mistaken for a DHCP update and captured as the prior — restore must
+        // still write the real DHCP resolver, not our old fallback.
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
+        // The demote took effect: the service shows our first fallback.
+        scutil.set_service_state(
+            "State:/Network/Service/ABC/DNS",
+            ServiceDnsState {
+                interface_name: Some("en0".to_string()),
+                servers: vec!["203.0.113.9".to_string()],
+            },
+        );
+        // fallback_dns changes to a different resolver; re-demote.
+        demote(&scutil, &snaps, &["203.0.113.50".to_string()]).unwrap();
+        let after = snaps.load().unwrap();
+        assert_eq!(
+            after.prior_servers,
+            vec!["198.51.100.1".to_string()],
+            "the prior must stay the real DHCP resolver, never our previous fallback"
+        );
+        assert_eq!(
+            after.installed_fallback,
+            vec!["203.0.113.50".to_string()],
+            "the recorded installed fallback tracks the newly applied one"
         );
     }
 
@@ -765,6 +853,7 @@ mod tests {
                 "State:/Network/Service/XYZ/DNS",
                 Some("en1"),
                 &["198.51.100.50"],
+                &["203.0.113.9"],
             )
         );
         let scripts = scutil.scripts.borrow();
