@@ -132,12 +132,18 @@ pub enum StateCommand {
 /// A snapshot of what is currently applied to the system. Includes the DNS
 /// servers so that a VPN DNS rotation (same interface and domains, different
 /// servers) is seen as out-of-sync and re-applied rather than treated as
-/// already converged.
+/// already converged. Likewise includes the demote-target (macOS off-tunnel
+/// fallback) so a change to it — e.g. the physical DHCP resolver changing after
+/// a Wi-Fi switch — also forces a re-apply (re-demote to the new fallback)
+/// rather than being treated as converged. The demote-target is *not* part of
+/// the wire `AppliedInfo` projection (it is a backend-internal concern, no
+/// protocol change).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Applied {
     interface: String,
     domains: Vec<String>,
     dns_servers: Vec<String>,
+    demote_target: Option<Vec<String>>,
 }
 
 /// Project the internal applied snapshot to its wire form. Defined once and used
@@ -204,6 +210,13 @@ pub struct StateMachine {
     /// desired target equals the — now possibly stale — `applied` snapshot, so a
     /// post-failure "already converged" check can never skip a needed re-apply.
     needs_resync: bool,
+    /// Set when the startup reconcile of orphaned persisted state (a global-revert
+    /// backend's demote left by a previous unclean exit) failed transiently. With
+    /// `applied == None`, an ordinary `revert()` is a no-op, so without this the
+    /// orphaned state would linger until a full VPN up→down cycle. While set, each
+    /// `revert()` retries the global cleanup until it succeeds. See
+    /// [`Self::cleanup_orphaned_state_on_startup`].
+    pending_global_cleanup: bool,
     /// Cancel handle for the current watch's forwarding task. Aborting it drops
     /// the detector's `Receiver<VpnEvent>`, which closes the channel and lets the
     /// detector release its resources (see [`Self::arm_watch`]).
@@ -238,6 +251,7 @@ impl StateMachine {
             applied: None,
             orphaned: Vec::new(),
             needs_resync: false,
+            pending_global_cleanup: false,
             watch_cancel: None,
             watch_generation: 0,
             // No watch is armed until `arm_watch` runs (in `run_state`, before
@@ -349,20 +363,68 @@ impl StateMachine {
     /// never set (e.g. one an OpenVPN up-script installed). If a *prior* session
     /// had DNS and the new one does not, this reverts that prior session's rules.
     ///
-    /// The last event's interface must also match the configured `vpn_name`.
-    /// A config change that switches `vpn_name` resets `last_info`/`vpn_up` and
-    /// re-arms the watch (see [`Self::adopt_config`]), so the old interface is
-    /// reverted and the new watch resamples; `last_info.interface_name` therefore
-    /// matches `vpn_name` whenever the configured interface is up.
+    /// On interface-keyed backends (Linux) the last event's interface must also
+    /// match the configured `vpn_name`. A config change that switches `vpn_name`
+    /// resets `last_info`/`vpn_up` and re-arms the watch (see
+    /// [`Self::adopt_config`]), so the old interface is reverted and the new
+    /// watch resamples; `last_info.interface_name` therefore matches `vpn_name`
+    /// whenever the configured interface is up.
+    ///
+    /// On a **global-revert backend** (macOS) detection is driven by the system
+    /// DNS model, not an interface name — the VPN's DNS is the hijacked system
+    /// default, scoped to no `utun`, and the active tunnel index varies between
+    /// sessions. There the interface name is advisory and must NOT gate apply, so
+    /// this check is skipped (the backend gates on its own DNS-model signal).
+    /// Linux behaviour is unchanged.
+    fn interface_gate_passes(&self, info: &VpnInfo) -> bool {
+        if self.backend.reverts_globally() {
+            true
+        } else {
+            info.interface_name == self.config.vpn_name
+        }
+    }
+
+    /// The off-tunnel fallback resolver to fold into the `VpnInfo` handed to the
+    /// backend: the configured `fallback_dns` override if set **and every entry is
+    /// a valid IP literal**, else the detector-supplied `demote_target` (the
+    /// physical interface's own DHCP resolver). A malformed override is ignored —
+    /// it would otherwise reach the root `scutil` demote script verbatim. `None` on
+    /// a backend/VPN that does not demote. The backend applies the demote only when
+    /// this is `Some(non-empty)`.
+    fn effective_demote_target(&self, info: &VpnInfo) -> Option<Vec<String>> {
+        match &self.config.fallback_dns {
+            // A configured override wins — but only when every entry is a real IP
+            // literal. The values are appended verbatim into the root `scutil`
+            // demote script, so a non-IP entry (a typo, a hostname, whitespace, an
+            // empty element) would malform the script rather than fail cleanly.
+            // Reject the whole override in that case and fall back to the detector's
+            // demote-target, logging so the bad config is visible.
+            Some(servers) if !servers.is_empty() => {
+                if servers.iter().all(|s| config::is_ip_literal(s)) {
+                    Some(servers.clone())
+                } else {
+                    log::warn!(
+                        "ignoring fallback_dns: every entry must be an IP literal; \
+                         using the detected physical resolver instead"
+                    );
+                    info.demote_target.clone()
+                }
+            }
+            _ => info.demote_target.clone(),
+        }
+    }
+
     fn desired(&self) -> Option<(VpnInfo, Vec<String>)> {
         let active = self.config.enabled && self.vpn_up && !self.config.vpn_hosts.is_empty();
         match &self.last_info {
             Some(info)
-                if active
-                    && !info.dns_servers.is_empty()
-                    && info.interface_name == self.config.vpn_name =>
+                if active && !info.dns_servers.is_empty() && self.interface_gate_passes(info) =>
             {
-                Some((info.clone(), self.config.vpn_hosts.clone()))
+                // Fold the configured fallback override (if any) into the
+                // demote-target so the backend receives the effective fallback.
+                let mut info = info.clone();
+                info.demote_target = self.effective_demote_target(&info);
+                Some((info, self.config.vpn_hosts.clone()))
             }
             _ => None,
         }
@@ -459,6 +521,9 @@ impl StateMachine {
                     interface: info.interface_name.clone(),
                     domains,
                     dns_servers: info.dns_servers.clone(),
+                    // Already folded with the `fallback_dns` override by
+                    // `desired()`; a change here forces a re-apply (re-demote).
+                    demote_target: info.demote_target.clone(),
                 };
                 // A matching snapshot only means "already converged" when the
                 // last apply/revert actually succeeded; after a failure the
@@ -483,6 +548,10 @@ impl StateMachine {
                         );
                         self.applied = Some(target);
                         self.needs_resync = false;
+                        // Applying establishes our own state (on macOS the demote
+                        // subsumes any prior process's snapshot), so a previously
+                        // pending orphaned-cleanup is no longer outstanding.
+                        self.pending_global_cleanup = false;
                         Ok(())
                     }
                     Ok(Err(e)) => {
@@ -523,8 +592,16 @@ impl StateMachine {
     /// `applied` is left set, so a later reconcile or shutdown retries it.
     async fn revert(&mut self) -> Result<(), PlatformError> {
         let Some(applied) = self.applied.clone() else {
-            // Nothing recorded as applied: the system already matches the
-            // "reverted" goal, so any prior uncertainty is resolved.
+            // Nothing recorded as applied. A previous process's orphaned global
+            // demote may still need cleaning (a startup reconcile that failed
+            // transiently) — retry it here so a Down/disable/reload converges it
+            // instead of waiting for a full VPN up→down cycle.
+            if self.pending_global_cleanup {
+                self.run_global_cleanup().await?;
+                self.pending_global_cleanup = false;
+            }
+            // The system already matches the "reverted" goal, so any prior
+            // uncertainty is resolved.
             self.needs_resync = false;
             return Ok(());
         };
@@ -553,6 +630,57 @@ impl StateMachine {
                 self.needs_resync = true;
                 Err(PlatformError::CommandFailed(format!(
                     "revert task panicked: {e}"
+                )))
+            }
+        }
+    }
+
+    /// Reconcile orphaned persisted state left by a previous unclean exit, once at
+    /// startup (before the watch is armed).
+    ///
+    /// A **global-revert backend** (macOS) persists its default-DNS demote on disk
+    /// so it survives a SIGKILL. If the daemon was killed while demoted and the VPN
+    /// then went down before this restart, the watch's initial sample is `Down`
+    /// and is suppressed (nothing changed from the watcher's view), so without this
+    /// nothing would restore the default resolver or clear the snapshot — the
+    /// machine would stay pinned to the off-tunnel fallback until the next VPN
+    /// up→down cycle. A global revert is idempotent (a no-op when nothing was
+    /// persisted); and if a VPN is in fact up, the watch's initial `Up` re-applies
+    /// immediately after. Per-interface backends (Linux) keep no cross-restart
+    /// persisted state of this kind, so they skip it (their revert needs a live
+    /// `applied` interface anyway). `applied` stays `None` either way — this only
+    /// cleans state a *previous* process left behind.
+    async fn cleanup_orphaned_state_on_startup(&mut self) {
+        if !self.backend.reverts_globally() {
+            return;
+        }
+        if self.run_global_cleanup().await.is_err() {
+            // A transient failure must not strand the orphaned state: mark it so
+            // every later `revert()` retries until it succeeds.
+            self.pending_global_cleanup = true;
+        }
+    }
+
+    /// Run one global cleanup revert (used by the startup reconcile and the
+    /// retry-on-`revert` path). Logs the outcome and returns the backend result.
+    async fn run_global_cleanup(&self) -> Result<(), PlatformError> {
+        let backend = self.backend.clone();
+        let interface = self.config.vpn_name.clone();
+        match tokio::task::spawn_blocking(move || backend.revert_rules(&interface)).await {
+            Ok(Ok(())) => {
+                log::debug!("reconciled any orphaned default-DNS demote state");
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                log::warn!(
+                    "orphaned-state cleanup failed: {e}; it will be retried on the next reconcile"
+                );
+                Err(e)
+            }
+            Err(e) => {
+                log::error!("orphaned-state cleanup task panicked: {e}");
+                Err(PlatformError::CommandFailed(format!(
+                    "orphaned-state cleanup task panicked: {e}"
                 )))
             }
         }
@@ -659,10 +787,14 @@ impl StateMachine {
         // intentionally ignored: shutdown reports cleanliness from the
         // `self.orphaned` check below, which covers the same lingering set.
         let _ = self.revert_orphaned().await;
-        let applied_clean = if self.applied.is_none() {
-            true
-        } else {
-            log::info!("shutdown: reverting active rules");
+        // Revert applied rules, and ALSO run a pending global cleanup (a macOS
+        // startup reconcile that failed transiently) so a stale demote snapshot /
+        // default DNS is not left behind when `applied` is `None`. `revert()`
+        // covers both: it reverts when `applied` is set, and runs the pending
+        // global cleanup otherwise — returning `Err` (→ unclean) if it still fails,
+        // so shutdown does not falsely report clean while a demote may remain.
+        let applied_clean = if self.applied.is_some() || self.pending_global_cleanup {
+            log::info!("shutdown: reverting active rules and any pending cleanup");
             match self.revert().await {
                 Ok(()) => true,
                 Err(e) => {
@@ -670,6 +802,8 @@ impl StateMachine {
                     false
                 }
             }
+        } else {
+            true
         };
         if applied_clean && self.orphaned.is_empty() {
             log::info!("shutdown: system left clean");
@@ -700,16 +834,17 @@ impl StateMachine {
             // surfaced regardless of *apply* state so a client can show the
             // interface's resolver read-only (the DNS-auto model). Sourced from
             // the last detector reading, gated on (a) the interface still being
-            // up and (b) its name matching the configured `vpn_name` — the same
-            // guards `desired()`/`routing_state()` use. The `vpn_up` gate matters
-            // because a `Down` event only flips `vpn_up` and leaves `last_info`
-            // populated, so without it a disconnected VPN would keep reporting its
-            // last DNS as "detected". Empty when no interface is configured, it is
-            // down, or it pushes no DNS.
+            // up and (b) the interface gate — its name matching `vpn_name` on
+            // Linux, or always (DNS-model-driven) on macOS — the same guard
+            // `desired()`/`routing_state()` use. The `vpn_up` gate matters because
+            // a `Down` event only flips `vpn_up` and leaves `last_info` populated,
+            // so without it a disconnected VPN would keep reporting its last DNS
+            // as "detected". Empty when no interface is configured, it is down, or
+            // it pushes no DNS.
             detected_dns: self
                 .last_info
                 .as_ref()
-                .filter(|info| self.vpn_up && info.interface_name == self.config.vpn_name)
+                .filter(|info| self.vpn_up && self.interface_gate_passes(info))
                 .map(|info| info.dns_servers.clone())
                 .unwrap_or_default(),
             detector_health: self.detector_health.clone(),
@@ -729,12 +864,15 @@ impl StateMachine {
     /// occur) is reported as `NoDnsFromVpn` rather than a near-unreachable state.
     ///
     /// A known out-of-sync condition takes precedence over every "inactive"
-    /// reason: a failed apply/revert (`needs_resync`) or an interface orphaned by
-    /// a failed switch (`orphaned` non-empty) means stale split-DNS rules may
-    /// still be installed somewhere, so reporting `Disabled`/`Applied`/etc. would
-    /// claim a clean state the daemon does not believe in. Both surface as
-    /// `ApplyFailed` ("out of sync") until cleanup succeeds — e.g. a `Disable`
-    /// whose revert failed reads `ApplyFailed`, not `Disabled`.
+    /// reason: a failed apply/revert (`needs_resync`), an interface orphaned by a
+    /// failed switch (`orphaned` non-empty), or a pending global cleanup (a macOS
+    /// startup demote-reconcile that failed transiently — `pending_global_cleanup`)
+    /// each means stale split-DNS rules or a stale demoted default may still be
+    /// installed, so reporting `Disabled`/`VpnDown`/`Applied`/etc. would claim a
+    /// clean state the daemon does not believe in. All surface as `ApplyFailed`
+    /// ("out of sync") until cleanup succeeds — e.g. a `Disable` whose revert
+    /// failed reads `ApplyFailed`, not `Disabled`; and a restart that could not
+    /// clear an orphaned demote reads `ApplyFailed`, not `VpnDown`.
     fn routing_state(&self) -> RoutingState {
         // A config file that does not parse takes precedence over everything:
         // the daemon froze on the last-good config, and the user must learn
@@ -743,9 +881,12 @@ impl StateMachine {
         if self.config_invalid {
             return RoutingState::ConfigInvalid;
         }
-        // Out-of-sync (a failed apply/revert, or a lingering orphaned interface)
-        // overrides the inactive-reason branches below — see the doc above.
-        if self.needs_resync || !self.orphaned.is_empty() {
+        // Out-of-sync (a failed apply/revert, a lingering orphaned interface, or a
+        // pending macOS demote-cleanup) overrides the inactive-reason branches
+        // below — see the doc above. Without the pending-cleanup term, a restart
+        // that left an orphaned demote pending would report `VpnDown` while the
+        // default DNS is still demoted.
+        if self.needs_resync || !self.orphaned.is_empty() || self.pending_global_cleanup {
             return RoutingState::ApplyFailed;
         }
         if !self.config.enabled {
@@ -757,11 +898,10 @@ impl StateMachine {
         if !self.vpn_up {
             return RoutingState::VpnDown;
         }
-        let has_vpn_dns = matches!(
-            &self.last_info,
-            Some(info)
-                if !info.dns_servers.is_empty() && info.interface_name == self.config.vpn_name
-        );
+        let has_vpn_dns = self
+            .last_info
+            .as_ref()
+            .is_some_and(|info| !info.dns_servers.is_empty() && self.interface_gate_passes(info));
         if !has_vpn_dns {
             return RoutingState::NoDnsFromVpn;
         }
@@ -1238,10 +1378,25 @@ impl StateMachine {
 }
 
 /// Whether a config delta requires re-arming the detector watch — i.e. it
-/// touches a field the watch is keyed on. Domain/`enabled` edits do not (those
-/// only change `desired()`), so they reconcile without tearing the watch down.
+/// touches a field the watch is keyed on, OR a field whose change needs the
+/// revert + re-sample that a re-arm performs. Domain/`enabled` edits do not
+/// (those only change `desired()`), so they reconcile without tearing the watch
+/// down.
+///
+/// `fallback_dns` is included for the revert + re-sample, not because the watch
+/// is keyed on it: after a macOS demote the detector reads the demoted value back
+/// as the demote-target, so `last_info.demote_target` becomes the override we
+/// installed. Without a fresh sample, removing or changing the override would
+/// leave the physical service pinned to the old fallback (`desired()` still
+/// equals the applied target, so nothing re-applies until the next network/VPN
+/// cycle). The re-arm reverts first — restoring the real prior DHCP resolver from
+/// the demote snapshot — then re-samples, so the next demote targets the correct
+/// resolver. (Harmless on Linux, which ignores `fallback_dns`.)
 fn watch_settings_changed(old: &LocalConfig, new: &LocalConfig) -> bool {
-    old.vpn_name != new.vpn_name || old.vpn_backend != new.vpn_backend || old.openvpn != new.openvpn
+    old.vpn_name != new.vpn_name
+        || old.vpn_backend != new.vpn_backend
+        || old.openvpn != new.openvpn
+        || old.fallback_dns != new.fallback_dns
 }
 
 /// The reply when a mutation cannot read the config file (missing or malformed).
@@ -1270,6 +1425,11 @@ pub async fn run_state(
     mut rx: mpsc::Receiver<StateCommand>,
     mut shutdown: oneshot::Receiver<oneshot::Sender<bool>>,
 ) {
+    // Reconcile any orphaned persisted state left by a previous unclean exit
+    // (e.g. a global-revert backend's default-DNS demote snapshot) before arming
+    // the watch — the initial Down sample is suppressed, so this is the only path
+    // that clears it when the VPN is already down at startup.
+    machine.cleanup_orphaned_state_on_startup().await;
     // Arm the VPN watch once here, before the command loop, so all watch
     // lifecycle (start at boot, re-arm on config change) lives in one owner —
     // the actor — rather than being split with `run_async`.
@@ -1330,6 +1490,9 @@ mod tests {
     #[derive(Default)]
     struct MockBackend {
         applies: Mutex<Vec<(String, Vec<String>)>>,
+        /// The `demote_target` carried by each apply, in order — so tests can
+        /// assert the state machine folded in the `fallback_dns` override.
+        applied_demote_targets: Mutex<Vec<Option<Vec<String>>>>,
         reverts: Mutex<Vec<String>>,
         fail_apply: AtomicBool,
         fail_revert: AtomicBool,
@@ -1401,6 +1564,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((info.interface_name.clone(), domains.to_vec()));
+            self.applied_demote_targets
+                .lock()
+                .unwrap()
+                .push(info.demote_target.clone());
             Ok(())
         }
 
@@ -1529,6 +1696,7 @@ mod tests {
             Ok(VpnInfo {
                 interface_name: interface.to_string(),
                 dns_servers: vec!["10.0.0.1".to_string()],
+                demote_target: None,
             })
         }
 
@@ -1563,6 +1731,7 @@ mod tests {
                     .send(VpnEvent::Up(VpnInfo {
                         interface_name: iface,
                         dns_servers: vec!["10.0.0.1".to_string()],
+                        demote_target: None,
                     }))
                     .await;
                 // Then release on receiver drop, like NM/OpenVPN's `tx.closed()`.
@@ -1712,6 +1881,7 @@ mod tests {
             enabled,
             vpn_backend: config::VpnBackend::default(),
             openvpn: config::OpenVpnConfig::default(),
+            fallback_dns: None,
         }
     }
 
@@ -1719,6 +1889,17 @@ mod tests {
         VpnEvent::Up(VpnInfo {
             interface_name: interface.to_string(),
             dns_servers: vec!["10.0.0.1".to_string()],
+            demote_target: None,
+        })
+    }
+
+    /// A macOS-style Up: the detector reports a demote-target (the physical DHCP
+    /// resolver) alongside the corp DNS. `interface_name` is advisory there.
+    fn vpn_up_macos(interface: &str, demote_target: &[&str]) -> VpnEvent {
+        VpnEvent::Up(VpnInfo {
+            interface_name: interface.to_string(),
+            dns_servers: vec!["192.0.2.53".to_string()],
+            demote_target: Some(demote_target.iter().map(|s| s.to_string()).collect()),
         })
     }
 
@@ -1785,6 +1966,122 @@ mod tests {
 
         assert!(backend.applies.lock().unwrap().is_empty());
         assert!(sm.applied.is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_reconciles_orphaned_demote_for_a_global_revert_backend() {
+        // A macOS-style backend persists its default-DNS demote across an unclean
+        // exit, so the daemon reverts any orphaned state once at startup — a
+        // suppressed initial Down would otherwise never clear it.
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "startup-cleanup-global",
+        );
+
+        sm.cleanup_orphaned_state_on_startup().await;
+
+        assert_eq!(
+            backend.reverts.lock().unwrap().as_slice(),
+            &["wg0"],
+            "the global-revert backend is reconciled once at boot"
+        );
+        assert!(
+            sm.applied.is_none(),
+            "cleanup records nothing as applied — it only clears a prior process's state"
+        );
+        assert!(
+            !sm.pending_global_cleanup,
+            "a successful cleanup leaves nothing pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_skips_cleanup_for_a_per_interface_backend() {
+        // A per-interface backend (Linux) keeps no cross-restart persisted state of
+        // this kind, so startup must not issue a spurious revert.
+        let backend = Arc::new(MockBackend::default()); // reverts_globally == false
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "startup-cleanup-skip",
+        );
+
+        sm.cleanup_orphaned_state_on_startup().await;
+
+        assert!(
+            backend.reverts.lock().unwrap().is_empty(),
+            "a per-interface backend is not reverted at boot"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_startup_cleanup_is_retried_on_a_later_reconcile() {
+        // P2: the startup cleanup fails transiently. Because `applied` is None an
+        // ordinary reconcile's revert() would be a no-op — but the pending flag
+        // makes the next revert retry the global cleanup until it succeeds, so an
+        // orphaned demote is not stranded until a full VPN up→down cycle.
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        backend.set_fail_revert(true); // the startup cleanup fails
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "startup-cleanup-retry",
+        );
+
+        sm.cleanup_orphaned_state_on_startup().await;
+        assert!(
+            sm.pending_global_cleanup,
+            "a failed cleanup is recorded as pending"
+        );
+        assert_eq!(
+            backend.reverts.lock().unwrap().len(),
+            1,
+            "the failing attempt still issued a revert"
+        );
+
+        // A later reconcile (VPN still down, nothing applied) retries the cleanup,
+        // which now succeeds and clears the pending flag.
+        backend.set_fail_revert(false);
+        sm.reconcile_primary().await.unwrap();
+        assert!(
+            !sm.pending_global_cleanup,
+            "a successful retry clears the pending flag"
+        );
+        assert_eq!(
+            backend.reverts.lock().unwrap().len(),
+            2,
+            "the cleanup is retried until it succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reports_apply_failed_while_a_global_cleanup_is_pending() {
+        // P2: a pending macOS demote-cleanup (a startup reconcile that failed) means
+        // a stale default DNS may still be installed, so status must read
+        // ApplyFailed — not VpnDown — even though nothing is applied and the VPN is
+        // down at restart.
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        backend.set_fail_revert(true);
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "status-pending-cleanup",
+        );
+        sm.cleanup_orphaned_state_on_startup().await; // fails → pending set
+        assert!(sm.pending_global_cleanup);
+        assert!(!sm.vpn_up, "VPN is down at restart");
+        assert!(sm.applied.is_none());
+
+        assert_eq!(
+            sm.routing_state(),
+            RoutingState::ApplyFailed,
+            "a pending demote-cleanup is out-of-sync, not a clean VpnDown"
+        );
     }
 
     #[tokio::test]
@@ -1877,6 +2174,7 @@ mod tests {
         sm.on_event(VpnEvent::Up(VpnInfo {
             interface_name: "wg0".to_string(),
             dns_servers: vec!["10.9.9.9".to_string()],
+            demote_target: None,
         }))
         .await;
 
@@ -1974,6 +2272,7 @@ mod tests {
         sm.on_event(VpnEvent::Up(VpnInfo {
             interface_name: "wg0".to_string(),
             dns_servers: Vec::new(),
+            demote_target: None,
         }))
         .await;
 
@@ -2005,6 +2304,7 @@ mod tests {
         sm.on_event(VpnEvent::Up(VpnInfo {
             interface_name: "wg0".to_string(),
             dns_servers: Vec::new(),
+            demote_target: None,
         }))
         .await;
 
@@ -2045,6 +2345,7 @@ mod tests {
             enabled: true,
             vpn_backend: config::VpnBackend::default(),
             openvpn: config::OpenVpnConfig::default(),
+            fallback_dns: None,
         };
         sm.config_store.save(&new_cfg).unwrap();
         let resp = sm.on_request(Request::ReloadConfig).await;
@@ -2167,6 +2468,59 @@ mod tests {
         // Revert failed: shutdown reports unclean and keeps `applied` set.
         assert!(!clean);
         assert!(sm.applied.is_some());
+    }
+
+    #[tokio::test]
+    async fn shutdown_runs_a_pending_global_cleanup_even_with_nothing_applied() {
+        // P2: a macOS startup cleanup failed (pending) and nothing is applied. If
+        // the daemon is stopped before any reconcile retries it, shutdown must
+        // still run the global cleanup rather than reporting clean while a stale
+        // demote snapshot / default DNS remains.
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        backend.set_fail_revert(true);
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "shutdown-pending-cleanup",
+        );
+        sm.cleanup_orphaned_state_on_startup().await; // fails → pending set
+        assert!(sm.pending_global_cleanup);
+        backend.reverts.lock().unwrap().clear();
+
+        backend.set_fail_revert(false); // the retry at shutdown succeeds
+        let clean = sm.shutdown().await;
+        assert!(clean, "shutdown is clean once the pending cleanup succeeds");
+        assert!(!sm.pending_global_cleanup, "the pending cleanup is cleared");
+        assert_eq!(
+            backend.reverts.lock().unwrap().as_slice(),
+            &["wg0"],
+            "shutdown ran the global cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_unclean_when_a_pending_cleanup_still_fails() {
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        backend.set_fail_revert(true);
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "shutdown-pending-fail",
+        );
+        sm.cleanup_orphaned_state_on_startup().await;
+        assert!(sm.pending_global_cleanup);
+
+        let clean = sm.shutdown().await; // fail_revert still true
+        assert!(
+            !clean,
+            "shutdown reports unclean while a demote snapshot may remain"
+        );
+        assert!(
+            sm.pending_global_cleanup,
+            "the pending flag stays set for a future retry"
+        );
     }
 
     #[tokio::test]
@@ -2496,6 +2850,16 @@ mod tests {
         let mut ovpn = base.clone();
         ovpn.openvpn.management = "127.0.0.1:7505".to_string();
         assert!(watch_settings_changed(&base, &ovpn));
+
+        // A `fallback_dns` change also re-arms: the re-arm's revert + re-sample is
+        // what restores the real prior DHCP resolver and re-demotes to it after the
+        // override is changed/removed (the detector reads the demoted value back, so
+        // a plain reconcile would otherwise stay pinned to the old fallback).
+        let mut fallback = base.clone();
+        fallback.fallback_dns = Some(vec!["203.0.113.9".to_string()]);
+        assert!(watch_settings_changed(&base, &fallback));
+        // ...and removing it again is a change too.
+        assert!(watch_settings_changed(&fallback, &base));
     }
 
     #[tokio::test]
@@ -2533,6 +2897,7 @@ mod tests {
         sm.on_event(VpnEvent::Up(VpnInfo {
             interface_name: "wg0".to_string(),
             dns_servers: Vec::new(),
+            demote_target: None,
         }))
         .await;
         assert_eq!(sm.routing_state(), RoutingState::NoDnsFromVpn);
@@ -2997,6 +3362,140 @@ mod tests {
         assert!(
             !backend.reverts.lock().unwrap().iter().any(|i| i == "wg1"),
             "the freshly-applied interface must never be reverted by orphan cleanup"
+        );
+    }
+
+    // --- macOS DNS-privacy path: gate decoupled from vpn_name, demote folding -
+
+    #[tokio::test]
+    async fn global_revert_backend_applies_regardless_of_interface_name() {
+        // On macOS the VPN's interface is not a stable, DNS-scoped link, so the
+        // configured `vpn_name` must NOT gate apply. A global-revert backend with
+        // an Up whose advisory interface_name differs from `vpn_name` must still
+        // apply (driven by the DNS-model signal the detector already decided).
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        // config.vpn_name is "wg0" (the helper default), but the macOS Up carries
+        // an unrelated advisory interface name.
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["corp.example.com"]),
+            "macos-gate",
+        );
+
+        sm.on_event(vpn_up_macos("utun7", &["198.51.100.1"])).await;
+        assert!(
+            sm.applied.is_some(),
+            "macOS apply must not be gated on interface_name == vpn_name"
+        );
+        assert_eq!(
+            backend.applies.lock().unwrap().len(),
+            1,
+            "the corp domains are applied despite the interface-name mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn linux_backend_still_gates_on_interface_name() {
+        // The Linux contract is unchanged: a per-interface backend (default,
+        // reverts_globally=false) still requires the Up's interface to match
+        // `vpn_name`, so a mismatched interface does NOT apply.
+        let backend = Arc::new(MockBackend::default()); // reverts_globally = false
+        let mut sm = machine(backend.clone(), config(true, &["a.com"]), "linux-gate");
+        // config.vpn_name == "wg0"; an Up on a different interface must not apply.
+        sm.on_event(vpn_up("wg1")).await;
+        assert!(
+            sm.applied.is_none(),
+            "Linux must still gate apply on interface_name == vpn_name"
+        );
+    }
+
+    #[tokio::test]
+    async fn macos_apply_uses_the_detector_demote_target_without_a_config_override() {
+        // With no `fallback_dns` override, the demote-target handed to the backend
+        // is the detector's (the physical DHCP resolver).
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["corp.example.com"]),
+            "macos-demote",
+        );
+
+        sm.on_event(vpn_up_macos("utun7", &["198.51.100.1"])).await;
+        assert_eq!(
+            backend.applied_demote_targets.lock().unwrap().as_slice(),
+            &[Some(vec!["198.51.100.1".to_string()])],
+            "without an override, the detector's demote-target is used"
+        );
+    }
+
+    #[tokio::test]
+    async fn macos_apply_folds_in_the_fallback_dns_config_override() {
+        // A configured `fallback_dns` override replaces the detector's
+        // demote-target in the VpnInfo handed to the backend.
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        let mut cfg = config(true, &["corp.example.com"]);
+        cfg.fallback_dns = Some(vec!["203.0.113.9".to_string()]);
+        let mut sm = machine(backend.clone(), cfg, "macos-override");
+
+        // The detector still reports 198.51.100.1, but the config override wins.
+        sm.on_event(vpn_up_macos("utun7", &["198.51.100.1"])).await;
+        assert_eq!(
+            backend.applied_demote_targets.lock().unwrap().as_slice(),
+            &[Some(vec!["203.0.113.9".to_string()])],
+            "the fallback_dns override must replace the detector's demote-target"
+        );
+    }
+
+    #[tokio::test]
+    async fn macos_apply_ignores_a_non_ip_fallback_dns_override() {
+        // A `fallback_dns` override with a non-IP entry must NOT reach the backend:
+        // it would be interpolated verbatim into the root `scutil` demote script. It
+        // is rejected as a whole and the detector's demote-target is used instead.
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        let mut cfg = config(true, &["corp.example.com"]);
+        cfg.fallback_dns = Some(vec!["not-an-ip".to_string()]);
+        let mut sm = machine(backend.clone(), cfg, "macos-bad-override");
+
+        sm.on_event(vpn_up_macos("utun7", &["198.51.100.1"])).await;
+        assert_eq!(
+            backend.applied_demote_targets.lock().unwrap().as_slice(),
+            &[Some(vec!["198.51.100.1".to_string()])],
+            "a non-IP fallback_dns override is ignored; the detector's demote-target is used"
+        );
+    }
+
+    #[tokio::test]
+    async fn macos_reapplies_on_a_redetect_after_the_default_was_reasserted() {
+        // Reconcile-on-event: if the VPN re-asserts its default after a network
+        // change, the detector re-emits Up (the watch fires on the DNS change).
+        // A fresh Up must re-drive apply (the backend re-demotes), bounded — one
+        // re-apply per event, no busy loop (this is purely event-driven; there is
+        // no timer here). We model two Up events and assert two applies.
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["corp.example.com"]),
+            "macos-reapply",
+        );
+
+        sm.on_event(vpn_up_macos("utun7", &["198.51.100.1"])).await;
+        // A second Up with a CHANGED demote-target (e.g. Wi-Fi switched, new DHCP
+        // resolver) — the dedup upstream only forwards genuine changes, so the
+        // state machine sees a distinct event and re-applies with the new target.
+        sm.on_event(vpn_up_macos("utun7", &["198.51.100.9"])).await;
+        let targets = backend.applied_demote_targets.lock().unwrap();
+        assert_eq!(
+            targets.as_slice(),
+            &[
+                Some(vec!["198.51.100.1".to_string()]),
+                Some(vec!["198.51.100.9".to_string()]),
+            ],
+            "a re-detected change re-applies the demote with the new target"
         );
     }
 
@@ -3637,6 +4136,7 @@ mod tests {
             enabled: true,
             vpn_backend: config::VpnBackend::default(),
             openvpn: config::OpenVpnConfig::default(),
+            fallback_dns: None,
         };
         let sm = machine(backend.clone(), cfg, "verify-no-iface");
 

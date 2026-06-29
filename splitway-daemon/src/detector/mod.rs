@@ -4,6 +4,15 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
+/// Re-export the macOS dynamic-store dump parsers so the macOS DNS backend can
+/// reuse them for the demote (it reads the same `scutil` dump shape to find the
+/// primary service and its current DNS). Kept here, behind the platform gate, so
+/// the two macOS modules share one parser rather than duplicating it.
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{
+    parse_array_field as macos_parse_array_field, parse_scalar_field as macos_parse_scalar_field,
+};
+
 #[cfg(target_os = "windows")]
 mod windows;
 

@@ -307,6 +307,7 @@ mod tests {
         let info = VpnInfo {
             interface_name: "tun0".to_string(),
             dns_servers: Vec::new(),
+            demote_target: None,
         };
         let result = LinuxBackend.apply_rules(&info, &["corp.example.com".to_string()]);
         assert!(
