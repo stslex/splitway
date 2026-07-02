@@ -613,6 +613,16 @@ impl StateMachine {
                 log::info!("reverted rules on {}", applied.interface);
                 self.applied = None;
                 self.needs_resync = false;
+                // On a global-revert backend (macOS) `revert_rules` also restores
+                // the on-disk demote snapshot — exactly the cleanup
+                // `pending_global_cleanup` tracks — so a successful applied-path
+                // revert clears it too. Without this, an apply-fail → revert-success
+                // sequence would leave the flag set and `routing_state()` stuck at
+                // `ApplyFailed` on a system that is in fact clean, until some later
+                // event happened to run the `applied == None` branch.
+                if self.backend.reverts_globally() {
+                    self.pending_global_cleanup = false;
+                }
                 Ok(())
             }
             Ok(Err(e)) => {
@@ -2081,6 +2091,54 @@ mod tests {
             sm.routing_state(),
             RoutingState::ApplyFailed,
             "a pending demote-cleanup is out-of-sync, not a clean VpnDown"
+        );
+    }
+
+    #[tokio::test]
+    async fn applied_path_revert_clears_a_pending_global_cleanup() {
+        // P3: startup cleanup failed (pending), then a VPN Up whose apply FAILS
+        // (applied stays Some, so the apply-success clear never runs), then a VPN
+        // Down whose applied-path revert SUCCEEDS. On a global-revert backend that
+        // revert also restores the demote snapshot the pending flag tracks, so it
+        // must be cleared here — otherwise routing_state() stays stuck at
+        // ApplyFailed on a system that is in fact clean, until some later event
+        // happens to run the `applied == None` branch.
+        let backend = Arc::new(MockBackend::default());
+        backend.set_reverts_globally(true);
+        backend.set_fail_revert(true);
+        let mut sm = machine(
+            backend.clone(),
+            config(true, &["a.com"]),
+            "applied-revert-clears-pending",
+        );
+        sm.cleanup_orphaned_state_on_startup().await; // fails → pending set
+        assert!(sm.pending_global_cleanup);
+
+        // VPN Up, but the apply fails → applied stays Some, pending flag untouched.
+        backend.set_fail_revert(false);
+        backend.set_fail_apply(true);
+        sm.on_event(vpn_up_macos("utun7", &["198.51.100.1"])).await;
+        assert!(sm.applied.is_some());
+        assert!(
+            sm.pending_global_cleanup,
+            "an apply failure never clears the pending cleanup"
+        );
+
+        // VPN Down: the applied-path revert succeeds (global) → clears the flag.
+        backend.set_fail_apply(false);
+        sm.on_event(VpnEvent::Down {
+            interface_name: "utun7".to_string(),
+        })
+        .await;
+        assert!(sm.applied.is_none());
+        assert!(
+            !sm.pending_global_cleanup,
+            "a successful global revert clears the pending cleanup"
+        );
+        assert_eq!(
+            sm.routing_state(),
+            RoutingState::VpnDown,
+            "the clean system reads VpnDown, not a stuck ApplyFailed"
         );
     }
 
