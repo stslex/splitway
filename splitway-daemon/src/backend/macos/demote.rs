@@ -29,11 +29,13 @@
 //! ([`build_set_dns_script`] / `build_*`) that are tested directly.
 
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+
+use serde::{Deserialize, Serialize};
 
 use splitway_shared::platform::PlatformError;
+
+use crate::detector::{macos_same_set as same_set, macos_scutil_script as scutil_script};
 
 /// The dynamic-store key holding the primary network service id we demote.
 const GLOBAL_IPV4_KEY: &str = "State:/Network/Global/IPv4";
@@ -46,14 +48,11 @@ pub(super) const SNAPSHOT_PATH: &str = "/var/run/splitway/dns-demote.snapshot";
 /// A captured pre-demote state: which service was demoted, the `InterfaceName`
 /// it was bound to, and the `ServerAddresses` it had before.
 ///
-/// Serialised to [`SNAPSHOT_PATH`] as a tiny self-describing line format (no
-/// serde dependency pulled in for one struct): each line is `<tag>\t<value>`,
-/// with tags `key` (the service DNS key, exactly once), `iface` (the
-/// `InterfaceName`, at most once — omitted when the service had none), `server`
-/// (one per prior resolver, in order), and `fallback` (one per installed-fallback
-/// resolver, in order). The tags make the optional `iface` line unambiguous even
-/// when there are no servers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serialised to [`SNAPSHOT_PATH`] as JSON via `serde` (already a direct
+/// dependency of this crate). JSON is used rather than a bespoke line format so
+/// there is no hand-rolled parser to keep in sync and no silent-corruption edge
+/// from a resolver value that happens to contain the field separator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct DemoteSnapshot {
     /// The full `State:/Network/Service/<id>/DNS` key that was overwritten.
     pub service_dns_key: String,
@@ -71,61 +70,6 @@ pub(super) struct DemoteSnapshot {
     /// change, where the service may still show a *previous* fallback we wrote.
     /// Updated only after a fallback write succeeds.
     pub installed_fallback: Vec<String>,
-}
-
-impl DemoteSnapshot {
-    /// Serialise to the on-disk `<tag>\t<value>` line format.
-    fn serialize(&self) -> String {
-        let mut out = String::new();
-        out.push_str("key\t");
-        out.push_str(&self.service_dns_key);
-        out.push('\n');
-        if let Some(iface) = &self.interface_name {
-            out.push_str("iface\t");
-            out.push_str(iface);
-            out.push('\n');
-        }
-        for s in &self.prior_servers {
-            out.push_str("server\t");
-            out.push_str(s);
-            out.push('\n');
-        }
-        for f in &self.installed_fallback {
-            out.push_str("fallback\t");
-            out.push_str(f);
-            out.push('\n');
-        }
-        out
-    }
-
-    /// Parse the on-disk `<tag>\t<value>` line format. Requires a `key` line;
-    /// `iface` is optional; `server` and `fallback` lines are collected in order.
-    /// Returns `None` for an empty/garbled snapshot (no `key`).
-    fn deserialize(text: &str) -> Option<Self> {
-        let mut service_dns_key: Option<String> = None;
-        let mut interface_name: Option<String> = None;
-        let mut prior_servers: Vec<String> = Vec::new();
-        let mut installed_fallback: Vec<String> = Vec::new();
-        for line in text.lines() {
-            let line = line.trim_end_matches(['\r', '\n']);
-            let Some((tag, value)) = line.split_once('\t') else {
-                continue; // skip a malformed line rather than failing the whole load
-            };
-            match tag {
-                "key" => service_dns_key = Some(value.to_string()),
-                "iface" if !value.is_empty() => interface_name = Some(value.to_string()),
-                "server" if !value.is_empty() => prior_servers.push(value.to_string()),
-                "fallback" if !value.is_empty() => installed_fallback.push(value.to_string()),
-                _ => {}
-            }
-        }
-        Some(DemoteSnapshot {
-            service_dns_key: service_dns_key?,
-            interface_name,
-            prior_servers,
-            installed_fallback,
-        })
-    }
 }
 
 /// The current DNS dict of one service, as read from
@@ -150,7 +94,14 @@ pub(super) trait ScutilRunner {
     /// `State:/Network/Service/<id>/DNS`.
     fn service_dns_state(&self, service_dns_key: &str) -> Result<ServiceDnsState, PlatformError>;
 
-    /// Run a `scutil` script (the text piped to `scutil`'s stdin).
+    /// Whether `key` currently exists in the dynamic store. A restore uses this
+    /// to avoid re-creating a phantom `State:` entry for a service configd has
+    /// already torn down (see [`restore_snapshot`]).
+    fn key_exists(&self, key: &str) -> Result<bool, PlatformError>;
+
+    /// Run a `scutil` *set* script (the text piped to `scutil`'s stdin). The impl
+    /// must surface a command failure even when `scutil` reports it on stdout with
+    /// a zero exit (see [`RealScutil::run_script`]).
     fn run_script(&self, script: &str) -> Result<(), PlatformError>;
 }
 
@@ -219,7 +170,7 @@ pub(super) struct RealScutil;
 
 impl ScutilRunner for RealScutil {
     fn primary_service(&self) -> Result<Option<String>, PlatformError> {
-        let dump = run_scutil(&format!("show {GLOBAL_IPV4_KEY}\n"))?;
+        let dump = scutil_script(&format!("show {GLOBAL_IPV4_KEY}\n"))?;
         Ok(crate::detector::macos_parse_scalar_field(
             &dump,
             "PrimaryService",
@@ -227,45 +178,53 @@ impl ScutilRunner for RealScutil {
     }
 
     fn service_dns_state(&self, service_dns_key: &str) -> Result<ServiceDnsState, PlatformError> {
-        let dump = run_scutil(&format!("show {service_dns_key}\n"))?;
+        let dump = scutil_script(&format!("show {service_dns_key}\n"))?;
         Ok(ServiceDnsState {
             interface_name: crate::detector::macos_parse_scalar_field(&dump, "InterfaceName"),
             servers: crate::detector::macos_parse_array_field(&dump, "ServerAddresses"),
         })
     }
 
+    fn key_exists(&self, key: &str) -> Result<bool, PlatformError> {
+        // `scutil` prints `No such key` (exit 0) for a `show` of an absent key;
+        // any other output means the key exists.
+        Ok(!scutil_script(&format!("show {key}\n"))?.contains("No such key"))
+    }
+
     fn run_script(&self, script: &str) -> Result<(), PlatformError> {
-        run_scutil(script).map(|_| ())
+        // `scutil` in script mode reports a failed command on **stdout** while
+        // still exiting 0 (it prints via `SCPrint`), so the exit-status check in
+        // `scutil_script` alone would record a failed `set` — the exact leak this
+        // demote closes — as success. A successful `open`/`d.init`/`get`/`d.add`/
+        // `set`/`quit` sequence is silent, so any non-benign stdout is a failure;
+        // the only benign output is `No such key` from `build_set_dns_script`'s
+        // `get` on a first-time / missing service key.
+        let out = scutil_script(script)?;
+        if let Some(err) = scutil_set_error(&out) {
+            return Err(PlatformError::CommandFailed(format!(
+                "scutil reported an error running a set script (stdout, exit 0): {err}"
+            )));
+        }
+        Ok(())
     }
 }
 
-/// Pipe `script` to `scutil`'s stdin and return its stdout.
-fn run_scutil(script: &str) -> Result<String, PlatformError> {
-    let mut child = Command::new("scutil")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| PlatformError::CommandFailed(format!("failed to spawn scutil: {e}")))?;
-    {
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            PlatformError::CommandFailed("scutil stdin was not captured".to_string())
-        })?;
-        stdin
-            .write_all(script.as_bytes())
-            .map_err(|e| PlatformError::CommandFailed(format!("writing scutil script: {e}")))?;
+/// Inspect `scutil` script-mode stdout for a reported command failure. Success is
+/// silent, so this returns `Some(joined error lines)` for any non-empty output
+/// other than the benign `No such key` notice (a `get` on a missing service key,
+/// which the demote/restore scripts issue by design), else `None`. Pure so the
+/// stdout-vs-exit-status contract is unit-tested without a live `scutil`.
+fn scutil_set_error(stdout: &str) -> Option<String> {
+    let residue: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.contains("No such key"))
+        .collect();
+    if residue.is_empty() {
+        None
+    } else {
+        Some(residue.join("; "))
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| PlatformError::CommandFailed(format!("waiting for scutil: {e}")))?;
-    if !output.status.success() {
-        return Err(PlatformError::CommandFailed(format!(
-            "scutil exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Reads/writes the on-disk demote snapshot. A trait so tests inject a temp-dir
@@ -292,7 +251,9 @@ impl FileSnapshotStore {
 impl SnapshotStore for FileSnapshotStore {
     fn load(&self) -> Option<DemoteSnapshot> {
         let text = fs::read_to_string(&self.path).ok()?;
-        DemoteSnapshot::deserialize(&text)
+        // A garbled/partial file parses to `None` (treated as "nothing demoted"),
+        // never a panic.
+        serde_json::from_str(&text).ok()
     }
 
     fn save(&self, snapshot: &DemoteSnapshot) -> Result<(), PlatformError> {
@@ -304,27 +265,17 @@ impl SnapshotStore for FileSnapshotStore {
                 ))
             })?;
         }
+        let bytes = serde_json::to_vec(snapshot).map_err(|e| {
+            PlatformError::CommandFailed(format!("serialising demote snapshot: {e}"))
+        })?;
         // atomic_write keeps the snapshot intact on a crash mid-write.
-        splitway_shared::config::atomic_write(&self.path, snapshot.serialize().as_bytes())
+        splitway_shared::config::atomic_write(&self.path, &bytes)
             .map_err(|e| PlatformError::CommandFailed(format!("writing demote snapshot: {e}")))
     }
 
     fn clear(&self) {
         let _ = fs::remove_file(&self.path);
     }
-}
-
-/// Order-insensitive equality of two resolver lists (treated as sets) — used to
-/// tell whether a service's live DNS is still our fallback or a new real resolver.
-fn same_server_set(a: &[String], b: &[String]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut a: Vec<&String> = a.iter().collect();
-    let mut b: Vec<&String> = b.iter().collect();
-    a.sort();
-    b.sort();
-    a == b
 }
 
 /// Demote the system default resolver to `fallback`, snapshotting the prior
@@ -335,10 +286,18 @@ fn same_server_set(a: &[String], b: &[String]) -> bool {
 ///
 /// Returns `Ok(false)` (not an error) when there is no primary service to demote
 /// — the caller treats that as "nothing to do".
+///
+/// `corp_dns` is the VPN's own resolver (the servers the `/etc/resolver` scope
+/// points at). Detection guarantees it differs from the physical resolver, so it
+/// is never a legitimate "prior": passing it lets the same-service refresh reject
+/// a `current` that equals it — i.e. a hijacking client that rewrote the physical
+/// service's `ServerAddresses` to its corp DNS between samples — instead of
+/// snapshotting the corp resolver as the off-VPN default a later restore installs.
 pub(super) fn demote(
     scutil: &dyn ScutilRunner,
     snapshots: &dyn SnapshotStore,
     fallback: &[String],
+    corp_dns: &[String],
 ) -> Result<bool, PlatformError> {
     if fallback.is_empty() {
         return Err(PlatformError::CommandFailed(
@@ -368,21 +327,32 @@ pub(super) fn demote(
     match snapshots.load() {
         Some(existing) if existing.service_dns_key == key => {
             let current = scutil.service_dns_state(&key)?;
-            // Keep the original prior while the service still shows a fallback WE
-            // installed — never capture our own fallback. We recognise "ours" two
-            // ways: the recorded `installed_fallback` (handles a `fallback_dns`
-            // change, where the service still shows a *previous* fallback we wrote)
-            // AND the `fallback` we are about to (re)install (handles a retry after
-            // the post-write `installed_fallback` record below failed, leaving it
-            // stale/empty while the service already shows this fallback — without
-            // this clause the retry would mistake our own fallback for a DHCP
-            // update and snapshot it as the prior, losing the real resolver). A
-            // value that is neither empty nor one of those is a genuine DHCP update
-            // on the same service → adopt it as the new prior so a later restore
-            // writes it.
+            // Refresh the prior when the service's live DNS is a genuine new
+            // resolver — a DHCP renewal handed the same service a new one and the
+            // watcher re-emitted Up — so a later restore writes the latest rather
+            // than a stale pre-change value. The hard part is telling that apart
+            // from OUR OWN fallback:
+            //
+            // - `current != installed_fallback` — the recorded fallback we last
+            //   wrote — is the primary signal. It stays correct in the default
+            //   config where the fallback tracks the physical DHCP resolver (so a
+            //   DHCP change makes `fallback` itself change): the new resolver still
+            //   differs from the *previously* recorded `installed_fallback`.
+            // - Comparing against the `fallback` we are ABOUT to install is only a
+            //   backstop for when `installed_fallback` is empty (a first-time or
+            //   lost record): then a `current` equal to that fallback is our own
+            //   write, not a DHCP update. Applying this backstop unconditionally
+            //   was the bug — in the default config the new DHCP resolver *equals*
+            //   the new fallback, so it wrongly suppressed the refresh and pinned a
+            //   stale prior. Gate it on `installed_fallback` being empty.
+            // - `current != corp_dns` rejects the VPN's own resolver leaking onto
+            //   the physical service (a hijacker rewrite between samples) — never a
+            //   legitimate prior, since detection requires corp != physical.
+            let installed_is_ours = same_set(&current.servers, &existing.installed_fallback)
+                || (existing.installed_fallback.is_empty() && same_set(&current.servers, fallback));
             if !current.servers.is_empty()
-                && !same_server_set(&current.servers, &existing.installed_fallback)
-                && !same_server_set(&current.servers, fallback)
+                && !installed_is_ours
+                && !same_set(&current.servers, corp_dns)
             {
                 snapshots.save(&DemoteSnapshot {
                     service_dns_key: key.clone(),
@@ -419,10 +389,25 @@ pub(super) fn demote(
     // recognises it as ours, even across a `fallback_dns` change. Done AFTER a
     // successful write so a failed write leaves the previously-recorded fallback
     // (still the value on the service) intact.
+    //
+    // This save is BEST-EFFORT: the demote's load-bearing effects (the `set` above
+    // and the prior snapshot) already succeeded, so a failure here must NOT fail
+    // the apply. Propagating it would make `apply_with` roll back only the
+    // `/etc/resolver` scope while the default stays demoted — the inverse
+    // half-state (default off-tunnel, but corp domains no longer scoped, so they
+    // leak via the fallback). The only thing lost is the `installed_fallback`
+    // dedup hint, which the same-service branch above already tolerates being
+    // stale/empty (the `installed_fallback.is_empty()` backstop). So log and keep
+    // the demote applied.
     if let Some(mut snapshot) = snapshots.load() {
-        if !same_server_set(&snapshot.installed_fallback, fallback) {
+        if !same_set(&snapshot.installed_fallback, fallback) {
             snapshot.installed_fallback = fallback.to_vec();
-            snapshots.save(&snapshot)?;
+            if let Err(e) = snapshots.save(&snapshot) {
+                log::warn!(
+                    "demote applied, but recording the installed fallback failed: {e}; \
+                     a later re-demote will re-derive it"
+                );
+            }
         }
     }
 
@@ -474,6 +459,22 @@ fn restore_snapshot(
     scutil: &dyn ScutilRunner,
     snapshot: &DemoteSnapshot,
 ) -> Result<(), PlatformError> {
+    // Skip the restore if the snapshot's service DNS key no longer exists — the
+    // service departed entirely (e.g. Wi-Fi off → Ethernet in, configd deleted its
+    // DNS/IPv4/IPv6 keys). `build_set_dns_script`'s `get`-then-`set` would re-create
+    // the departed key as a phantom `State:/Network/Service/<old>/DNS` carrying the
+    // stale resolver and (when the snapshot had no interface) no `InterfaceName` and
+    // no live IPv4/IPv6 entity — which the detector reads as an unscoped
+    // default-resolver hijacker → a false "VPN up" pointing corp domains at a dead
+    // resolver. A gone service needs no restore; leaving it absent is correct.
+    if !scutil.key_exists(&snapshot.service_dns_key)? {
+        log::info!(
+            "skipping restore of {}: its service DNS key no longer exists \
+             (the service departed); not re-creating a phantom entry",
+            snapshot.service_dns_key
+        );
+        return Ok(());
+    }
     let script = build_set_dns_script(
         &snapshot.service_dns_key,
         &snapshot.prior_servers,
@@ -500,6 +501,9 @@ pub(super) mod test_support {
         pub service_states: RefCell<std::collections::HashMap<String, ServiceDnsState>>,
         pub scripts: RefCell<Vec<String>>,
         pub fail_on_set: std::cell::Cell<bool>,
+        /// Service DNS keys the fake reports as absent (`key_exists` → false), so a
+        /// test can model a service configd tore down (the phantom-restore case).
+        pub absent_keys: RefCell<std::collections::HashSet<String>>,
     }
 
     impl FakeScutil {
@@ -515,6 +519,7 @@ pub(super) mod test_support {
                 service_states: RefCell::new(std::collections::HashMap::new()),
                 scripts: RefCell::new(Vec::new()),
                 fail_on_set: std::cell::Cell::new(false),
+                absent_keys: RefCell::new(std::collections::HashSet::new()),
             }
         }
 
@@ -535,6 +540,12 @@ pub(super) mod test_support {
                 .borrow_mut()
                 .insert(key.to_string(), state);
         }
+
+        /// Mark a service DNS key as gone from the dynamic store, so `key_exists`
+        /// reports it absent (the service departed — configd tore its keys down).
+        pub fn set_key_absent(&self, key: &str) {
+            self.absent_keys.borrow_mut().insert(key.to_string());
+        }
     }
 
     impl ScutilRunner for FakeScutil {
@@ -549,6 +560,9 @@ pub(super) mod test_support {
                 .cloned()
                 .unwrap_or_else(|| self.default_state.clone()))
         }
+        fn key_exists(&self, key: &str) -> Result<bool, PlatformError> {
+            Ok(!self.absent_keys.borrow().contains(key))
+        }
         fn run_script(&self, script: &str) -> Result<(), PlatformError> {
             if self.fail_on_set.get() && script.contains("set ") {
                 return Err(PlatformError::CommandFailed("simulated set failure".into()));
@@ -562,12 +576,26 @@ pub(super) mod test_support {
     #[derive(Default)]
     pub(in super::super) struct MemSnapshots {
         pub slot: RefCell<Option<DemoteSnapshot>>,
+        /// When `Some(n)`, the next `n` saves succeed and every save after that
+        /// fails — so a test can model the post-write `installed_fallback` record
+        /// failing *after* the demote's `set` already took effect (the inverse
+        /// half-state case). `None` = every save succeeds.
+        pub ok_saves: std::cell::Cell<Option<usize>>,
     }
     impl SnapshotStore for MemSnapshots {
         fn load(&self) -> Option<DemoteSnapshot> {
             self.slot.borrow().clone()
         }
         fn save(&self, snapshot: &DemoteSnapshot) -> Result<(), PlatformError> {
+            match self.ok_saves.get() {
+                Some(0) => {
+                    return Err(PlatformError::CommandFailed(
+                        "simulated snapshot save failure".into(),
+                    ))
+                }
+                Some(n) => self.ok_saves.set(Some(n - 1)),
+                None => {}
+            }
             *self.slot.borrow_mut() = Some(snapshot.clone());
             Ok(())
         }
@@ -679,6 +707,11 @@ mod tests {
         );
     }
 
+    /// Round-trip a snapshot through the on-disk (serde JSON) encoding.
+    fn json_round_trip(s: &DemoteSnapshot) -> DemoteSnapshot {
+        serde_json::from_str(&serde_json::to_string(s).unwrap()).unwrap()
+    }
+
     #[test]
     fn snapshot_round_trips_through_disk_format() {
         let s = snap(
@@ -687,13 +720,13 @@ mod tests {
             &["198.51.100.1", "198.51.100.2"],
             &["203.0.113.9", "203.0.113.10"],
         );
-        assert_eq!(DemoteSnapshot::deserialize(&s.serialize()).unwrap(), s);
+        assert_eq!(json_round_trip(&s), s);
     }
 
     #[test]
     fn snapshot_round_trips_with_no_prior_servers_and_no_interface() {
         let s = snap("State:/Network/Service/ABC/DNS", None, &[], &[]);
-        assert_eq!(DemoteSnapshot::deserialize(&s.serialize()).unwrap(), s);
+        assert_eq!(json_round_trip(&s), s);
     }
 
     #[test]
@@ -704,13 +737,19 @@ mod tests {
             &[],
             &["203.0.113.9"],
         );
-        assert_eq!(DemoteSnapshot::deserialize(&s.serialize()).unwrap(), s);
+        assert_eq!(json_round_trip(&s), s);
     }
 
     #[test]
-    fn snapshot_deserialize_rejects_garbage_without_a_key() {
-        assert!(DemoteSnapshot::deserialize("").is_none());
-        assert!(DemoteSnapshot::deserialize("server\t1.2.3.4\n").is_none());
+    fn snapshot_deserialize_rejects_garbage() {
+        // The store's `load` maps any deserialize error to `None` (treated as
+        // "nothing demoted"), never a panic: empty, non-JSON, and JSON missing the
+        // required `service_dns_key` field all fail to parse.
+        assert!(serde_json::from_str::<DemoteSnapshot>("").is_err());
+        assert!(serde_json::from_str::<DemoteSnapshot>("not json at all").is_err());
+        assert!(
+            serde_json::from_str::<DemoteSnapshot>("{\"prior_servers\":[\"192.0.2.1\"]}").is_err()
+        );
     }
 
     // --- demote / restore orchestration --------------------------------------
@@ -719,7 +758,13 @@ mod tests {
     fn demote_snapshots_prior_then_sets_the_fallback_preserving_the_interface() {
         let scutil = FakeScutil::up();
         let snaps = MemSnapshots::default();
-        let did = demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
+        let did = demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
         assert!(did);
         // Prior state captured for the primary service, including its interface.
         assert_eq!(
@@ -747,7 +792,13 @@ mod tests {
     fn redemote_same_service_still_on_our_fallback_keeps_the_snapshot() {
         let scutil = FakeScutil::up();
         let snaps = MemSnapshots::default();
-        demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
+        demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
         let after_first = snaps.load().unwrap();
         // The demote took effect: the service now reports OUR fallback as its DNS.
         scutil.set_service_state(
@@ -759,7 +810,13 @@ mod tests {
         );
         // A second demote (same primary, still our fallback) must keep the ORIGINAL
         // prior, not snapshot our own fallback.
-        demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
+        demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
         assert_eq!(snaps.load().unwrap(), after_first);
         assert_eq!(
             after_first.prior_servers,
@@ -776,7 +833,13 @@ mod tests {
         // the latest service DNS instead of pinning the pre-change one.
         let scutil = FakeScutil::up();
         let snaps = MemSnapshots::default();
-        demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
+        demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
         // DHCP hands the same service a new resolver.
         scutil.set_service_state(
             "State:/Network/Service/ABC/DNS",
@@ -785,7 +848,13 @@ mod tests {
                 servers: vec!["198.51.100.77".to_string()],
             },
         );
-        demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
+        demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
         assert_eq!(
             snaps.load().unwrap(),
             snap(
@@ -806,7 +875,13 @@ mod tests {
         // still write the real DHCP resolver, not our old fallback.
         let scutil = FakeScutil::up();
         let snaps = MemSnapshots::default();
-        demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
+        demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
         // The demote took effect: the service shows our first fallback.
         scutil.set_service_state(
             "State:/Network/Service/ABC/DNS",
@@ -816,7 +891,13 @@ mod tests {
             },
         );
         // fallback_dns changes to a different resolver; re-demote.
-        demote(&scutil, &snaps, &["203.0.113.50".to_string()]).unwrap();
+        demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.50".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
         let after = snaps.load().unwrap();
         assert_eq!(
             after.prior_servers,
@@ -859,7 +940,13 @@ mod tests {
             },
         );
         // Retry the demote with the SAME fallback.
-        demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
+        demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
         let after = snaps.load().unwrap();
         assert_eq!(
             after.prior_servers,
@@ -875,13 +962,242 @@ mod tests {
     }
 
     #[test]
+    fn redemote_default_config_refreshes_when_dhcp_equals_the_new_fallback() {
+        // P1: in the DEFAULT config the fallback IS the physical DHCP resolver, so
+        // a DHCP change makes the new resolver EQUAL the new fallback. The refresh
+        // must still fire — keyed on the PREVIOUSLY recorded installed_fallback, not
+        // on comparing against the fallback we are about to install — or a later
+        // restore pins the stale pre-change resolver. The old `current != fallback`
+        // guard wrongly suppressed exactly this case.
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        // First demote, default config: fallback == the physical DHCP resolver.
+        demote(
+            &scutil,
+            &snaps,
+            &["198.51.100.1".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
+        // DHCP renews: the service now shows a NEW resolver, and in the default
+        // config the detector's demote-target (== the fallback) is that same value.
+        scutil.set_service_state(
+            "State:/Network/Service/ABC/DNS",
+            ServiceDnsState {
+                interface_name: Some("en0".to_string()),
+                servers: vec!["198.51.100.77".to_string()],
+            },
+        );
+        demote(
+            &scutil,
+            &snaps,
+            &["198.51.100.77".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
+        let after = snaps.load().unwrap();
+        assert_eq!(
+            after.prior_servers,
+            vec!["198.51.100.77".to_string()],
+            "the prior must refresh to the new DHCP resolver even when it equals the new fallback"
+        );
+        assert_eq!(after.installed_fallback, vec!["198.51.100.77".to_string()]);
+    }
+
+    #[test]
+    fn redemote_never_captures_the_corp_resolver_as_a_prior() {
+        // P1 edge: a hijacking client rewrites the physical service's
+        // ServerAddresses to its OWN corp DNS between samples. That corp value must
+        // never be captured as the prior — a later restore would then install the
+        // corp resolver as the off-VPN default. The real prior stays untouched.
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
+        // The physical service now (transiently) shows the corp resolver.
+        scutil.set_service_state(
+            "State:/Network/Service/ABC/DNS",
+            ServiceDnsState {
+                interface_name: Some("en0".to_string()),
+                servers: vec!["192.0.2.53".to_string()],
+            },
+        );
+        demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            snaps.load().unwrap().prior_servers,
+            vec!["198.51.100.1".to_string()],
+            "the corp resolver must never be snapshotted as the physical prior"
+        );
+    }
+
+    #[test]
+    fn demote_survives_a_post_write_installed_fallback_save_failure() {
+        // P2: the `set` already demoted the default and the prior snapshot is saved,
+        // but the post-write installed_fallback record fails. The demote must NOT
+        // fail — that would make apply_with roll back only the /etc/resolver scope,
+        // leaving the inverse half-state (default demoted, corp domains unscoped →
+        // they leak via the fallback). It stays applied; only the dedup hint is lost.
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        // The first save (capture_snapshot) succeeds; the second (post-write) fails.
+        snaps.ok_saves.set(Some(1));
+        let did = demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
+        assert!(
+            did,
+            "the demote stays applied despite the bookkeeping save failure"
+        );
+        // The set took effect (the fallback script was issued)...
+        assert!(scutil
+            .scripts
+            .borrow()
+            .iter()
+            .any(|s| s.contains("d.add ServerAddresses * 203.0.113.9")));
+        // ...and the prior snapshot survived (recoverable on a later revert).
+        let after = snaps.load().unwrap();
+        assert_eq!(after.prior_servers, vec!["198.51.100.1".to_string()]);
+        // The installed_fallback hint was not recorded (its save failed) — tolerated
+        // by the same-service refresh branch's `installed_fallback.is_empty()` path.
+        assert!(after.installed_fallback.is_empty());
+    }
+
+    #[test]
+    fn restore_skips_a_departed_service_instead_of_recreating_a_phantom() {
+        // P1: on VPN-down the demoted service has departed (Wi-Fi off → Ethernet in;
+        // configd tore down its keys). Restore must NOT re-create the key — a
+        // get-then-set would leave a phantom the detector reads as an unscoped
+        // default-resolver hijacker → a false "VPN up" at a dead resolver.
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
+        scutil.scripts.borrow_mut().clear();
+        // The demoted service's DNS key is gone.
+        scutil.set_key_absent("State:/Network/Service/ABC/DNS");
+
+        let restored = restore(&scutil, &snaps).unwrap();
+        assert!(
+            restored,
+            "restore reports it handled the snapshot so the caller still flushes"
+        );
+        // No set script re-created the departed key...
+        assert!(
+            scutil
+                .scripts
+                .borrow()
+                .iter()
+                .all(|s| !s.contains("set State:/Network/Service/ABC/DNS")),
+            "a departed service must not be re-created as a phantom"
+        );
+        // ...and the snapshot is cleared.
+        assert!(snaps.load().is_none());
+    }
+
+    #[test]
+    fn demote_on_a_changed_primary_skips_a_departed_old_service() {
+        // P1: the primary switched because the OLD service departed entirely (its
+        // keys are gone). The old service must NOT be restored (no phantom); the new
+        // primary is still snapshotted and demoted.
+        let scutil = FakeScutil::up(); // primary ABC (en0)
+        let snaps = MemSnapshots::default();
+        demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
+        scutil.scripts.borrow_mut().clear();
+        // The old primary ABC departed; the new primary is XYZ (en1) with its own DNS.
+        scutil.set_key_absent("State:/Network/Service/ABC/DNS");
+        scutil.set_primary("XYZ");
+        scutil.set_service_state(
+            "State:/Network/Service/XYZ/DNS",
+            ServiceDnsState {
+                interface_name: Some("en1".to_string()),
+                servers: vec!["198.51.100.50".to_string()],
+            },
+        );
+        demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
+
+        let scripts = scutil.scripts.borrow();
+        // The departed old service is NOT restored (no phantom re-created).
+        assert!(
+            scripts
+                .iter()
+                .all(|s| !s.contains("set State:/Network/Service/ABC/DNS")),
+            "the departed old service must not be re-created"
+        );
+        // The new primary IS demoted to the fallback.
+        assert!(scripts
+            .iter()
+            .any(|s| s.contains("set State:/Network/Service/XYZ/DNS")
+                && s.contains("d.add ServerAddresses * 203.0.113.9")));
+        drop(scripts);
+        assert_eq!(
+            snaps.load().unwrap().service_dns_key,
+            "State:/Network/Service/XYZ/DNS"
+        );
+    }
+
+    #[test]
+    fn scutil_set_error_flags_stdout_failures_but_allows_no_such_key() {
+        // Success is silent → None.
+        assert!(scutil_set_error("").is_none());
+        assert!(scutil_set_error("\n  \n").is_none());
+        // The benign `get` on a missing key → None (the demote/restore scripts
+        // issue `get` by design, and a first-time service key does not exist yet).
+        assert!(scutil_set_error("  No such key\n").is_none());
+        assert!(scutil_set_error("No such key\nNo such key\n").is_none());
+        // A real stdout-reported failure (exit 0) → Some.
+        let err = scutil_set_error("  SCPreferencesCommitChanges: Permission denied\n").unwrap();
+        assert!(err.contains("Permission denied"));
+        // Mixed: only the non-benign line is reported.
+        let err = scutil_set_error("No such key\n  failed to apply\n").unwrap();
+        assert!(err.contains("failed to apply") && !err.contains("No such key"));
+    }
+
+    #[test]
     fn demote_on_a_changed_primary_restores_the_old_then_snapshots_the_new() {
         // P2: the primary service changes while up (e.g. Wi-Fi → Ethernet) with a
         // snapshot already present. The old service must be un-demoted (not left
         // stranded on our fallback), and the NEW service snapshotted + demoted.
         let scutil = FakeScutil::up(); // primary = ABC (en0)
         let snaps = MemSnapshots::default();
-        demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
+        demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
         scutil.scripts.borrow_mut().clear();
 
         // The primary switches to XYZ on en1 with its own DHCP resolver.
@@ -893,7 +1209,13 @@ mod tests {
                 servers: vec!["198.51.100.50".to_string()],
             },
         );
-        demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
+        demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
 
         // The snapshot now tracks the NEW primary with its real prior DNS.
         assert_eq!(
@@ -929,7 +1251,13 @@ mod tests {
         let scutil = FakeScutil::up();
         *scutil.primary.borrow_mut() = None;
         let snaps = MemSnapshots::default();
-        let did = demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
+        let did = demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
         assert!(!did);
         assert!(snaps.load().is_none());
         assert!(scutil.scripts.borrow().is_empty());
@@ -939,7 +1267,7 @@ mod tests {
     fn demote_to_empty_fallback_is_rejected() {
         let scutil = FakeScutil::up();
         let snaps = MemSnapshots::default();
-        assert!(demote(&scutil, &snaps, &[]).is_err());
+        assert!(demote(&scutil, &snaps, &[], &["192.0.2.53".to_string()]).is_err());
         // Nothing captured or issued on rejection.
         assert!(snaps.load().is_none());
         assert!(scutil.scripts.borrow().is_empty());
@@ -949,7 +1277,13 @@ mod tests {
     fn restore_sets_prior_servers_with_the_interface_and_clears_snapshot() {
         let scutil = FakeScutil::up();
         let snaps = MemSnapshots::default();
-        demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
+        demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
         scutil.scripts.borrow_mut().clear();
 
         restore(&scutil, &snaps).unwrap();
@@ -977,7 +1311,13 @@ mod tests {
             },
         );
         let snaps = MemSnapshots::default();
-        demote(&scutil, &snaps, &["203.0.113.9".to_string()]).unwrap();
+        demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        )
+        .unwrap();
         scutil.scripts.borrow_mut().clear();
 
         restore(&scutil, &snaps).unwrap();
@@ -1004,7 +1344,12 @@ mod tests {
         let scutil = FakeScutil::up();
         scutil.fail_on_set();
         let snaps = MemSnapshots::default();
-        let result = demote(&scutil, &snaps, &["203.0.113.9".to_string()]);
+        let result = demote(
+            &scutil,
+            &snaps,
+            &["203.0.113.9".to_string()],
+            &["192.0.2.53".to_string()],
+        );
         assert!(result.is_err());
         // Snapshot persisted so the half-done demote is recoverable on revert.
         assert!(snaps.load().is_some());

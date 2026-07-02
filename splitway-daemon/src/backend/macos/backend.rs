@@ -139,7 +139,10 @@ fn apply_with(
     let journal = apply_to_dir(dir, servers, domains)?;
 
     if let Some(fallback) = fallback {
-        if let Err(e) = demote::demote(scutil, snapshots, fallback) {
+        // `servers` is the corp DNS (what the /etc/resolver scope points at); pass
+        // it so the demote never snapshots the corp resolver as the physical prior
+        // (a hijacker rewriting the physical service between samples — see demote).
+        if let Err(e) = demote::demote(scutil, snapshots, fallback, servers) {
             // Undo exactly this apply's scope changes — overwritten files back to
             // their prior bytes, newly-created and pruned files undone — so a
             // transient demote failure restores the prior scope rather than
@@ -748,7 +751,7 @@ mod tests {
         apply_to_dir(&dir, &servers(), &["a.com".to_string()]).unwrap();
         // A resolver file the user wrote by hand.
         let user_file = dir.join("user.example");
-        fs::write(&user_file, "nameserver 9.9.9.9\n").unwrap();
+        fs::write(&user_file, "nameserver 192.0.2.9\n").unwrap();
 
         let removed = remove_managed(&dir, None, None).unwrap();
         assert_eq!(removed, 1);
@@ -823,13 +826,13 @@ mod tests {
         let dir = temp_dir("apply-refuse-unmanaged");
         // The user already has a hand-written resolver for this domain.
         let user = dir.join("corp.example.com");
-        fs::write(&user, "nameserver 9.9.9.9\n").unwrap();
+        fs::write(&user, "nameserver 192.0.2.9\n").unwrap();
 
         let err = apply_to_dir(&dir, &servers(), &["corp.example.com".to_string()]).unwrap_err();
         assert!(matches!(err, PlatformError::CommandFailed(_)));
         // The user's file is left exactly as it was — not replaced by a managed
         // file that a later revert would delete.
-        assert_eq!(fs::read_to_string(&user).unwrap(), "nameserver 9.9.9.9\n");
+        assert_eq!(fs::read_to_string(&user).unwrap(), "nameserver 192.0.2.9\n");
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -254,8 +254,11 @@ pub(super) fn decide(model: &DnsModel) -> Detected {
     }
 }
 
-/// Order-insensitive equality of two resolver lists (treated as sets).
-fn same_set(a: &[String], b: &[String]) -> bool {
+/// Order-insensitive equality of two resolver lists (treated as sets). Shared
+/// with the demote (`crate::detector::macos_same_set`) so detection dedup and the
+/// demote's "is the service's live DNS still our fallback" check can never drift
+/// apart on what counts as the "same resolver set".
+pub(crate) fn same_set(a: &[String], b: &[String]) -> bool {
     if a.len() != b.len() {
         return false;
     }

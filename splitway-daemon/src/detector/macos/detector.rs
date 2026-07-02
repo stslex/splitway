@@ -174,7 +174,16 @@ fn scutil_list(pattern: &str) -> Result<String, PlatformError> {
 /// Drive `scutil` in script mode by piping `script` (terminated by an implicit
 /// quit on EOF) to its stdin. Centralises the spawn + error mapping so the
 /// individual readers stay one-liners and the whole I/O surface is one function.
-fn scutil_script(script: &str) -> Result<String, PlatformError> {
+///
+/// Shared with the demote backend (`crate::detector::macos_scutil_script`) so the
+/// single `scutil` driver — spawn, stdin pipe, exit-status mapping — has exactly
+/// one implementation; a future change to it (a timeout, non-UTF-8 handling)
+/// lands in one place rather than drifting between two near-identical copies.
+/// Returns the raw stdout; a non-zero exit is mapped to `Err`, but note `scutil`
+/// in script mode also reports some command failures on stdout with exit 0 (a
+/// missing key is `No such key`), so a *set* caller must additionally inspect the
+/// returned stdout (see the demote's `RealScutil::run_script`).
+pub(crate) fn scutil_script(script: &str) -> Result<String, PlatformError> {
     use std::io::Write;
     use std::process::Stdio;
 

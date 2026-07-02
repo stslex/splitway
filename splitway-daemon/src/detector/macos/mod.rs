@@ -14,8 +14,12 @@ mod parser;
 mod state;
 mod watch;
 
-/// Re-export the dynamic-store dump parsers for the macOS DNS backend's demote,
-/// which reads the same `scutil` dump shape (see [`crate::detector`]).
-pub(crate) use parser::{parse_array_field, parse_scalar_field};
+/// Re-export the pieces the macOS DNS backend's demote reuses so the two macOS
+/// modules share one implementation rather than duplicating it: the dynamic-store
+/// dump parsers (the demote reads the same `scutil` dump shape), the `scutil`
+/// script driver, and the order-insensitive resolver-set compare. See
+/// [`crate::detector`].
+pub(crate) use detector::scutil_script;
+pub(crate) use parser::{parse_array_field, parse_scalar_field, same_set};
 
 pub struct MacosDetector;
