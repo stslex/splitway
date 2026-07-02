@@ -122,11 +122,11 @@ mod tests {
             5,
             || {
                 reads.set(reads.get() + 1);
-                Ok(s(&["9.9.9.9"]))
+                Ok(s(&["192.0.2.9"]))
             },
             || pauses.set(pauses.get() + 1),
         );
-        assert_eq!(r, Ok(s(&["9.9.9.9"])));
+        assert_eq!(r, Ok(s(&["192.0.2.9"])));
         assert_eq!(reads.get(), 1, "a first success reads exactly once");
         assert_eq!(pauses.get(), 0, "no pause when the first read succeeds");
     }
@@ -143,12 +143,12 @@ mod tests {
                 if attempt.get() < 3 {
                     Err("scutil hiccup")
                 } else {
-                    Ok(s(&["1.1.1.1"]))
+                    Ok(s(&["192.0.2.1"]))
                 }
             },
             || pauses.set(pauses.get() + 1),
         );
-        assert_eq!(r, Ok(s(&["1.1.1.1"])));
+        assert_eq!(r, Ok(s(&["192.0.2.1"])));
         assert_eq!(attempt.get(), 3);
         assert_eq!(pauses.get(), 2, "paused before each of the two retries");
     }
@@ -177,11 +177,11 @@ mod tests {
             0,
             || {
                 reads.set(reads.get() + 1);
-                Ok(s(&["8.8.8.8"]))
+                Ok(s(&["192.0.2.8"]))
             },
             || panic!("must not pause with a zero budget"),
         );
-        assert_eq!(r, Ok(s(&["8.8.8.8"])));
+        assert_eq!(r, Ok(s(&["192.0.2.8"])));
         assert_eq!(reads.get(), 1);
     }
 

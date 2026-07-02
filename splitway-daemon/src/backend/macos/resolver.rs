@@ -68,15 +68,15 @@ mod tests {
 
     #[test]
     fn is_managed_only_for_our_marker() {
-        assert!(is_managed(&resolver_contents(&["1.1.1.1".to_string()])));
+        assert!(is_managed(&resolver_contents(&["192.0.2.1".to_string()])));
         assert!(is_managed(MANAGED_MARKER));
         // A file the user wrote by hand must not be claimed.
-        assert!(!is_managed("nameserver 1.1.1.1\n"));
-        assert!(!is_managed("# some other tool\nnameserver 1.1.1.1\n"));
+        assert!(!is_managed("nameserver 192.0.2.1\n"));
+        assert!(!is_managed("# some other tool\nnameserver 192.0.2.1\n"));
         assert!(!is_managed(""));
         // The marker must be the *first* line, not buried later.
         assert!(!is_managed(&format!(
-            "nameserver 1.1.1.1\n{MANAGED_MARKER}\n"
+            "nameserver 192.0.2.1\n{MANAGED_MARKER}\n"
         )));
     }
 

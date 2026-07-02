@@ -245,7 +245,7 @@ pub struct LocalConfig {
     /// [`crate::platform::VpnInfo::demote_target`]). `None` (the default, and
     /// always on Linux) means "use the physical primary interface's own DHCP
     /// resolver", which the detector discovers; `Some(servers)` pins a specific
-    /// public resolver (e.g. `["1.1.1.1"]`) for non-corp DNS instead. Ignored on
+    /// public resolver (e.g. `["203.0.113.9"]`) for non-corp DNS instead. Ignored on
     /// platforms that do not demote. `#[serde(default)]` keeps older configs
     /// (without this field) parsing unchanged.
     #[serde(default)]
