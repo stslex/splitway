@@ -4,6 +4,17 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
+/// Re-export the macOS dynamic-store primitives so the macOS DNS backend can
+/// reuse them for the demote (it reads the same `scutil` dump shape to find the
+/// primary service and its current DNS, drives `scutil` the same way, and
+/// compares resolver sets the same way). Kept here, behind the platform gate, so
+/// the two macOS modules share one implementation rather than duplicating it.
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{
+    parse_array_field as macos_parse_array_field, parse_scalar_field as macos_parse_scalar_field,
+    same_set as macos_same_set, scutil_script as macos_scutil_script,
+};
+
 #[cfg(target_os = "windows")]
 mod windows;
 

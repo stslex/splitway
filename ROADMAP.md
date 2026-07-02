@@ -184,7 +184,7 @@ reimplemented per frontend:
 - **7a — `splitway-gui-core`** (done): extract the framework-agnostic GUI logic
   (the pure view-model **and** the truth-contract orchestration) into a crate
   depending on `splitway-shared` only, so both egui and the future Tauri backend
-  drive one `GuiCore`. See [`docs/design/gui-core-extraction.md`](design/gui-core-extraction.md).
+  drive one `GuiCore`. See [`docs/design/gui-core-extraction.md`](docs/design/gui-core-extraction.md).
 - **7b — Tauri shell + read-only view** (done): the `splitway-gui-tauri` backend
   hosts `GuiCore` and pushes the full view-model to a vanilla-TS frontend that
   renders it read-only (no mutations — those are 7c). gui-core gained `Verify`
@@ -209,7 +209,7 @@ reimplemented per frontend:
   store. Frozen-on-malformed mutations are rejected with an on-disk-fix message
   and the frozen state is shown prominently. No protocol change (the verbs already
   exist at v6); egui stays a read/write reference, untouched. See
-  [`docs/design/tauri-mutations.md`](design/tauri-mutations.md).
+  [`docs/design/tauri-mutations.md`](docs/design/tauri-mutations.md).
 - **7d — visual design + window behavior** (done): the approved Variant B design as
   the real Tauri UI — full-window layout, the simplified interface-centric model
   (interface + domains; DNS auto-derived and shown read-only; no vpn-name/backend
@@ -220,7 +220,7 @@ reimplemented per frontend:
   authorized additive protocol bump (v6 → **v7**): `StatusInfo.detected_dns` exposes
   the selected interface's detected DNS independent of apply state, so the DNS
   readout is honest in the empty/disabled states too. See
-  [`docs/design/tauri-design-window.md`](design/tauri-design-window.md). (Manual-DNS
+  [`docs/design/tauri-design-window.md`](docs/design/tauri-design-window.md). (Manual-DNS
   override — for VPNs that connect but push no DNS — is deferred as a real future
   daemon feature, not built here.)
 - **7d-2 — bundling**: Nix packaging (two-stage frontend + Rust, `wrapGAppsHook3`,
@@ -229,6 +229,42 @@ reimplemented per frontend:
   `packages.<system>.splitway-gui`, bundling the IBM Plex OFL `woff2`, and the
   README GUI-install section. Split from 7d because its real proof — the *built*
   binary rendering for a fresh in-group niri user — is machine-bound.
+- **7d-3 — macOS self-install**: the macOS counterpart of 7d-2's Linux bundling.
+  An ad-hoc/unsigned `Splitway.app` (`.app` only — no signing, notarization,
+  `.dmg`/`.pkg`, or `SMAppService`) that bundles the `splitway-daemon` + `splitway`
+  helpers, a GUI LaunchDaemon plist (carrying `--socket-group splitway`), and a
+  `bootstrap.sh`. Two health-keyed Tauri commands escalate via `osascript … with
+  administrator privileges` (one native password prompt) to install/start
+  (`NotRunning` → Install button) and disable (footer link) the root daemon — no
+  terminal. The bundle path is additive (the Tauri bundler is invoked only by the
+  build wrapper; `cargo build` / `nix build` never read `bundle`), and the commands
+  keep the truth contract (do the work → refresh-now → never touch the VM). Split
+  from 7d-2 because its real proof — the built `.app` driving the live install on
+  macOS — is machine-bound. See
+  [`docs/design/macos-self-install.md`](docs/design/macos-self-install.md). (Homebrew —
+  installing the same `.app` + binaries, with no competing `service` block — is the
+  next phase.)
+- **7d-4 — macOS DNS privacy (demote + scope)**: the macOS backend reaches DNS
+  parity with Linux. The previous backend only *scoped* the corp domains via
+  `/etc/resolver`; that is insufficient against a VPN client that hijacks the
+  system **default** resolver (the corp resolver is the global default, scoped to
+  no `utun`, so non-corp DNS would also traverse the tunnel). This phase adds the
+  **demote**: snapshot the primary network service's DNS, overwrite it with an
+  off-tunnel fallback (the physical interface's own DHCP resolver, or a
+  configured `fallback_dns` override), and restore it on every revert path —
+  transactional and reversible (an on-disk snapshot survives an unclean exit).
+  Detection is rewritten to be **structural and vendor-neutral**: it reads the
+  per-service DNS model (a service whose resolver differs from the physical
+  link's is the VPN) rather than filtering `scutil --dns` by a `utun` — and reads
+  the VPN signal from the VPN's *own* service, not the global default Splitway
+  mutates, so the demote does not cause detection to oscillate. The state machine
+  is decoupled from `vpn_name` on macOS (gated via `reverts_globally()`); Linux
+  stays interface-keyed and unchanged. DNS only — no IP-route manipulation (the
+  client already splits IP; same boundary as Linux). The GUI interface-picker
+  becomes a benign no-op on macOS (removal is a later GUI phase). Implementation +
+  synthetic-fixture tests land here; the live packet-level / reconnect / revert
+  acceptance is machine-bound and verified separately. See
+  [`docs/design/macos-dns-privacy.md`](docs/design/macos-dns-privacy.md).
 
 ### Phase 8 — feature freeze + hardening
 

@@ -1,0 +1,306 @@
+#!/bin/bash
+#
+# bootstrap.sh — the privileged install/disable steps for the Splitway macOS
+# self-installer, run as ROOT via osascript's `do shell script ... with
+# administrator privileges` (one native password prompt). It is bundled inside
+# Splitway.app (Contents/Resources) alongside the helper binaries and the
+# LaunchDaemon plist; the Tauri `install_service` / `disable_service` commands
+# invoke it as `/bin/bash <this> install` / `<this> disable`.
+#
+# SECURITY: this script is the privileged surface of an UNSIGNED app, so it is
+# deliberately inert — it takes exactly one fixed subcommand (install|disable)
+# and NO data derived from the GUI or any user input. The console user it adds to
+# the group is read from the live system (`stat -f %Su /dev/console`), not passed
+# in. Every step is idempotent and a failure aborts before the next, so a partial
+# run never leaves the system half-configured (mirrors the daemon's own
+# apply-or-rollback contract). See docs/design/macos-self-install.md.
+
+set -euo pipefail
+
+# Pin PATH to the system locations so every privileged tool we invoke (stat,
+# install, dseditgroup, launchctl, xattr, …) resolves to a trusted system binary,
+# never to something on the caller's inherited PATH. A root script must not trust
+# the environment it was launched from.
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+# Resolve our own directory (the bundle's Contents/Resources) so the binaries and
+# plist that travel beside us are found regardless of where the .app lives
+# (/Applications, ~/Applications, a mounted volume, …). No hardcoded app path.
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+readonly LABEL="com.splitway.daemon"
+readonly PLIST_DST="/Library/LaunchDaemons/${LABEL}.plist"
+readonly BIN_DIR="/usr/local/bin"
+readonly GROUP="splitway"
+
+log() { printf 'splitway-bootstrap: %s\n' "$*"; }
+die() { printf 'splitway-bootstrap: error: %s\n' "$*" >&2; exit 1; }
+
+# True if $1 carries a macOS ACL that could let a NON-root principal modify it
+# (write/delete/rename/replace the entry or its children). macOS ACLs are NOT
+# reflected in the POSIX mode bits and are NOT cleared by a `chmod` mode change,
+# so a root:wheel 0755 directory can still be attacker-writable through an ACL —
+# which would let a non-root user swap the directory that holds the root-run
+# daemon. Parse `ls -lde`: each numbered ACL entry is
+# `<n>: <principal> <allow|deny> <perms>`; flag any `allow` entry for a principal
+# other than root/wheel whose comma-separated perms include a write-class right.
+# Fails closed (any such entry → refuse), matching this script's verify-or-abort
+# discipline for the destination of a root-run binary.
+acl_allows_nonroot_write() {
+    local line principal perms
+    while IFS= read -r line; do
+        # Trim leading whitespace, then keep only ACL entry lines.
+        line="${line#"${line%%[![:space:]]*}"}"
+        case "$line" in
+            [0-9]*:\ *) : ;;
+            *) continue ;;
+        esac
+        line="${line#*: }"        # strip the "<n>: " index
+        # Split on the " allow " action keyword rather than a positional field:
+        # an ACL principal (record/full name) can contain spaces, so field-2
+        # parsing would let `user:First Last allow write` slip through. `deny` and
+        # malformed lines have no " allow " and are skipped (not a grant). Perms are
+        # a single comma-list with no spaces, so " allow " appears exactly once.
+        case " $line " in
+            *" allow "*) : ;;
+            *) continue ;;
+        esac
+        principal="${line%% allow *}"
+        perms="${line##* allow }"
+        case "$principal" in
+            user:root | group:wheel) continue ;;
+        esac
+        case ",$perms," in
+            *,write,* | *,delete,* | *,append,* | *,add_file,* | *,add_subdirectory,* | \
+                *,delete_child,* | *,writeattr,* | *,writeextattr,* | *,writesecurity,* | *,chown,*)
+                return 0
+                ;;
+        esac
+    done < <(ls -lde "$1" 2>/dev/null)
+    return 1
+}
+
+# Walk every ancestor of $1 up to / and refuse unless each is root-owned, not
+# writable by group or other, AND free of an ACL granting a non-root principal
+# write. Renaming or replacing a directory entry needs write access to its
+# PARENT, not to the entry itself — so pinning $BIN_DIR to root:wheel is not
+# enough: a single non-root-writable ancestor (e.g. /usr/local left admin-owned
+# by the Homebrew-on-Intel layout, or one carrying a stray ACL) still lets a
+# non-root user swap the directory out and have launchd exec their binary as
+# root. We verify (never chown/chmod) the parents: touching /usr/local would
+# break a real Homebrew, so an unsafe chain is a hard refusal with an actionable
+# message instead.
+assert_root_only_path() {
+    local dir="$1" owner perm
+    while :; do
+        owner="$(stat -f '%Su' "$dir" 2>/dev/null || true)"
+        perm="$(stat -f '%Lp' "$dir" 2>/dev/null || true)"
+        [ "$owner" = "root" ] || die "${dir} is owned by '${owner:-unknown}', not root; refusing — a non-root owner of an ancestor of ${BIN_DIR} could substitute the root-run daemon binary"
+        # 8#22 = group-write|other-write, base-8 on both operands so the mask is
+        # unambiguous regardless of leading-zero/octal shell quirks.
+        if [ -z "$perm" ] || [ "$(( 8#$perm & 8#22 ))" -ne 0 ]; then
+            die "${dir} (mode ${perm:-unknown}) is writable by group or other; refusing — a writable ancestor of ${BIN_DIR} lets a non-root user substitute the root-run daemon binary"
+        fi
+        if acl_allows_nonroot_write "$dir"; then
+            die "${dir} carries a macOS ACL granting write/delete to a non-root principal; refusing — an ACL-writable ancestor of ${BIN_DIR} lets a non-root user substitute the root-run daemon binary (ACLs are invisible to the mode bits and survive chmod)"
+        fi
+        [ "$dir" = "/" ] && break
+        dir="$(dirname "$dir")"
+    done
+}
+
+# --- install ---------------------------------------------------------------
+
+install_binaries() {
+    # The daemon is exec'd as ROOT by launchd, so its directory MUST be writable
+    # only by root — otherwise a non-root admin (e.g. the Homebrew-on-Intel layout
+    # where /usr/local/bin is admin-owned) could swap the binary and have launchd
+    # run it as root at the next boot (a persistent local privilege escalation).
+    # Create the dir if absent, then pin it to root:wheel 0755 and refuse to
+    # proceed if it cannot be made root-owned. BSD `install` has no -D, so the dir
+    # is handled here.
+    mkdir -p "$BIN_DIR"
+    # Verify the parent chain BEFORE touching ownership, so an unsafe layout (e.g.
+    # Homebrew-on-Intel's admin-owned /usr/local) is a clean refusal that has not
+    # already re-chowned a pre-existing $BIN_DIR out from under the user. A
+    # non-root-writable ancestor can rename/replace $BIN_DIR itself, so pinning it
+    # to root:wheel below is only sound once every parent is root-only.
+    assert_root_only_path "$(dirname "$BIN_DIR")"
+    # ...then resolve symlinks before trusting that result: the check above is
+    # lexical, so a symlinked $BIN_DIR (e.g. /usr/local/bin -> /Users/alice/bin)
+    # would pass it while the REAL target lives in a user-writable tree — letting
+    # that user rename/replace the target and have launchd run it as root. The
+    # lexical parent being root-only (verified above) means a non-root user cannot
+    # swap the symlink itself; this closes the other half by verifying the physical
+    # target's ancestor chain too. On a normal (non-symlink) layout it resolves to
+    # the same path, so the extra check is a no-op.
+    local real_bin
+    real_bin="$(cd "$BIN_DIR" && pwd -P)" || die "cannot resolve the real path of ${BIN_DIR}"
+    [ "$real_bin" = "$BIN_DIR" ] || assert_root_only_path "$(dirname "$real_bin")"
+    chown root:wheel "$BIN_DIR" || die "cannot make ${BIN_DIR} root-owned; refusing to install a root-run binary into a non-root-writable directory"
+    chmod 755 "$BIN_DIR"
+    # A macOS ACL survives the chmod above and is invisible to the mode-bit check,
+    # so an ACL granting another user write/delete on $BIN_DIR would still let them
+    # swap the root-run binary. We own $BIN_DIR, so strip any ACL outright (like the
+    # chown), then confirm none granting non-root write remains.
+    chmod -N "$BIN_DIR" 2>/dev/null || true
+    if acl_allows_nonroot_write "$BIN_DIR"; then
+        die "${BIN_DIR} still carries a macOS ACL granting non-root write after chmod -N; refusing to install a root-run binary there"
+    fi
+    local owner
+    owner="$(stat -f '%Su:%Sg' "$BIN_DIR")"
+    [ "$owner" = "root:wheel" ] || die "${BIN_DIR} is ${owner}, not root:wheel; refusing to install a root-run binary there"
+
+    # SECURITY (trust boundary): the source binaries below are trusted BY
+    # ASSUMPTION, not verified here, and that is deliberate. No in-bundle integrity
+    # check (a compiled-in hash, an in-script source-permission or source-ownership
+    # check) is attempted, because:
+    #  1. CO-LOCATION: this script lives in Contents/Resources beside the very
+    #     binaries it copies (and beside the GUI binary in Contents/MacOS) and is
+    #     run AS ROOT by osascript. The same write access that could swap
+    #     splitway-daemon could edit the check out of THIS script, or replace the
+    #     whole script with a root payload, before any check runs — so a verifier
+    #     that cannot sit outside the writable bundle protects nothing against the
+    #     only attacker who can trigger the bug.
+    #  2. A root-owned-source check would also reject every supported location: a
+    #     drag-installed .app is owned by the installing user, not root, in
+    #     /Applications and ~/Applications alike.
+    # The DESTINATION is what root CAN soundly verify and IS hardened above
+    # (BIN_DIR pinned + re-checked, assert_root_only_path on every ancestor). The
+    # sound source-side fix is an OS-enforced root of trust (Developer-ID signing +
+    # notarization + SMAppService), out of scope. See docs/design/macos-self-install.md
+    # ("Trust boundary of the unsigned self-installer").
+    local name src dst
+    for name in splitway-daemon splitway; do
+        src="${SELF_DIR}/${name}"
+        dst="${BIN_DIR}/${name}"
+        [ -f "$src" ] || die "bundled binary not found: ${src}"
+        # root:wheel 0755 — matches the plist install and the now-hardened dir.
+        install -o root -g wheel -m 755 "$src" "$dst"
+        # A quarantined binary loads but then fails silently under launchd, so
+        # strip the flag on the installed copy (ignore "attribute not found").
+        xattr -d com.apple.quarantine "$dst" 2>/dev/null || true
+        log "installed ${dst}"
+    done
+}
+
+console_user() {
+    # The GUI user to grant socket access. The script runs as root, so $USER is
+    # `root` and $SUDO_USER is unset under osascript escalation — read the user
+    # at the console instead. Empty / `root` / `loginwindow` means no GUI session.
+    stat -f '%Su' /dev/console 2>/dev/null || true
+}
+
+ensure_group() {
+    if dseditgroup -o read "$GROUP" >/dev/null 2>&1; then
+        log "group ${GROUP} already exists"
+    else
+        dseditgroup -o create "$GROUP"
+        log "created group ${GROUP}"
+    fi
+}
+
+add_user_to_group() {
+    local user="$1"
+    if dseditgroup -o checkmember -m "$user" "$GROUP" >/dev/null 2>&1; then
+        log "${user} is already a member of ${GROUP}"
+    else
+        dseditgroup -o edit -a "$user" -t user "$GROUP"
+        log "added ${user} to ${GROUP}"
+    fi
+}
+
+install_plist() {
+    local src="${SELF_DIR}/${LABEL}.plist"
+    [ -f "$src" ] || die "bundled plist not found: ${src}"
+    # launchd refuses a plist not owned by root or that is group-writable.
+    install -m 644 -o root -g wheel "$src" "$PLIST_DST"
+    log "installed ${PLIST_DST}"
+}
+
+# Wait until the service record is gone from the system domain (up to ~3s).
+# `launchctl bootout` returns before launchd has finished reaping the old job and
+# removing its record, and `KeepAlive=true` widens that window — so an immediate
+# `bootstrap` of the same label can fail with "Operation already in progress (37)"
+# or "Input/output error (5)". Polling `launchctl print` to not-found closes the
+# race before we re-bootstrap.
+wait_for_service_gone() {
+    for _ in $(seq 1 30); do
+        launchctl print "system/${LABEL}" >/dev/null 2>&1 || return 0
+        sleep 0.1
+    done
+    # Fall through even if still present; the retry loop below absorbs the residue.
+    return 0
+}
+
+bootstrap_daemon() {
+    # Modern (not legacy `load -w`) idempotent sequence: tear down any prior
+    # instance, then bring it up. bootout of an unloaded service errors, so it is
+    # tolerated; after it we settle (the record may linger briefly) before
+    # re-bootstrapping.
+    launchctl bootout "system/${LABEL}" 2>/dev/null || true
+    wait_for_service_gone
+    # Clear any stale `launchctl disable` flag BEFORE bootstrap — a disabled label
+    # makes bootstrap refuse to load. `enable` on a never-seen/already-enabled
+    # label is a harmless no-op.
+    launchctl enable "system/${LABEL}" 2>/dev/null || true
+    # Retry bootstrap a few times: even after the settle poll, launchd can still
+    # report the transient "already in progress"/I/O races right after a teardown.
+    # The final failure stays fatal (no `|| true`) so a genuine error is not masked.
+    for _ in $(seq 1 10); do
+        if launchctl bootstrap system "$PLIST_DST" 2>/dev/null; then
+            log "bootstrapped ${LABEL}"
+            return 0
+        fi
+        sleep 0.3
+    done
+    # Last attempt without suppression, so its real error message surfaces on die.
+    launchctl bootstrap system "$PLIST_DST" || die "launchctl bootstrap failed for ${LABEL}"
+    log "bootstrapped ${LABEL}"
+}
+
+do_install() {
+    log "installing the Splitway service"
+    install_binaries
+    ensure_group
+
+    local user
+    user="$(console_user)"
+    if [ -z "$user" ] || [ "$user" = "root" ] || [ "$user" = "loginwindow" ]; then
+        # No interactive desktop user to grant access to. Still install + start
+        # the daemon (root can drive it via sudo); the GUI run by a real user
+        # later will surface a clear "add me to the group" state.
+        log "no console user detected; skipping group membership (run from a desktop session to grant GUI access)"
+    else
+        add_user_to_group "$user"
+    fi
+
+    install_plist
+    bootstrap_daemon
+    # The daemon self-creates /var/root/.config/splitway/config.json on first
+    # run, so nothing is seeded here.
+    log "install complete"
+}
+
+# --- disable ---------------------------------------------------------------
+
+do_disable() {
+    log "disabling the Splitway service"
+    # bootout sends SIGTERM, which the daemon traps to revert /etc/resolver
+    # before exiting — the system is left clean. Tolerate an already-stopped
+    # service.
+    launchctl bootout "system/${LABEL}" 2>/dev/null || true
+    # Remove the plist so it does not relaunch at boot. Conservative scope: the
+    # binaries, the group, group membership, and the config are left in place so
+    # a later re-install needs no re-prompt (full uninstall is a separate step).
+    rm -f "$PLIST_DST"
+    log "disable complete"
+}
+
+# --- entry -----------------------------------------------------------------
+
+case "${1:-}" in
+    install) do_install ;;
+    disable) do_disable ;;
+    *) die "usage: bootstrap.sh <install|disable>" ;;
+esac

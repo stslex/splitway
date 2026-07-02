@@ -232,6 +232,9 @@ impl VpnDetector for LinuxDetector {
         Ok(VpnInfo {
             interface_name: interface.to_string(),
             dns_servers,
+            // Linux scopes DNS per link (systemd-resolved); the system default
+            // is never hijacked, so no off-tunnel demote is needed.
+            demote_target: None,
         })
     }
 

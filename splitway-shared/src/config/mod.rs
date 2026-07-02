@@ -50,6 +50,7 @@ pub fn create_empty_config_at(path: &Path) -> Result<(), ConfigParseError> {
         enabled: default_enabled(),
         vpn_backend: VpnBackend::default(),
         openvpn: OpenVpnConfig::default(),
+        fallback_dns: None,
     };
     save_config_to(path, &empty_config)
 }
@@ -145,6 +146,17 @@ pub fn config_file_path() -> PathBuf {
     config_folder_path().join("config.json")
 }
 
+/// Whether `s` is a bare IPv4/IPv6 address literal — not a hostname, not empty,
+/// and with no surrounding or embedded whitespace. Used to validate resolver
+/// addresses before they reach a platform DNS command that interpolates them
+/// verbatim (e.g. the macOS `scutil` demote script: a non-IP value would malform
+/// the script rather than fail cleanly). `IpAddr` parsing is strict — it rejects
+/// trailing/leading spaces and embedded newlines — so this doubles as an
+/// injection guard. Pure; unit-tested without a live system.
+pub fn is_ip_literal(s: &str) -> bool {
+    s.parse::<std::net::IpAddr>().is_ok()
+}
+
 fn config_folder_path() -> PathBuf {
     // Resolve without panicking — this runs inside a long-lived daemon that
     // may be a systemd service where HOME is not guaranteed. Prefer
@@ -228,6 +240,16 @@ pub struct LocalConfig {
     /// pre-3c configs parsing; ignored unless `vpn_backend = openvpn`.
     #[serde(default)]
     pub openvpn: OpenVpnConfig,
+    /// Optional override for the off-tunnel fallback resolver used on platforms
+    /// that demote a hijacked system default (macOS — see
+    /// [`crate::platform::VpnInfo::demote_target`]). `None` (the default, and
+    /// always on Linux) means "use the physical primary interface's own DHCP
+    /// resolver", which the detector discovers; `Some(servers)` pins a specific
+    /// public resolver (e.g. `["203.0.113.9"]`) for non-corp DNS instead. Ignored on
+    /// platforms that do not demote. `#[serde(default)]` keeps older configs
+    /// (without this field) parsing unchanged.
+    #[serde(default)]
+    pub fallback_dns: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -302,6 +324,8 @@ mod tests {
                 management: "127.0.0.1:7505".to_string(),
                 management_password_file: Some("/etc/splitway/mgmt.pass".to_string()),
             },
+            // A non-default value so the round-trip exercises the new field.
+            fallback_dns: Some(vec!["192.0.2.1".to_string()]),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -374,6 +398,21 @@ mod tests {
     }
 
     #[test]
+    fn is_ip_literal_accepts_addresses_and_rejects_everything_else() {
+        assert!(is_ip_literal("192.0.2.1"));
+        assert!(is_ip_literal("2001:db8::1"));
+        // Rejected: a hostname, an empty element, and — critically for the
+        // unescaped `scutil` script — embedded whitespace or a newline.
+        assert!(!is_ip_literal("example.com"));
+        assert!(!is_ip_literal(""));
+        assert!(!is_ip_literal("192.0.2.1 q"));
+        assert!(!is_ip_literal(" 192.0.2.1"));
+        assert!(!is_ip_literal(
+            "192.0.2.1\nset State:/Network/Service/x/DNS"
+        ));
+    }
+
+    #[test]
     fn save_config_to_round_trips() {
         let path = temp_config("save-round-trip");
         let config = LocalConfig {
@@ -382,6 +421,7 @@ mod tests {
             enabled: true,
             vpn_backend: VpnBackend::default(),
             openvpn: OpenVpnConfig::default(),
+            fallback_dns: None,
         };
         save_config_to(&path, &config).unwrap();
         let loaded = load_config_from(&path).unwrap();

@@ -20,6 +20,8 @@ impl VpnDetector for OpenVpnDetector {
         Ok(VpnInfo {
             interface_name: interface.to_string(),
             dns_servers,
+            // Linux scopes DNS per link; the default is not hijacked.
+            demote_target: None,
         })
     }
 

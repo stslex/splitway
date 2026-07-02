@@ -35,6 +35,15 @@
 //! view-models, so no mutation can write displayed state (the truth contract).
 //! `check_domain` is a one-shot route-check returning its own result; it is never
 //! folded into the VM. See [`docs/design/tauri-mutations.md`](../../docs/design/tauri-mutations.md).
+//!
+//! On macOS the shell also owns the **privileged service bootstrap**
+//! (`install_service` / `disable_service`): it escalates via `osascript ... with
+//! administrator privileges` to run the bundled `bootstrap.sh` as root — one
+//! native password prompt, no terminal. These keep the write-path shape exactly
+//! (do the work → fire refresh-now → never touch the VM); the real health then
+//! flows back through `view-model-changed`. `host_platform` lets the frontend
+//! branch the macOS-vs-Linux remediation copy. See
+//! [`docs/design/macos-self-install.md`](../../docs/design/macos-self-install.md).
 
 pub mod bridge;
 
@@ -71,6 +80,13 @@ pub fn run() {
             bridge::set_config,
             bridge::reload,
             bridge::check_domain,
+            // macOS self-install: escalate via osascript to install/disable the
+            // root LaunchDaemon; host_platform lets the frontend branch the
+            // remediation copy. Custom commands are not ACL-gated, so the
+            // capability file is unchanged.
+            bridge::install_service,
+            bridge::disable_service,
+            bridge::host_platform,
         ])
         .setup(move |app| {
             // Clone the Arc to the shared VM and an AppHandle into the poll

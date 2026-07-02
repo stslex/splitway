@@ -5,6 +5,7 @@
 //! actual filesystem work lives in [`backend`].
 
 mod backend;
+mod demote;
 mod resolver;
 
 pub struct MacosBackend;

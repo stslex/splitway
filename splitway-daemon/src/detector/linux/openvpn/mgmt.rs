@@ -401,6 +401,8 @@ async fn handle_line(
             VpnEvent::Up(VpnInfo {
                 interface_name: interface.to_string(),
                 dns_servers: last_dns.clone(),
+                // Linux scopes DNS per link; the default is not hijacked.
+                demote_target: None,
             })
         }
         Transition::Down => {

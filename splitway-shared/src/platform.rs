@@ -24,6 +24,21 @@ pub enum PlatformError {
 pub struct VpnInfo {
     pub interface_name: String,
     pub dns_servers: Vec<String>,
+    /// The resolver to fall back to for *non*-routed (off-tunnel) DNS when the
+    /// VPN client has hijacked the system **default** resolver rather than
+    /// scoping its DNS to the tunnel interface (observed on macOS: the corp
+    /// resolver is registered as the global default, so every query — not just
+    /// corp ones — would otherwise traverse the tunnel).
+    ///
+    /// `Some(servers)` means the backend must, in addition to scoping the corp
+    /// domains, **demote** the system default to these servers so non-corp DNS
+    /// resolves off-tunnel. Typically the physical primary interface's own DHCP
+    /// resolver, surfaced by the detector that found the default was overridden.
+    ///
+    /// `None` (the Linux case, and macOS when no default override is detected)
+    /// means scope-only: the platform already keeps the default off-tunnel, so
+    /// no demote is needed. Additive — backends that ignore it are unaffected.
+    pub demote_target: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]

@@ -59,7 +59,7 @@ function frozen(configPath: string): ViewModel {
 }
 
 test("frozen blocker points at the daemon's actual config path", () => {
-  const stage = stageFor(frozen("/home/user/.config/splitway/config.json"));
+  const stage = stageFor(frozen("/home/user/.config/splitway/config.json"), "linux");
   assert.equal(stage.kind, "blocker");
   if (stage.kind !== "blocker") return;
   assert.equal(stage.blocker.variant, "frozen");
@@ -67,7 +67,7 @@ test("frozen blocker points at the daemon's actual config path", () => {
 });
 
 test("frozen blocker falls back to the default path when unknown", () => {
-  const stage = stageFor(frozen(""));
+  const stage = stageFor(frozen(""), "linux");
   assert.equal(stage.kind === "blocker" && stage.blocker.command, "/var/lib/splitway/config.json");
 });
 
@@ -79,12 +79,59 @@ test("connection health maps to the right blocker / main", () => {
     ["TransientError", "error"],
   ];
   for (const [health, variant] of cases) {
-    const stage = stageFor(withHealth(health));
+    const stage = stageFor(withHealth(health), "linux");
     assert.equal(stage.kind, "blocker", `${health} should be a blocker`);
     if (stage.kind === "blocker") assert.equal(stage.blocker.variant, variant);
   }
-  assert.equal(stageFor(withHealth("Connected")).kind, "main");
-  assert.equal(stageFor(withHealth("Unknown")).kind, "connecting");
+  assert.equal(stageFor(withHealth("Connected"), "linux").kind, "main");
+  assert.equal(stageFor(withHealth("Unknown"), "linux").kind, "connecting");
+});
+
+test("macOS NotRunning offers the install action, not a systemctl command", () => {
+  const stage = stageFor(withHealth("NotRunning"), "macos");
+  assert.equal(stage.kind, "blocker");
+  if (stage.kind !== "blocker") return;
+  assert.equal(stage.blocker.variant, "disconnected");
+  // The one-click install button, no terminal command.
+  assert.equal(stage.blocker.action?.key, "install");
+  assert.equal(stage.blocker.command, undefined);
+});
+
+test("Linux NotRunning keeps the systemctl command, no install action", () => {
+  const stage = stageFor(withHealth("NotRunning"), "linux");
+  if (stage.kind !== "blocker") return assert.fail("expected a blocker");
+  assert.equal(stage.blocker.command, "systemctl status splitway");
+  assert.equal(stage.blocker.action, undefined);
+});
+
+test("macOS PermissionDenied gives sign-out guidance plus an install/repair action, not usermod", () => {
+  const stage = stageFor(withHealth("PermissionDenied"), "macos");
+  if (stage.kind !== "blocker") return assert.fail("expected a blocker");
+  assert.equal(stage.blocker.variant, "no-permission");
+  // No usermod (wrong OS); keep the sign-out guidance for the GUI-install path.
+  assert.equal(stage.blocker.command, undefined);
+  assert.match(stage.blocker.body, /sign out/i);
+  // ...and offer the idempotent install/repair action for the manual/sudo-daemon
+  // path (root-only socket), where signing out alone cannot grant GUI access.
+  assert.equal(stage.blocker.action?.key, "install");
+});
+
+test("Linux PermissionDenied keeps the usermod command", () => {
+  const stage = stageFor(withHealth("PermissionDenied"), "linux");
+  if (stage.kind !== "blocker") return assert.fail("expected a blocker");
+  assert.equal(stage.blocker.command, "sudo usermod -aG splitway $USER");
+});
+
+test("TransientError omits the systemctl command on macOS, keeps it on Linux", () => {
+  const mac = stageFor(withHealth("TransientError"), "macos");
+  if (mac.kind !== "blocker") return assert.fail("expected a blocker");
+  assert.equal(mac.blocker.variant, "error");
+  assert.equal(mac.blocker.command, undefined);
+  assert.equal(mac.blocker.action, undefined);
+
+  const linux = stageFor(withHealth("TransientError"), "linux");
+  if (linux.kind !== "blocker") return assert.fail("expected a blocker");
+  assert.equal(linux.blocker.command, "systemctl status splitway");
 });
 
 console.log(`stage: ${passed} passed`);

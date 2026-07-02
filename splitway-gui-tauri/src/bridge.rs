@@ -39,7 +39,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use splitway_shared::config::VpnBackend;
 use splitway_shared::ipc::client::{self, ClientError};
@@ -249,6 +249,153 @@ pub async fn check_domain(domain: String) -> CheckOutcome {
             message: format!("internal error: check task failed: {e}"),
         },
     }
+}
+
+// --- privileged service management (macOS self-install) --------------------
+//
+// The macOS GUI installs/disables the root LaunchDaemon itself, so a user never
+// has to touch the terminal. These commands escalate via osascript's `do shell
+// script ... with administrator privileges` (one native password prompt) to run
+// the bundled `bootstrap.sh` as root. Like every other command here they honour
+// the truth contract: they do the privileged work, fire refresh-now so the poll
+// thread re-polls, and return a `Result<(), String>` — they NEVER touch the VM.
+// The real health (`NotRunning` → `PermissionDenied`/`Connected`) flows back only
+// through the next `view-model-changed`. See docs/design/macos-self-install.md.
+
+/// The platform the GUI is running on, for the frontend to branch remediation
+/// copy + affordances (the install/disable flow is macOS-only). A plain custom
+/// command (not ACL-gated) so no `os:` plugin permission is needed.
+#[tauri::command]
+pub fn host_platform() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "other"
+    }
+}
+
+/// Build the AppleScript that runs the bundled bootstrap as root. Pure and
+/// platform-independent so the quoting/escaping is unit-testable without running
+/// osascript.
+///
+/// The escalated shell command is `/bin/bash <script> <subcommand>`, where the
+/// ONLY variable is `script_path` — a bundle-derived absolute path, never GUI
+/// input. It is injected as an AppleScript string variable (with `"`/`\` escaped
+/// for the AppleScript literal) and handed to the shell via `quoted form of`, so
+/// a path containing spaces (`/Applications/My Apps/Splitway.app/…`) stays a
+/// single shell token. `subcommand` is a fixed literal chosen by which command
+/// ran (`install`/`disable`), so the command text is inert by construction.
+fn build_admin_applescript(script_path: &str, subcommand: &str) -> String {
+    // Escape backslash first, then the double-quote, for the AppleScript string
+    // literal. A real bundle path contains neither, but escape defensively so the
+    // injected value can never break out of the literal.
+    let escaped = script_path.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        "set scriptPath to \"{escaped}\"\n\
+         do shell script \"/bin/bash \" & quoted form of scriptPath & \" {subcommand}\" \
+         with administrator privileges"
+    )
+}
+
+/// Resolve the bundled `bootstrap.sh`, escalate via osascript, and run it with
+/// the given fixed subcommand. macOS-only; on other platforms it is an error
+/// (the command is still registered so the frontend surface is uniform).
+///
+/// Returns `Ok(())` on a clean exit; a user-cancelled password dialog and a
+/// non-zero bootstrap exit both map to a human-readable `Err`.
+fn run_privileged(app: &AppHandle, subcommand: &str) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Err("the in-app service installer is macOS-only".to_string());
+    }
+
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("could not locate the app resources: {e}"))?;
+    let script = resource_dir.join("bootstrap.sh");
+    if !script.exists() {
+        return Err(format!(
+            "the bundled installer script is missing ({}); rebuild the app",
+            script.display()
+        ));
+    }
+    let script_path = script
+        .to_str()
+        .ok_or_else(|| "the app resource path is not valid UTF-8".to_string())?;
+
+    let applescript = build_admin_applescript(script_path, subcommand);
+    let output = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(&applescript)
+        .output()
+        .map_err(|e| format!("failed to launch osascript: {e}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // osascript reports a cancelled auth dialog as error -128 / "User canceled".
+    if stderr.contains("-128") || stderr.to_lowercase().contains("user canceled") {
+        return Err("authentication was cancelled".to_string());
+    }
+    let detail = stderr.trim();
+    if detail.is_empty() {
+        Err(format!(
+            "the installer exited with status {}",
+            output.status
+        ))
+    } else {
+        Err(detail.to_string())
+    }
+}
+
+/// Run a privileged service action on the blocking pool (osascript blocks on the
+/// password dialog), then fire refresh-now so the poll thread re-polls and the
+/// real health surfaces. Never touches the VM — the truth contract holds exactly
+/// as it does for [`dispatch_mutation`].
+async fn dispatch_service_action(
+    app: AppHandle,
+    subcommand: &'static str,
+    refresh: RefreshSignal,
+) -> Result<(), String> {
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        run_privileged(&app, subcommand)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => Err(format!("internal error: service task failed: {e}")),
+    };
+    // Re-poll on every outcome: success moves the VM toward PermissionDenied /
+    // Connected, and even a failure should refresh (e.g. a partial state). The
+    // emit-on-change gate dedups a genuine no-op.
+    refresh.fire();
+    result
+}
+
+/// Install & start the root Splitway LaunchDaemon (one native password prompt).
+/// Idempotent — safe to re-run over an existing install. Offered by the GUI when
+/// `Health == NotRunning` on macOS.
+#[tauri::command]
+pub async fn install_service(
+    app: AppHandle,
+    refresh: State<'_, RefreshSignal>,
+) -> Result<(), String> {
+    dispatch_service_action(app, "install", refresh.inner().clone()).await
+}
+
+/// Stop the daemon (SIGTERM reverts /etc/resolver) and remove its LaunchDaemon
+/// plist so it will not relaunch at boot. Conservative: binaries, the group, and
+/// the config are left in place.
+#[tauri::command]
+pub async fn disable_service(
+    app: AppHandle,
+    refresh: State<'_, RefreshSignal>,
+) -> Result<(), String> {
+    dispatch_service_action(app, "disable", refresh.inner().clone()).await
 }
 
 /// Drive `core` through one whole poll cycle and return the resulting snapshot.
@@ -662,5 +809,46 @@ mod tests {
             vec!["corp.example.com".to_string()],
             "the new domain must arrive via the re-poll, not the command"
         );
+    }
+
+    // --- privileged service management (macOS self-install) ----------------
+
+    #[test]
+    fn host_platform_reports_a_known_value() {
+        // Whatever we built on, it is one of the three the frontend branches on.
+        assert!(matches!(host_platform(), "macos" | "linux" | "other"));
+    }
+
+    #[test]
+    fn admin_applescript_is_inert_and_fixed_apart_from_the_path() {
+        let script = build_admin_applescript(
+            "/Applications/Splitway.app/Contents/Resources/bootstrap.sh",
+            "install",
+        );
+        // The path is injected only as an AppleScript string variable; the shell
+        // command is fixed and quotes it via `quoted form of`, never bare
+        // interpolation.
+        assert!(script.contains(
+            "set scriptPath to \"/Applications/Splitway.app/Contents/Resources/bootstrap.sh\""
+        ));
+        assert!(script
+            .contains("do shell script \"/bin/bash \" & quoted form of scriptPath & \" install\""));
+        assert!(script.ends_with("with administrator privileges"));
+        // The subcommand is the only other variable, and it is a fixed literal.
+        let disable = build_admin_applescript("/x/bootstrap.sh", "disable");
+        assert!(disable.contains("& \" disable\""));
+        assert!(!disable.contains("install"));
+    }
+
+    #[test]
+    fn admin_applescript_escapes_quotes_and_backslashes_in_the_path() {
+        // A pathological path can never break out of the AppleScript string
+        // literal: a `"` and a `\` are both escaped before injection.
+        let script = build_admin_applescript("/weird/a\"b\\c/bootstrap.sh", "install");
+        assert!(script.contains("set scriptPath to \"/weird/a\\\"b\\\\c/bootstrap.sh\""));
+        // Exactly one statement sets the path and exactly one runs the shell —
+        // the injected value adds no extra AppleScript statements.
+        assert_eq!(script.matches("do shell script").count(), 1);
+        assert_eq!(script.matches("set scriptPath to").count(), 1);
     }
 }

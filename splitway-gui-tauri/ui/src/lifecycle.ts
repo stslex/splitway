@@ -21,8 +21,18 @@ import type { CheckOutcome } from "./bindings/view-model";
 
 /** A stable key per mutating control, for pending + per-action error tracking.
  *  `iface` is the interface-selector write (a `set_config` that round-trips the
- *  current backend/openvpn unchanged); `reload` is the apply-failed resync. */
-export type ActionKey = "toggle" | "add" | "iface" | "reload" | `remove:${string}`;
+ *  current backend/openvpn unchanged); `reload` is the apply-failed resync.
+ *  `install`/`disable` are the macOS privileged service actions (escalate via the
+ *  native password prompt) — tracked here so the blocker button / footer link show
+ *  a pending state and surface their own per-action error. */
+export type ActionKey =
+  | "toggle"
+  | "add"
+  | "iface"
+  | "reload"
+  | "install"
+  | "disable"
+  | `remove:${string}`;
 
 /** The one-shot CheckDomain query state — ephemeral, never folded into the VM. */
 export type CheckState = "idle" | "pending" | CheckOutcome;
@@ -57,6 +67,11 @@ export interface Lifecycle {
   check: CheckState;
   /** The ephemeral undo snackbar, or null when hidden. */
   undo: UndoState | null;
+  /** Whether the macOS "Stop the Splitway service" link is armed for confirmation
+   *  (a two-click confirm: the first click arms it, the second runs disable). The
+   *  webview's native `window.confirm` is unreliable under WKWebView, so the
+   *  confirmation is in-UI rather than a native dialog. */
+  disableArmed: boolean;
 }
 
 export function newLifecycle(): Lifecycle {
@@ -68,6 +83,7 @@ export function newLifecycle(): Lifecycle {
     ifaceInput: "",
     checkInput: "",
     check: "idle",
+    disableArmed: false,
     undo: null,
   };
 }

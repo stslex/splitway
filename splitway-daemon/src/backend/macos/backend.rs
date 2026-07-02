@@ -13,6 +13,7 @@ use splitway_shared::config::atomic_write;
 use splitway_shared::ipc::{LinkDnsState, ResolutionInfo};
 use splitway_shared::platform::{DnsBackend, PlatformError, VpnInfo};
 
+use super::demote;
 use super::resolver::{is_managed, is_valid_domain, resolver_contents, resolver_path};
 use super::MacosBackend;
 
@@ -26,21 +27,36 @@ impl DnsBackend for MacosBackend {
                 "no DNS servers in VpnInfo".to_string(),
             ));
         }
-        apply_to_dir(Path::new(RESOLVER_DIR), &vpn_info.dns_servers, domains)?;
+        let fallback = vpn_info.demote_target.as_deref().filter(|f| !f.is_empty());
+        apply_with(
+            Path::new(RESOLVER_DIR),
+            &vpn_info.dns_servers,
+            domains,
+            fallback,
+            &demote::RealScutil,
+            &demote::FileSnapshotStore::new(),
+        )?;
         flush_dns_cache();
         Ok(())
     }
 
     fn revert_rules(&self, _interface: &str) -> Result<(), PlatformError> {
-        // There is no per-interface resolver state on macOS — resolver files
-        // are keyed by domain. Reverting removes every file we own.
-        let removed = remove_managed(Path::new(RESOLVER_DIR), None).map_err(|e| {
-            PlatformError::CommandFailed(format!("failed to remove resolver files: {e}"))
-        })?;
-        if removed > 0 {
+        let outcome = revert_with(
+            Path::new(RESOLVER_DIR),
+            &demote::RealScutil,
+            &demote::FileSnapshotStore::new(),
+        )?;
+        // Flush when EITHER resolver files were removed OR a demoted default was
+        // restored — restoring the default changes resolution even when no files
+        // were removed (e.g. a retried revert after the files were already gone),
+        // so the cache must not keep serving the demoted/default answers.
+        if outcome.removed > 0 || outcome.restored_default {
             flush_dns_cache();
         }
-        log::info!("reverted {removed} splitway resolver file(s)");
+        log::info!(
+            "reverted {} splitway resolver file(s) and restored any demoted default",
+            outcome.removed
+        );
         Ok(())
     }
 
@@ -98,8 +114,82 @@ impl DnsBackend for MacosBackend {
     }
 }
 
+/// The apply pipeline, parameterized over the resolver dir and the demote seam
+/// so the scope+demote wiring is unit-testable without touching the live system.
+/// Two steps, transactional across both:
+///
+/// 1. **Scope** — `apply_to_dir` routes `domains` to `servers` via
+///    `/etc/resolver` (itself transactional; rolls back on any failure).
+/// 2. **Demote** — when `fallback` is `Some` (the VPN hijacked the system
+///    default), [`demote::demote`] sends non-corp DNS off-tunnel. If it fails,
+///    step 1's writes are rolled back **to the exact pre-apply scope** so the
+///    system is never left half-changed (scoped but with the default still
+///    hijacked), and the demote error is surfaced. Rolling back this apply's
+///    journal — not a blanket managed-file removal — means a re-apply whose
+///    demote fails restores the previously-working split DNS instead of wiping
+///    it. The demote's own snapshot still lets a later revert restore the default.
+fn apply_with(
+    dir: &Path,
+    servers: &[String],
+    domains: &[String],
+    fallback: Option<&[String]>,
+    scutil: &dyn demote::ScutilRunner,
+    snapshots: &dyn demote::SnapshotStore,
+) -> Result<(), PlatformError> {
+    let journal = apply_to_dir(dir, servers, domains)?;
+
+    if let Some(fallback) = fallback {
+        // `servers` is the corp DNS (what the /etc/resolver scope points at); pass
+        // it so the demote never snapshots the corp resolver as the physical prior
+        // (a hijacker rewriting the physical service between samples — see demote).
+        if let Err(e) = demote::demote(scutil, snapshots, fallback, servers) {
+            // Undo exactly this apply's scope changes — overwritten files back to
+            // their prior bytes, newly-created and pruned files undone — so a
+            // transient demote failure restores the prior scope rather than
+            // dropping every managed resolver file.
+            rollback(&journal);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// What a revert changed: how many managed resolver files were removed, and
+/// whether a demoted system default was restored. Either being non-trivial means
+/// resolution changed and the DNS cache must be flushed.
+struct RevertOutcome {
+    removed: usize,
+    restored_default: bool,
+}
+
+/// The revert pipeline, parameterized over the resolver dir and the demote seam.
+/// Removes every managed `/etc/resolver` file AND restores any demoted system
+/// default from the on-disk snapshot. Reports both (see [`RevertOutcome`]) so the
+/// caller can flush the DNS cache when either changed.
+///
+/// The restore runs even when no resolver files were removed: a prior run may
+/// have demoted without (or after pruning) resolver files, and the snapshot is
+/// the record of record. A restore failure is surfaced (not swallowed) so the
+/// caller retries rather than recording a clean revert over a still-demoted
+/// default.
+fn revert_with(
+    dir: &Path,
+    scutil: &dyn demote::ScutilRunner,
+    snapshots: &dyn demote::SnapshotStore,
+) -> Result<RevertOutcome, PlatformError> {
+    let removed = remove_managed(dir, None, None).map_err(|e| {
+        PlatformError::CommandFailed(format!("failed to remove resolver files: {e}"))
+    })?;
+    let restored_default = demote::restore(scutil, snapshots)?;
+    Ok(RevertOutcome {
+        removed,
+        restored_default,
+    })
+}
+
 /// Prior on-disk state of a resolver file before this apply touched it, used to
 /// undo a failed apply.
+#[derive(Debug)]
 enum Prior {
     /// The file existed; these are its bytes, restored on rollback.
     Existed(Vec<u8>),
@@ -118,7 +208,15 @@ enum Prior {
 /// never a partial or empty set. Then prunes our now-unwanted files; a prune
 /// failure is returned (not swallowed) so the caller retries rather than
 /// recording success while a dropped domain's file keeps routing.
-fn apply_to_dir(dir: &Path, servers: &[String], domains: &[String]) -> Result<(), PlatformError> {
+///
+/// On success returns the **journal** of every change made (files overwritten,
+/// created, and pruned), so a caller (the apply pipeline) can undo exactly this
+/// reconcile — restoring the prior scope — if a *later* step (the demote) fails.
+fn apply_to_dir(
+    dir: &Path,
+    servers: &[String],
+    domains: &[String],
+) -> Result<Vec<(PathBuf, Prior)>, PlatformError> {
     // Reject names that are not safe single path components before touching the
     // filesystem: `dir.join("../x")` would escape /etc/resolver, and a
     // slash-containing name would never match the single-component filenames
@@ -201,20 +299,17 @@ fn apply_to_dir(dir: &Path, servers: &[String], domains: &[String]) -> Result<()
 
     let keep: BTreeSet<&str> = domains.iter().map(String::as_str).collect();
     // Surface prune failures: a leftover file for a dropped domain keeps routing
-    // it through the VPN. Roll back this call's writes first — on a failed
-    // reconcile the state machine does not record `applied`, so newly-created
-    // files left behind would be skipped by a later revert. This undoes only
-    // this call's writes; a partially-completed prune is not un-deleted, but
-    // prune only ever removes files that are being dropped or are already stale,
-    // so those deletions are safe to leave. The result stays consistent with the
-    // retained `applied` state.
-    if let Err(e) = remove_managed(dir, Some(&keep)) {
+    // it through the VPN. The prune records each removed file into `written` (as
+    // `Prior::Existed`), so on a prune failure — or a later demote failure — the
+    // rollback restores the pruned files too, leaving the prior scope exactly as
+    // it was rather than a partial set.
+    if let Err(e) = remove_managed(dir, Some(&keep), Some(&mut written)) {
         rollback(&written);
         return Err(PlatformError::CommandFailed(format!(
             "failed to prune stale resolver files: {e}"
         )));
     }
-    Ok(())
+    Ok(written)
 }
 
 /// Undo the writes recorded in `written`, most recent first: restore each
@@ -238,7 +333,15 @@ fn rollback(written: &[(PathBuf, Prior)]) {
 /// filename is in `keep` (when `Some`). A missing `dir` is treated as "nothing
 /// to remove". Returns how many files were removed. Files we do not own (no
 /// marker) and unreadable files are left untouched.
-fn remove_managed(dir: &Path, keep: Option<&BTreeSet<&str>>) -> io::Result<usize> {
+///
+/// When `journal` is `Some`, each removed file is recorded as
+/// `(path, Prior::Existed(bytes))` so a later [`rollback`] can re-create it — the
+/// apply pipeline uses this so a prune is undoable along with the writes.
+fn remove_managed(
+    dir: &Path,
+    keep: Option<&BTreeSet<&str>>,
+    mut journal: Option<&mut Vec<(PathBuf, Prior)>>,
+) -> io::Result<usize> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
@@ -262,11 +365,16 @@ fn remove_managed(dir: &Path, keep: Option<&BTreeSet<&str>>) -> io::Result<usize
         if keep.is_some_and(|keep| keep.contains(name)) {
             continue;
         }
-        // Only touch files we wrote; never a user-authored resolver file.
-        match fs::read_to_string(&path) {
-            Ok(contents) if is_managed(&contents) => {
+        // Only touch files we wrote; never a user-authored resolver file. Read
+        // the bytes (not a lossy string) so a journaled entry restores them
+        // exactly on rollback.
+        match fs::read(&path) {
+            Ok(bytes) if is_managed(&String::from_utf8_lossy(&bytes)) => {
                 fs::remove_file(&path)?;
                 removed += 1;
+                if let Some(journal) = journal.as_deref_mut() {
+                    journal.push((path, Prior::Existed(bytes)));
+                }
             }
             _ => {}
         }
@@ -373,6 +481,226 @@ mod tests {
         vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()]
     }
 
+    // --- scope + demote wiring (apply_with / revert_with) --------------------
+    //
+    // These exercise the two-step pipeline with the demote seam faked, so they
+    // assert BOTH the /etc/resolver files written and the exact scutil script
+    // issued — without touching the live system.
+
+    use super::demote::test_support::{FakeScutil, MemSnapshots};
+
+    #[test]
+    fn apply_with_scopes_and_demotes_to_the_fallback() {
+        let dir = temp_dir("apply-with-demote");
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        let corp = vec!["192.0.2.53".to_string()];
+        let fallback = vec!["198.51.100.1".to_string()];
+
+        apply_with(
+            &dir,
+            &corp,
+            &[
+                "corp.example.com".to_string(),
+                "jira.example.com".to_string(),
+            ],
+            Some(&fallback),
+            &scutil,
+            &snaps,
+        )
+        .unwrap();
+
+        // Scope: a managed resolver file per corp domain, pointing at corp DNS.
+        for domain in ["corp.example.com", "jira.example.com"] {
+            let body = fs::read_to_string(dir.join(domain)).unwrap();
+            assert!(is_managed(&body));
+            assert!(body.contains("nameserver 192.0.2.53"));
+        }
+        // Demote: exactly the set-fallback script on the primary service, and
+        // the prior default snapshotted for restore.
+        let scripts = scutil.scripts.borrow();
+        assert_eq!(scripts.len(), 1);
+        assert!(scripts[0].contains("d.add ServerAddresses * 198.51.100.1\n"));
+        assert!(scripts[0].contains("set State:/Network/Service/ABC/DNS\n"));
+        drop(scripts);
+        assert_eq!(
+            snaps.slot.borrow().as_ref().unwrap().prior_servers,
+            vec!["198.51.100.1".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_with_no_fallback_scopes_only_no_demote() {
+        let dir = temp_dir("apply-scope-only");
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        apply_with(
+            &dir,
+            &["192.0.2.53".to_string()],
+            &["corp.example.com".to_string()],
+            None,
+            &scutil,
+            &snaps,
+        )
+        .unwrap();
+        assert!(dir.join("corp.example.com").exists());
+        // No demote issued, nothing snapshotted.
+        assert!(scutil.scripts.borrow().is_empty());
+        assert!(snaps.slot.borrow().is_none());
+    }
+
+    #[test]
+    fn apply_with_rolls_back_the_scope_when_the_demote_fails() {
+        // Transactional across both steps: a demote failure must undo the
+        // resolver scope so the system is never left half-changed.
+        let dir = temp_dir("apply-rollback");
+        let scutil = FakeScutil::up();
+        scutil.fail_on_set();
+        let snaps = MemSnapshots::default();
+
+        let result = apply_with(
+            &dir,
+            &["192.0.2.53".to_string()],
+            &["corp.example.com".to_string()],
+            Some(&["198.51.100.1".to_string()]),
+            &scutil,
+            &snaps,
+        );
+        assert!(result.is_err(), "a demote failure fails the whole apply");
+        // The scope was rolled back — no managed resolver file remains.
+        assert!(
+            !dir.join("corp.example.com").exists(),
+            "the resolver scope must be rolled back on demote failure"
+        );
+    }
+
+    #[test]
+    fn demote_failure_on_a_reapply_restores_the_previous_scope() {
+        // A re-apply over a previously-working scope whose demote then fails must
+        // restore the PRIOR files (overwritten ones back to their old content,
+        // pruned ones re-created), not wipe every managed resolver file.
+        let dir = temp_dir("apply-reapply-rollback");
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        // First apply (no demote): two managed files become the working scope.
+        apply_with(
+            &dir,
+            &["192.0.2.53".to_string()],
+            &[
+                "corp.example.com".to_string(),
+                "old.example.com".to_string(),
+            ],
+            None,
+            &scutil,
+            &snaps,
+        )
+        .unwrap();
+        let corp_before = fs::read_to_string(dir.join("corp.example.com")).unwrap();
+        assert!(dir.join("old.example.com").exists());
+
+        // Re-apply with new servers, dropping old.example.com — but the demote fails.
+        scutil.fail_on_set();
+        let result = apply_with(
+            &dir,
+            &["192.0.2.99".to_string()],
+            &["corp.example.com".to_string()],
+            Some(&["198.51.100.1".to_string()]),
+            &scutil,
+            &snaps,
+        );
+        assert!(result.is_err(), "the demote failure fails the apply");
+        // The previous scope is restored exactly: corp.example.com back to its
+        // prior content, and the pruned old.example.com re-created.
+        assert_eq!(
+            fs::read_to_string(dir.join("corp.example.com")).unwrap(),
+            corp_before,
+            "the overwritten file is restored to its pre-reapply content"
+        );
+        assert!(
+            dir.join("old.example.com").exists(),
+            "the pruned file is restored on rollback — not left dropped"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn revert_with_removes_files_and_restores_the_default() {
+        let dir = temp_dir("revert-with");
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        // Apply (scope + demote), then revert.
+        apply_with(
+            &dir,
+            &["192.0.2.53".to_string()],
+            &["corp.example.com".to_string()],
+            Some(&["198.51.100.1".to_string()]),
+            &scutil,
+            &snaps,
+        )
+        .unwrap();
+        scutil.scripts.borrow_mut().clear();
+
+        let outcome = revert_with(&dir, &scutil, &snaps).unwrap();
+        assert_eq!(
+            outcome.removed, 1,
+            "the one managed resolver file is removed"
+        );
+        assert!(outcome.restored_default, "the demoted default was restored");
+        assert!(!dir.join("corp.example.com").exists());
+        // The default was restored to the snapshotted prior servers, and the
+        // snapshot cleared.
+        let scripts = scutil.scripts.borrow();
+        assert_eq!(scripts.len(), 1);
+        assert!(scripts[0].contains("d.add ServerAddresses * 198.51.100.1\n"));
+        drop(scripts);
+        assert!(snaps.slot.borrow().is_none());
+    }
+
+    #[test]
+    fn revert_with_nothing_applied_is_a_clean_noop() {
+        let dir = temp_dir("revert-noop");
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        let outcome = revert_with(&dir, &scutil, &snaps).unwrap();
+        assert_eq!(outcome.removed, 0);
+        assert!(!outcome.restored_default);
+        assert!(scutil.scripts.borrow().is_empty());
+    }
+
+    #[test]
+    fn revert_with_reports_a_restore_even_when_no_files_were_removed() {
+        // P2: the resolver files were already gone (removed == 0) but a demote
+        // snapshot still exists (e.g. a prior revert removed the files, then the
+        // scutil restore failed; this retry restores the default). revert_with must
+        // report the restore so the caller still flushes the DNS cache.
+        let dir = temp_dir("revert-restore-only");
+        let scutil = FakeScutil::up();
+        let snaps = MemSnapshots::default();
+        apply_with(
+            &dir,
+            &["192.0.2.53".to_string()],
+            &["corp.example.com".to_string()],
+            Some(&["198.51.100.1".to_string()]),
+            &scutil,
+            &snaps,
+        )
+        .unwrap();
+        // Simulate the resolver file already being gone from a prior partial revert.
+        fs::remove_file(dir.join("corp.example.com")).unwrap();
+        scutil.scripts.borrow_mut().clear();
+
+        let outcome = revert_with(&dir, &scutil, &snaps).unwrap();
+        assert_eq!(outcome.removed, 0, "no resolver files left to remove");
+        assert!(
+            outcome.restored_default,
+            "the demoted default was still restored → caller must flush"
+        );
+        assert!(
+            snaps.slot.borrow().is_none(),
+            "snapshot cleared after restore"
+        );
+    }
+
     #[test]
     fn apply_writes_one_marked_file_per_domain() {
         let dir = temp_dir("apply-writes");
@@ -423,9 +751,9 @@ mod tests {
         apply_to_dir(&dir, &servers(), &["a.com".to_string()]).unwrap();
         // A resolver file the user wrote by hand.
         let user_file = dir.join("user.example");
-        fs::write(&user_file, "nameserver 9.9.9.9\n").unwrap();
+        fs::write(&user_file, "nameserver 192.0.2.9\n").unwrap();
 
-        let removed = remove_managed(&dir, None).unwrap();
+        let removed = remove_managed(&dir, None, None).unwrap();
         assert_eq!(removed, 1);
         assert!(!dir.join("a.com").exists(), "our file is removed");
         assert!(user_file.exists(), "the user's file is untouched");
@@ -437,7 +765,7 @@ mod tests {
         let mut missing = std::env::temp_dir();
         missing.push(format!("splitway-absent-resolver-{}", std::process::id()));
         let _ = fs::remove_dir_all(&missing);
-        assert_eq!(remove_managed(&missing, None).unwrap(), 0);
+        assert_eq!(remove_managed(&missing, None, None).unwrap(), 0);
     }
 
     #[test]
@@ -498,13 +826,13 @@ mod tests {
         let dir = temp_dir("apply-refuse-unmanaged");
         // The user already has a hand-written resolver for this domain.
         let user = dir.join("corp.example.com");
-        fs::write(&user, "nameserver 9.9.9.9\n").unwrap();
+        fs::write(&user, "nameserver 192.0.2.9\n").unwrap();
 
         let err = apply_to_dir(&dir, &servers(), &["corp.example.com".to_string()]).unwrap_err();
         assert!(matches!(err, PlatformError::CommandFailed(_)));
         // The user's file is left exactly as it was — not replaced by a managed
         // file that a later revert would delete.
-        assert_eq!(fs::read_to_string(&user).unwrap(), "nameserver 9.9.9.9\n");
+        assert_eq!(fs::read_to_string(&user).unwrap(), "nameserver 192.0.2.9\n");
         fs::remove_dir_all(&dir).unwrap();
     }
 
