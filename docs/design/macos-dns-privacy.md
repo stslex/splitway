@@ -194,10 +194,19 @@ deliberate and documented so the boundary is not mistaken for a gap.
 ## What is not built here
 
 - **GUI changes** (interface-picker removal, a corp-domains / fallback-DNS UI) —
-  a later phase. The macOS daemon no longer depends on `vpn_name` for
-  correctness; the picker remains a benign no-op on macOS (the daemon
-  auto-detects and ignores a picked `vpn_name`). The state machine is strictly
-  daemon-side here.
+  a later phase. The macOS daemon no longer depends on the *value* of `vpn_name`
+  for correctness — the detector auto-detects and ignores whatever is picked — so
+  the picker is a value-agnostic no-op there. One residual dependency remains,
+  though: `vpn_name` is still load-bearing as the **arming switch**. `arm_watch`
+  bails out when `vpn_name` is empty (`DetectorHealth::Inactive`, no SCDynamicStore
+  watch, no initial sample), and a fresh macOS self-install boots exactly there
+  (`bootstrap.sh` starts the daemon, which self-creates its config with an empty
+  `vpn_name`), so no detection runs until the user picks *some* interface (any
+  value works). Today the GUI's platform-agnostic main stage pushes the user
+  through the picker, so the flow works in practice; a future picker-removal /
+  auto-detection phase must also branch `arm_watch`'s empty-name gate (e.g. on
+  `reverts_globally()`) or it would silently disable macOS detection. The state
+  machine is strictly daemon-side here.
 - **Homebrew packaging** — a later phase; nothing ships until the live
   acceptance below passes.
 - **The live verification itself** — see below. This phase is implementation +
