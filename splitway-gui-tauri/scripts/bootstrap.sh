@@ -36,14 +36,60 @@ readonly GROUP="splitway"
 log() { printf 'splitway-bootstrap: %s\n' "$*"; }
 die() { printf 'splitway-bootstrap: error: %s\n' "$*" >&2; exit 1; }
 
-# Walk every ancestor of $1 up to / and refuse unless each is root-owned and not
-# writable by group or other. Renaming or replacing a directory entry needs write
-# access to its PARENT, not to the entry itself — so pinning $BIN_DIR to
-# root:wheel is not enough: a single non-root-writable ancestor (e.g. /usr/local
-# left admin-owned by the Homebrew-on-Intel layout) still lets a non-root user
-# swap the directory out and have launchd exec their binary as root. We verify
-# (never chown) the parents: chowning /usr/local would break a real Homebrew, so
-# an unsafe chain is a hard refusal with an actionable message instead.
+# True if $1 carries a macOS ACL that could let a NON-root principal modify it
+# (write/delete/rename/replace the entry or its children). macOS ACLs are NOT
+# reflected in the POSIX mode bits and are NOT cleared by a `chmod` mode change,
+# so a root:wheel 0755 directory can still be attacker-writable through an ACL —
+# which would let a non-root user swap the directory that holds the root-run
+# daemon. Parse `ls -lde`: each numbered ACL entry is
+# `<n>: <principal> <allow|deny> <perms>`; flag any `allow` entry for a principal
+# other than root/wheel whose comma-separated perms include a write-class right.
+# Fails closed (any such entry → refuse), matching this script's verify-or-abort
+# discipline for the destination of a root-run binary.
+acl_allows_nonroot_write() {
+    local line principal perms
+    while IFS= read -r line; do
+        # Trim leading whitespace, then keep only ACL entry lines.
+        line="${line#"${line%%[![:space:]]*}"}"
+        case "$line" in
+            [0-9]*:\ *) : ;;
+            *) continue ;;
+        esac
+        line="${line#*: }"        # strip the "<n>: " index
+        # Split on the " allow " action keyword rather than a positional field:
+        # an ACL principal (record/full name) can contain spaces, so field-2
+        # parsing would let `user:First Last allow write` slip through. `deny` and
+        # malformed lines have no " allow " and are skipped (not a grant). Perms are
+        # a single comma-list with no spaces, so " allow " appears exactly once.
+        case " $line " in
+            *" allow "*) : ;;
+            *) continue ;;
+        esac
+        principal="${line%% allow *}"
+        perms="${line##* allow }"
+        case "$principal" in
+            user:root | group:wheel) continue ;;
+        esac
+        case ",$perms," in
+            *,write,* | *,delete,* | *,append,* | *,add_file,* | *,add_subdirectory,* | \
+                *,delete_child,* | *,writeattr,* | *,writeextattr,* | *,writesecurity,* | *,chown,*)
+                return 0
+                ;;
+        esac
+    done < <(ls -lde "$1" 2>/dev/null)
+    return 1
+}
+
+# Walk every ancestor of $1 up to / and refuse unless each is root-owned, not
+# writable by group or other, AND free of an ACL granting a non-root principal
+# write. Renaming or replacing a directory entry needs write access to its
+# PARENT, not to the entry itself — so pinning $BIN_DIR to root:wheel is not
+# enough: a single non-root-writable ancestor (e.g. /usr/local left admin-owned
+# by the Homebrew-on-Intel layout, or one carrying a stray ACL) still lets a
+# non-root user swap the directory out and have launchd exec their binary as
+# root. We verify (never chown/chmod) the parents: touching /usr/local would
+# break a real Homebrew, so an unsafe chain is a hard refusal with an actionable
+# message instead.
 assert_root_only_path() {
     local dir="$1" owner perm
     while :; do
@@ -54,6 +100,9 @@ assert_root_only_path() {
         # unambiguous regardless of leading-zero/octal shell quirks.
         if [ -z "$perm" ] || [ "$(( 8#$perm & 8#22 ))" -ne 0 ]; then
             die "${dir} (mode ${perm:-unknown}) is writable by group or other; refusing — a writable ancestor of ${BIN_DIR} lets a non-root user substitute the root-run daemon binary"
+        fi
+        if acl_allows_nonroot_write "$dir"; then
+            die "${dir} carries a macOS ACL granting write/delete to a non-root principal; refusing — an ACL-writable ancestor of ${BIN_DIR} lets a non-root user substitute the root-run daemon binary (ACLs are invisible to the mode bits and survive chmod)"
         fi
         [ "$dir" = "/" ] && break
         dir="$(dirname "$dir")"
@@ -90,6 +139,14 @@ install_binaries() {
     [ "$real_bin" = "$BIN_DIR" ] || assert_root_only_path "$(dirname "$real_bin")"
     chown root:wheel "$BIN_DIR" || die "cannot make ${BIN_DIR} root-owned; refusing to install a root-run binary into a non-root-writable directory"
     chmod 755 "$BIN_DIR"
+    # A macOS ACL survives the chmod above and is invisible to the mode-bit check,
+    # so an ACL granting another user write/delete on $BIN_DIR would still let them
+    # swap the root-run binary. We own $BIN_DIR, so strip any ACL outright (like the
+    # chown), then confirm none granting non-root write remains.
+    chmod -N "$BIN_DIR" 2>/dev/null || true
+    if acl_allows_nonroot_write "$BIN_DIR"; then
+        die "${BIN_DIR} still carries a macOS ACL granting non-root write after chmod -N; refusing to install a root-run binary there"
+    fi
     local owner
     owner="$(stat -f '%Su:%Sg' "$BIN_DIR")"
     [ "$owner" = "root:wheel" ] || die "${BIN_DIR} is ${owner}, not root:wheel; refusing to install a root-run binary there"
